@@ -1699,6 +1699,7 @@ dependencies = [
  "clap",
  "dirs",
  "ratatui",
+ "rustix",
  "serde",
  "toml",
 ]

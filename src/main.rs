@@ -2,8 +2,6 @@ mod app;
 mod config;
 mod term;
 
-use std::os::unix::fs::MetadataExt;
-
 use anyhow::{Result, bail};
 use clap::{Parser, Subcommand};
 
@@ -33,7 +31,7 @@ enum Command {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    if running_as_root()? {
+    if rustix::process::geteuid().is_root() {
         bail!(
             "vole must not be run as root; run it as your normal user (it asks for sudo when needed)"
         );
@@ -53,9 +51,4 @@ fn main() -> Result<()> {
     let result = App::new(screen, config).run(&mut terminal);
     ratatui::restore();
     result
-}
-
-/// `/proc/self` is owned by the process's effective user.
-fn running_as_root() -> Result<bool> {
-    Ok(std::fs::metadata("/proc/self")?.uid() == 0)
 }

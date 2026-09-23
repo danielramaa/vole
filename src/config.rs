@@ -9,7 +9,7 @@ use serde::Deserialize;
 #[derive(Debug, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
-    /// Cached versions of each installed package to keep.
+    /// Cached versions of each installed package to keep. At least 1, so a downgrade stays possible.
     pub pacman_keep_versions: u32,
     /// Size the systemd journal is shrunk to, in MB.
     pub journal_max_mb: u32,
@@ -49,8 +49,8 @@ impl Config {
     }
 
     fn validate(&self) -> Result<()> {
-        if !(0..=10).contains(&self.pacman_keep_versions) {
-            bail!("pacman_keep_versions must be between 0 and 10");
+        if !(1..=10).contains(&self.pacman_keep_versions) {
+            bail!("pacman_keep_versions must be between 1 and 10");
         }
         if !(50..=10_000).contains(&self.journal_max_mb) {
             bail!("journal_max_mb must be between 50 and 10000");
@@ -76,6 +76,12 @@ mod tests {
     #[test]
     fn rejects_out_of_range_values() {
         let config: Config = toml::from_str("journal_max_mb = 1").unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn rejects_keeping_zero_package_versions() {
+        let config: Config = toml::from_str("pacman_keep_versions = 0").unwrap();
         assert!(config.validate().is_err());
     }
 

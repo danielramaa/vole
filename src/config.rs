@@ -45,7 +45,9 @@ impl Config {
         };
         let config: Self =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
-        config.validate()?;
+        config
+            .validate()
+            .with_context(|| format!("validating {}", path.display()))?;
         Ok(config)
     }
 

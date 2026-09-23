@@ -157,6 +157,19 @@ cargo run
 
 CI runs the same checks, plus a build on Rust 1.88 to make sure the minimum version still works.
 
+### Dev container (any OS)
+
+vole only runs on Arch. On any other system (Windows, macOS, another Linux distro), use the Arch Linux container. All you need is [Docker](https://docs.docker.com/get-docker/).
+
+```sh
+docker compose run --rm dev      # opens a shell inside Arch, in the project folder
+cargo run                        # then work as usual
+```
+
+Your project folder is shared with the container, so you can edit in your usual editor on the host. Inside, you're the normal user `dev` (password `dev`, for `sudo`). The container is also a safe, throwaway system for testing what vole deletes.
+
+After changing `docker/Dockerfile`, rebuild with `docker compose build`.
+
 ### Project documents
 
 - [CONTEXT.md](CONTEXT.md): the glossary. What vole means by Plan, Item, Orphaned Config, Owner, Protected List and so on. Code and issues use these words.

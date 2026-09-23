@@ -1,0 +1,21 @@
+services:
+  dev:
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+      args:
+        UID: ${UID:-1000}
+        GID: ${GID:-1000}
+    image: vole-dev
+    volumes:
+      - .:/home/dev/vole
+      - cargo-registry:/home/dev/.cargo/registry
+      - target:/home/dev/target
+    environment:
+      TERM: xterm-256color
+    stdin_open: true
+    tty: true
+
+volumes:
+  cargo-registry:
+  target:

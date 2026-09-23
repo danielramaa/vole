@@ -1,4 +1,5 @@
 use std::fs;
+use std::io::ErrorKind;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result, bail};
@@ -37,11 +38,11 @@ impl Config {
         let Some(path) = Self::path() else {
             return Ok(Self::default());
         };
-        if !path.exists() {
-            return Ok(Self::default());
-        }
-        let text =
-            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let text = match fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(Self::default()),
+            Err(err) => return Err(err).with_context(|| format!("reading {}", path.display())),
+        };
         let config: Self =
             toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
         config.validate()?;

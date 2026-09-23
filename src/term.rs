@@ -16,11 +16,13 @@ pub fn run_external(
 ) -> io::Result<ExitStatus> {
     disable_raw_mode()?;
     execute!(stdout(), LeaveAlternateScreen)?;
+    terminal.show_cursor()?;
 
     let status = command.status();
 
     execute!(stdout(), EnterAlternateScreen)?;
     enable_raw_mode()?;
+    terminal.hide_cursor()?;
     terminal.clear()?;
 
     status

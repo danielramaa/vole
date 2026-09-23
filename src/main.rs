@@ -3,29 +3,18 @@ mod config;
 mod term;
 
 use anyhow::{Result, bail};
-use clap::{Parser, Subcommand};
+use clap::Parser;
 
-use crate::app::{App, Screen};
+use crate::app::{App, Module};
 use crate::config::Config;
 
 /// Clean, analyze and maintain an Arch Linux system.
 #[derive(Parser)]
 #[command(version, about)]
 struct Cli {
-    #[command(subcommand)]
-    command: Option<Command>,
-}
-
-#[derive(Subcommand, Clone, Copy)]
-enum Command {
-    /// Caches, pacman cache, journal and trash
-    Clean,
-    /// Orphaned packages and configs
-    Orphans,
-    /// Interactive disk explorer
-    Analyze,
-    /// Real-time system dashboard
-    Status,
+    /// Module to open directly (default: the menu)
+    #[arg(value_enum)]
+    module: Option<Module>,
 }
 
 fn main() -> Result<()> {
@@ -39,16 +28,8 @@ fn main() -> Result<()> {
 
     let config = Config::load()?;
 
-    let screen = match cli.command {
-        None => Screen::Menu,
-        Some(Command::Clean) => Screen::Clean,
-        Some(Command::Orphans) => Screen::Orphans,
-        Some(Command::Analyze) => Screen::Analyze,
-        Some(Command::Status) => Screen::Status,
-    };
-
     let mut terminal = ratatui::init();
-    let result = App::new(screen, config).run(&mut terminal);
+    let result = App::new(cli.module, config).run(&mut terminal);
     ratatui::restore();
     result
 }

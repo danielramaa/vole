@@ -86,30 +86,53 @@ impl App {
             return;
         }
         match self.screen {
-            Screen::Menu => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
-                KeyCode::Down | KeyCode::Char('j') => self.menu.select_next(),
-                KeyCode::Up | KeyCode::Char('k') => self.menu.select_previous(),
-                KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                    let index = self
-                        .menu
-                        .selected()
-                        .unwrap_or(0)
-                        .min(Screen::MODULES.len() - 1);
-                    self.screen = Screen::MODULES[index];
+            Screen::Menu => self.on_menu_key(key),
+            screen => {
+                // The module gets the key first, so it can use h/l, Esc, etc. for its own
+                // navigation; only unhandled keys leave the module.
+                if !self.on_module_key(screen, key) {
+                    self.on_leave_key(key);
                 }
-                _ => {}
-            },
-            _ => match key.code {
-                KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                    if self.started_on_menu {
-                        self.screen = Screen::Menu;
-                    } else {
-                        self.quit = true;
-                    }
-                }
-                _ => {}
-            },
+            }
+        }
+    }
+
+    fn on_menu_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => self.quit = true,
+            KeyCode::Down | KeyCode::Char('j') => self.menu.select_next(),
+            KeyCode::Up | KeyCode::Char('k') => self.menu.select_previous(),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let index = self
+                    .menu
+                    .selected()
+                    .unwrap_or(0)
+                    .min(Screen::MODULES.len() - 1);
+                self.screen = Screen::MODULES[index];
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys handled inside a module. Returns whether the key was used.
+    fn on_module_key(&mut self, screen: Screen, _key: KeyEvent) -> bool {
+        match screen {
+            Screen::Menu | Screen::Clean | Screen::Orphans | Screen::Analyze | Screen::Status => {
+                false
+            }
+        }
+    }
+
+    fn on_leave_key(&mut self, key: KeyEvent) {
+        if matches!(
+            key.code,
+            KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h')
+        ) {
+            if self.started_on_menu {
+                self.screen = Screen::Menu;
+            } else {
+                self.quit = true;
+            }
         }
     }
 

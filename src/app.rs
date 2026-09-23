@@ -135,7 +135,12 @@ impl App {
                         .block(block),
                     body,
                 );
-                frame.render_widget(Line::from(" q/h back"), footer);
+                let hint = if self.started_on_menu {
+                    " q/h back"
+                } else {
+                    " q quit"
+                };
+                frame.render_widget(Line::from(hint), footer);
             }
         }
     }

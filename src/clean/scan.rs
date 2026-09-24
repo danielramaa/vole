@@ -108,7 +108,9 @@ pub fn home_categories(home: &Path, rules: &Rules, mounts: &Mounts) -> HomeCateg
         }
     }
     let mut user_cache = user_cache.finish();
-    user_cache.items.sort_by(|a, b| b.size.cmp(&a.size));
+    user_cache
+        .items
+        .sort_by_key(|item| std::cmp::Reverse(item.size));
 
     HomeCategories {
         yay: yay.finish(),

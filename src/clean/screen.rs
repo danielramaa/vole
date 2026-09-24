@@ -1,6 +1,8 @@
 //! The `clean` screens: scanning, the Plan with selection, confirmation, and the result.
 
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
@@ -34,10 +36,29 @@ enum State {
         view: PlanView,
         in_use: bool,
     },
-    /// Confirmed: the App runs the removal right after drawing this.
+    /// Confirmed: the removal starts on the next tick.
     Removing(PlanView),
+    /// The home Items are being removed on a worker thread.
+    RemovingHome {
+        plan: Plan,
+        receiver: Receiver<Progress>,
+        stop: Arc<AtomicBool>,
+        now: String,
+    },
+    /// The home Items are done; the root commands wait for the App to lend the terminal.
+    RootPending {
+        plan: Plan,
+        outcomes: Vec<Outcome>,
+        log: Log,
+    },
     Done(Vec<Outcome>),
     Failed(String),
+}
+
+/// Messages from the removal thread.
+enum Progress {
+    Item(String),
+    Finished(Vec<Outcome>, Log),
 }
 
 impl Screen {
@@ -75,22 +96,94 @@ impl Screen {
         matches!(self.state, State::Ready(_))
     }
 
-    /// Starts the scan, then picks up the Plan once it is done.
+    /// Moves background work along: starts the scan or the removal, and picks up their results.
     pub fn tick(&mut self) {
-        if let State::NotStarted = self.state {
-            self.state = State::Scanning(Self::start(self.config.clone()));
+        let state = std::mem::replace(&mut self.state, State::NotStarted);
+        self.state = match state {
+            State::NotStarted => State::Scanning(Self::start(self.config.clone())),
+            State::Scanning(receiver) => match receiver.try_recv() {
+                Ok(Ok(plan)) => State::Ready(PlanView::new(plan)),
+                Ok(Err(err)) => State::Failed(format!("Could not build the plan: {err}")),
+                Err(TryRecvError::Empty) => State::Scanning(receiver),
+                Err(TryRecvError::Disconnected) => {
+                    State::Failed("the scan stopped unexpectedly".into())
+                }
+            },
+            State::Removing(view) => match self.prepare() {
+                Ok((rules, log)) => Self::start_removal(view.plan, rules, log),
+                Err(err) => State::Failed(format!("Nothing was removed: {err}")),
+            },
+            State::RemovingHome {
+                plan,
+                receiver,
+                stop,
+                mut now,
+            } => loop {
+                match receiver.try_recv() {
+                    Ok(Progress::Item(label)) => now = label,
+                    Ok(Progress::Finished(mut outcomes, log)) => {
+                        let root = plan.selected().filter(|item| item.path().is_none());
+                        if stop.load(Ordering::Relaxed) {
+                            outcomes.extend(root.map(|item| {
+                                remove::not_attempted(item, "stopped before removing it")
+                            }));
+                            break State::Done(outcomes);
+                        }
+                        if root.count() == 0 {
+                            break State::Done(outcomes);
+                        }
+                        break State::RootPending {
+                            plan,
+                            outcomes,
+                            log,
+                        };
+                    }
+                    Err(TryRecvError::Empty) => {
+                        break State::RemovingHome {
+                            plan,
+                            receiver,
+                            stop,
+                            now,
+                        };
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        break State::Failed(
+                            "The removal stopped unexpectedly; the operation log has what was removed."
+                                .into(),
+                        );
+                    }
+                }
+            },
+            state => state,
+        };
+    }
+
+    /// Removes the home Items on a worker thread, so the screen keeps drawing.
+    fn start_removal(plan: Plan, rules: Rules, mut log: Log) -> State {
+        let (sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_plan = plan.clone();
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut progress = |done: usize, total: usize, label: &str| {
+                let _ = sender.send(Progress::Item(format!("{label} ({} of {total})", done + 1)));
+            };
+            let outcomes = remove::remove_home(
+                &worker_plan,
+                &rules,
+                &Mounts::load(),
+                &mut log,
+                &mut progress,
+                &worker_stop,
+            );
+            let _ = sender.send(Progress::Finished(outcomes, log));
+        });
+        State::RemovingHome {
+            plan,
+            receiver,
+            stop,
+            now: String::new(),
         }
-        let State::Scanning(receiver) = &self.state else {
-            return;
-        };
-        self.state = match receiver.try_recv() {
-            Ok(Ok(plan)) => State::Ready(PlanView::new(plan)),
-            Ok(Err(err)) => State::Failed(format!("Could not build the plan: {err}")),
-            Err(TryRecvError::Empty) => return,
-            Err(TryRecvError::Disconnected) => {
-                State::Failed("the scan stopped unexpectedly".into())
-            }
-        };
     }
 
     /// Returns whether the key was used.
@@ -100,6 +193,12 @@ impl Screen {
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
         );
         let yes = matches!(key.code, KeyCode::Char('y'));
+        if let State::RemovingHome { stop, .. } = &self.state
+            && key.code == KeyCode::Esc
+        {
+            stop.store(true, Ordering::Relaxed);
+            return true;
+        }
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
             State::Ready(mut view) if key.code == KeyCode::Enter => {
@@ -130,7 +229,10 @@ impl Screen {
                 }
             }
             State::Confirm { view, .. } if back => (State::Ready(view), true),
-            state @ (State::Confirm { .. } | State::Removing(_)) => (state, true),
+            state @ (State::Confirm { .. }
+            | State::Removing(_)
+            | State::RemovingHome { .. }
+            | State::RootPending { .. }) => (state, true),
             State::Done(_) | State::Failed(_) if matches!(key.code, KeyCode::Enter) => {
                 (State::NotStarted, true)
             }
@@ -144,32 +246,41 @@ impl Screen {
         match &self.state {
             State::Ready(_) => "↑↓/jk move · space select · a select category · enter remove…",
             State::Confirm { .. } => "y remove · n back",
+            State::RemovingHome { .. } => "esc stop after this Item",
             State::Done(_) | State::Failed(_) => "enter scan again",
-            State::NotStarted | State::Scanning(_) | State::Removing(_) => "",
+            State::NotStarted
+            | State::Scanning(_)
+            | State::Removing(_)
+            | State::RootPending { .. } => "",
         }
     }
 
+    #[cfg(test)]
     pub fn is_removing(&self) -> bool {
         matches!(self.state, State::Removing(_))
     }
 
-    /// Removes the confirmed Items. `run_root` runs the `sudo` commands with the TUI paused.
-    /// Fails when the TUI couldn't be brought back afterwards; the result is logged either way.
-    pub fn remove(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
+    /// Whether the root commands are waiting for [`Screen::run_root`].
+    pub fn needs_terminal(&self) -> bool {
+        matches!(self.state, State::RootPending { .. })
+    }
+
+    /// Runs the confirmed root commands; `run_root` runs them with the TUI paused. Fails when
+    /// the TUI couldn't be brought back afterwards; the result is logged either way.
+    pub fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
-        let State::Removing(view) = state else {
+        let State::RootPending {
+            plan,
+            mut outcomes,
+            mut log,
+        } = state
+        else {
             self.state = state;
             return Ok(());
         };
-        let (state, terminal) = match self.prepare() {
-            Ok((rules, mut log)) => {
-                let (outcomes, terminal) =
-                    remove::apply(&view.plan, &rules, &Mounts::load(), &mut log, run_root);
-                (State::Done(outcomes), terminal)
-            }
-            Err(err) => (State::Failed(format!("Nothing was removed: {err}")), Ok(())),
-        };
-        self.state = state;
+        let (root, terminal) = remove::remove_root(&plan, &mut log, run_root);
+        outcomes.extend(root);
+        self.state = State::Done(outcomes);
         terminal
     }
 
@@ -198,8 +309,16 @@ impl Screen {
             State::Confirm { view, in_use } => {
                 draw_confirm(frame, area, block, &view.plan, *in_use)
             }
-            State::Removing(_) => {
+            State::Removing(_) | State::RootPending { .. } => {
                 frame.render_widget(Paragraph::new("Removing…").block(block), area)
+            }
+            State::RemovingHome { now, stop, .. } => {
+                let text = if stop.load(Ordering::Relaxed) {
+                    format!("Stopping after {now}…")
+                } else {
+                    format!("Removing {now}…")
+                };
+                frame.render_widget(Paragraph::new(text).block(block), area)
             }
             State::Done(outcomes) => draw_done(frame, area, block, outcomes),
         }

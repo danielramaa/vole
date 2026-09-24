@@ -86,10 +86,11 @@ impl App {
                 clean.tick();
             }
             terminal.draw(|frame| self.draw(frame))?;
+            // Root commands need the terminal, which only the App has.
             if let Some(clean) = &mut self.clean
-                && clean.is_removing()
+                && clean.needs_terminal()
             {
-                clean.remove(&mut |commands| term::run_external(terminal, commands))?;
+                clean.run_root(&mut |commands| term::run_external(terminal, commands))?;
                 continue;
             }
             // Wake up now and then, so background work (the clean scan) shows up.

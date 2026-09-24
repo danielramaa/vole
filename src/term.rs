@@ -2,8 +2,10 @@ use std::io::{self, stdout};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::time::Duration;
 
 use ratatui::DefaultTerminal;
+use ratatui::crossterm::event;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
@@ -40,6 +42,12 @@ pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) ->
     };
     let resumed = resume(terminal);
     let _ = ignore_interrupts(false);
+    // Keys typed while the TUI was paused are not meant for it.
+    if resumed.is_ok() {
+        while event::poll(Duration::ZERO).unwrap_or(false) {
+            let _ = event::read();
+        }
+    }
 
     Ran {
         statuses,

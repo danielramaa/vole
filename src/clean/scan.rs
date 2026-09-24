@@ -234,6 +234,11 @@ impl Mounts {
     pub fn contains(&self, path: &Path) -> bool {
         self.0.contains(path)
     }
+
+    #[cfg(test)]
+    pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self(paths.into_iter().collect())
+    }
 }
 
 /// Decodes the `\040`-style escapes mountinfo uses for spaces and other special bytes.

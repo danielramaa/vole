@@ -1,4 +1,4 @@
-//! The `clean` screens: scanning, then the Plan with selection.
+//! The `clean` screens: scanning, the Plan with selection, confirmation, and the result.
 
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -11,26 +11,39 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
 use super::build_plan;
-use super::plan::Plan;
+use super::plan::{Item, Plan};
+use super::remove::{self, Log, Outcome, RunRoot};
+use super::scan::{ALLOWED_ROOTS, Mounts};
 use crate::config::Config;
+use crate::safety::Rules;
 use crate::size;
 
 pub struct Screen {
+    config: Config,
     state: State,
 }
 
 enum State {
     /// The scan starts on the first tick, so creating the screen touches nothing.
-    NotStarted(Config),
+    NotStarted,
     Scanning(Receiver<Result<Plan, String>>),
     Ready(PlanView),
+    /// Asking before anything is removed; `in_use` is the extra step for In Use Items.
+    Confirm {
+        view: PlanView,
+        in_use: bool,
+    },
+    /// Confirmed: the App runs the removal right after drawing this.
+    Removing(PlanView),
+    Done(Vec<Outcome>),
     Failed(String),
 }
 
 impl Screen {
     pub fn new(config: &Config) -> Self {
         Self {
-            state: State::NotStarted(config.clone()),
+            config: config.clone(),
+            state: State::NotStarted,
         }
     }
 
@@ -51,6 +64,7 @@ impl Screen {
     #[cfg(test)]
     pub fn with_plan(plan: Plan) -> Self {
         Self {
+            config: Config::default(),
             state: State::Ready(PlanView::new(plan)),
         }
     }
@@ -62,15 +76,15 @@ impl Screen {
 
     /// Starts the scan, then picks up the Plan once it is done.
     pub fn tick(&mut self) {
-        if let State::NotStarted(config) = &self.state {
-            self.state = State::Scanning(Self::start(config.clone()));
+        if let State::NotStarted = self.state {
+            self.state = State::Scanning(Self::start(self.config.clone()));
         }
         let State::Scanning(receiver) = &self.state else {
             return;
         };
         self.state = match receiver.try_recv() {
             Ok(Ok(plan)) => State::Ready(PlanView::new(plan)),
-            Ok(Err(err)) => State::Failed(err),
+            Ok(Err(err)) => State::Failed(format!("Could not build the plan: {err}")),
             Err(TryRecvError::Empty) => return,
             Err(TryRecvError::Disconnected) => {
                 State::Failed("the scan stopped unexpectedly".into())
@@ -80,33 +94,188 @@ impl Screen {
 
     /// Returns whether the key was used.
     pub fn on_key(&mut self, key: KeyEvent) -> bool {
-        match &mut self.state {
-            State::Ready(view) => view.on_key(key),
-            State::NotStarted(_) | State::Scanning(_) | State::Failed(_) => false,
-        }
+        let back = matches!(
+            key.code,
+            KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
+        );
+        let yes = matches!(key.code, KeyCode::Char('y'));
+        let state = std::mem::replace(&mut self.state, State::NotStarted);
+        let (state, used) = match state {
+            State::Ready(view) if key.code == KeyCode::Enter => {
+                if view.plan.selected().next().is_some() {
+                    (
+                        State::Confirm {
+                            view,
+                            in_use: false,
+                        },
+                        true,
+                    )
+                } else {
+                    (State::Ready(view), true)
+                }
+            }
+            State::Ready(mut view) => {
+                let used = view.on_key(key);
+                (State::Ready(view), used)
+            }
+            State::Confirm { view, in_use } if yes => {
+                let any_in_use = view.plan.selected().any(|item| item.in_use);
+                if any_in_use && !in_use {
+                    (State::Confirm { view, in_use: true }, true)
+                } else {
+                    (State::Removing(view), true)
+                }
+            }
+            State::Confirm { view, .. } if back => (State::Ready(view), true),
+            state @ (State::Confirm { .. } | State::Removing(_)) => (state, true),
+            State::Done(_) | State::Failed(_) if matches!(key.code, KeyCode::Enter) => {
+                (State::NotStarted, true)
+            }
+            state => (state, false),
+        };
+        self.state = state;
+        used
     }
 
     pub fn hint(&self) -> &'static str {
-        match self.state {
-            State::Ready(_) => "↑↓/jk move · space select · a select category",
-            State::NotStarted(_) | State::Scanning(_) | State::Failed(_) => "",
+        match &self.state {
+            State::Ready(_) => "↑↓/jk move · space select · a select category · enter remove…",
+            State::Confirm { .. } => "y remove · n back",
+            State::Done(_) | State::Failed(_) => "enter scan again",
+            State::NotStarted | State::Scanning(_) | State::Removing(_) => "",
         }
+    }
+
+    pub fn is_removing(&self) -> bool {
+        matches!(self.state, State::Removing(_))
+    }
+
+    /// Removes the confirmed Items. `run_root` runs the `sudo` commands with the TUI paused.
+    pub fn remove(&mut self, run_root: &mut RunRoot) {
+        let state = std::mem::replace(&mut self.state, State::NotStarted);
+        let State::Removing(view) = state else {
+            self.state = state;
+            return;
+        };
+        self.state = match self.prepare() {
+            Ok((rules, mut log)) => State::Done(remove::apply(
+                &view.plan,
+                &rules,
+                &Mounts::load(),
+                &mut log,
+                run_root,
+            )),
+            Err(err) => State::Failed(format!("Nothing was removed: {err}")),
+        };
+    }
+
+    /// Fresh path rules, and the Operation Log: nothing is removed if it can't be written.
+    fn prepare(&self) -> Result<(Rules, Log), String> {
+        let home = dirs::home_dir().ok_or("the home directory could not be found")?;
+        let rules = Rules::new(&home, ALLOWED_ROOTS, &self.config.protected_paths(&home))
+            .map_err(|err| format!("resolving {}: {err}", home.display()))?;
+        let path = Log::path().ok_or("the operation log's folder could not be found")?;
+        let log = Log::open(&path)
+            .map_err(|err| format!("opening the operation log {}: {err}", path.display()))?;
+        Ok((rules, log))
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered().title(" clean ");
         match &mut self.state {
-            State::NotStarted(_) | State::Scanning(_) => frame.render_widget(
+            State::NotStarted | State::Scanning(_) => frame.render_widget(
                 Paragraph::new("Measuring caches, the pacman cache and the journal…").block(block),
                 area,
             ),
-            State::Failed(err) => frame.render_widget(
-                Paragraph::new(format!("Could not build the plan: {err}")).block(block),
-                area,
-            ),
+            State::Failed(err) => {
+                frame.render_widget(Paragraph::new(err.as_str()).block(block), area)
+            }
             State::Ready(view) => view.draw(frame, area, block),
+            State::Confirm { view, in_use } => {
+                draw_confirm(frame, area, block, &view.plan, *in_use)
+            }
+            State::Removing(_) => {
+                frame.render_widget(Paragraph::new("Removing…").block(block), area)
+            }
+            State::Done(outcomes) => draw_done(frame, area, block, outcomes),
         }
     }
+}
+
+fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, in_use: bool) {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let selected: Vec<&Item> = plan.selected().collect();
+    let width = usize::from(block.inner(area).width);
+    let mut lines = Vec::new();
+    if in_use {
+        let count = selected.iter().filter(|item| item.in_use).count();
+        lines.push(Line::styled(
+            format!("{count} of these Items are in use by running programs."),
+            bold,
+        ));
+        lines.push(Line::from(
+            "Removing them can make those programs misbehave. Remove them anyway?",
+        ));
+    } else {
+        lines.push(Line::styled(
+            format!(
+                "Remove these {} Items, freeing about {}?",
+                selected.len(),
+                size::format(plan.selected_size())
+            ),
+            bold,
+        ));
+        lines.push(Line::from("Caches and the trash are deleted permanently."));
+        if selected.iter().any(|item| item.path().is_none()) {
+            lines.push(Line::from(
+                "For the pacman cache and the journal, vole pauses and sudo asks for your password.",
+            ));
+        }
+    }
+    lines.push(Line::default());
+    for item in &selected {
+        let mut spans = vec![Span::raw(format!("  {}", item.label))];
+        if item.in_use {
+            spans.push(Span::styled("  in use", bold));
+        }
+        lines.push(right_aligned(spans, size::format(item.size), width));
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome]) {
+    let width = usize::from(block.inner(area).width);
+    let freed: u64 = outcomes
+        .iter()
+        .filter(|o| o.error.is_none())
+        .map(|o| o.size)
+        .sum();
+    let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
+    let mut summary = format!("Freed about {}", size::format(freed));
+    if failed > 0 {
+        summary.push_str(&format!(" · {failed} failed"));
+    }
+    let mut lines = vec![
+        Line::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
+        Line::default(),
+    ];
+    for outcome in outcomes {
+        match &outcome.error {
+            None => lines.push(right_aligned(
+                vec![Span::raw(format!("  ✓ {}", outcome.label))],
+                size::format(outcome.size),
+                width,
+            )),
+            Some(err) => {
+                lines.push(Line::from(format!("  ✗ {}", outcome.label)));
+                lines.push(Line::styled(
+                    format!("      {err}"),
+                    Style::new().add_modifier(Modifier::DIM),
+                ));
+            }
+        }
+    }
+    frame.render_widget(Paragraph::new(lines).block(block), area);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -186,7 +355,7 @@ impl PlanView {
         frame.render_stateful_widget(list, list_area, &mut self.list);
 
         let total = format!(
-            " Selected {} of {} · nothing is removed yet",
+            " Selected {} of {}",
             size::format(self.plan.selected_size()),
             size::format(self.plan.size()),
         );
@@ -316,6 +485,57 @@ mod tests {
     fn sizes_line_up_with_wide_characters() {
         let line = right_aligned(vec![Span::raw("~/.cache/日本")], "1 B".into(), 20);
         assert_eq!(line.width(), 20);
+    }
+
+    fn is_confirming(screen: &Screen, step: bool) -> bool {
+        matches!(screen.state, State::Confirm { in_use, .. } if in_use == step)
+    }
+
+    #[test]
+    fn enter_asks_for_confirmation_only_with_a_selection() {
+        let mut screen = screen();
+        assert!(press(&mut screen, KeyCode::Enter));
+        assert!(screen.has_plan());
+        press(&mut screen, KeyCode::Char('a'));
+        press(&mut screen, KeyCode::Enter);
+        assert!(is_confirming(&screen, false));
+        // Backing out keeps the selection, and q goes back instead of leaving.
+        assert!(press(&mut screen, KeyCode::Char('q')));
+        assert_eq!(selected_size(&screen), 30);
+        press(&mut screen, KeyCode::Enter);
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(screen.is_removing());
+    }
+
+    #[test]
+    fn in_use_items_need_a_second_confirmation() {
+        let mut screen = screen();
+        if let State::Ready(view) = &mut screen.state {
+            view.plan.categories[1].items[0].in_use = true;
+        }
+        for _ in 0..4 {
+            press(&mut screen, KeyCode::Char('j'));
+        }
+        press(&mut screen, KeyCode::Char(' '));
+        press(&mut screen, KeyCode::Enter);
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(is_confirming(&screen, true));
+        press(&mut screen, KeyCode::Esc);
+        assert!(screen.has_plan());
+        press(&mut screen, KeyCode::Enter);
+        press(&mut screen, KeyCode::Char('y'));
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(screen.is_removing());
+    }
+
+    #[test]
+    fn keys_do_nothing_while_removing() {
+        let mut screen = screen();
+        press(&mut screen, KeyCode::Char('a'));
+        press(&mut screen, KeyCode::Enter);
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(press(&mut screen, KeyCode::Char('q')));
+        assert!(screen.is_removing());
     }
 
     #[test]

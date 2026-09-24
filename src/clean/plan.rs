@@ -18,6 +18,36 @@ pub enum RootCommand {
 pub const PACCACHE: &str = "/usr/bin/paccache";
 pub const JOURNALCTL: &str = "/usr/bin/journalctl";
 
+impl RootCommand {
+    pub fn program(self) -> &'static str {
+        match self {
+            RootCommand::PacmanKeep(_) | RootCommand::PacmanUninstalled => PACCACHE,
+            RootCommand::JournalVacuum(_) => JOURNALCTL,
+        }
+    }
+
+    /// The arguments that apply the command: fixed flags and numbers only (ADR 0001).
+    pub fn args(self) -> Vec<String> {
+        match self {
+            RootCommand::PacmanKeep(keep) => vec!["-r".into(), format!("-k{keep}")],
+            RootCommand::PacmanUninstalled => vec!["-r".into(), "-u".into(), "-k0".into()],
+            RootCommand::JournalVacuum(mb) => {
+                vec!["--rotate".into(), format!("--vacuum-size={mb}M")]
+            }
+        }
+    }
+
+    /// Commands run in this order: uninstalled packages go before `PacmanKeep`, which
+    /// would otherwise also trim them.
+    pub fn order(self) -> u8 {
+        match self {
+            RootCommand::PacmanUninstalled => 0,
+            RootCommand::PacmanKeep(_) => 1,
+            RootCommand::JournalVacuum(_) => 2,
+        }
+    }
+}
+
 /// What an Item is, and so how it may be removed. Every kind has exactly one way (ADR 0003).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Kind {
@@ -115,6 +145,13 @@ impl Plan {
         self.categories.iter().map(Category::selected_size).sum()
     }
 
+    pub fn selected(&self) -> impl Iterator<Item = &Item> {
+        self.categories
+            .iter()
+            .flat_map(|category| &category.items)
+            .filter(|item| item.selected)
+    }
+
     pub fn items_mut(&mut self) -> impl Iterator<Item = &mut Item> {
         self.categories
             .iter_mut()
@@ -133,6 +170,32 @@ mod tests {
             Item::new("b", Kind::Trash("/b".into()), 5),
         ];
         category
+    }
+
+    #[test]
+    fn root_commands_take_only_flags_and_numbers() {
+        let commands = [
+            RootCommand::PacmanKeep(2),
+            RootCommand::PacmanUninstalled,
+            RootCommand::JournalVacuum(200),
+        ];
+        for command in commands {
+            assert!(command.program().starts_with("/usr/bin/"));
+            for arg in command.args() {
+                assert!(
+                    arg.starts_with('-')
+                        && arg
+                            .chars()
+                            .all(|c| c.is_ascii_alphanumeric() || "-=".contains(c)),
+                    "{arg}"
+                );
+            }
+        }
+        assert_eq!(RootCommand::PacmanKeep(3).args(), ["-r", "-k3"]);
+        assert_eq!(
+            RootCommand::JournalVacuum(200).args(),
+            ["--rotate", "--vacuum-size=200M"]
+        );
     }
 
     #[test]

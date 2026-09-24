@@ -1,6 +1,6 @@
 //! The Categories inside the home directory, measured by walking the disk.
 
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::fs::{self, Metadata};
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -197,20 +197,26 @@ fn is_real_dir(path: &Path) -> bool {
 }
 
 /// Space freed by removing `path`: allocated blocks, not following symlinks, not crossing into
-/// other filesystems, and counting hard-linked files once.
+/// other filesystems. A hard-linked file only counts when all of its links are inside `path`,
+/// since otherwise removing `path` doesn't free it.
 pub fn disk_usage(path: &Path) -> u64 {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return 0;
     };
     let device = meta.dev();
-    let mut seen = HashSet::new();
+    // Inode → (links seen, links in total, bytes).
+    let mut linked: HashMap<u64, (u64, u64, u64)> = HashMap::new();
     let mut total = 0;
     let mut stack: Vec<(PathBuf, Metadata)> = vec![(path.to_path_buf(), meta)];
     while let Some((path, meta)) = stack.pop() {
         if meta.dev() != device {
             continue;
         }
-        if !meta.is_dir() && meta.nlink() > 1 && !seen.insert(meta.ino()) {
+        if !meta.is_dir() && meta.nlink() > 1 {
+            let entry = linked
+                .entry(meta.ino())
+                .or_insert((0, meta.nlink(), meta.blocks() * 512));
+            entry.0 += 1;
             continue;
         }
         total += meta.blocks() * 512;
@@ -223,7 +229,12 @@ pub fn disk_usage(path: &Path) -> u64 {
             }
         }
     }
-    total
+    let freed_links: u64 = linked
+        .values()
+        .filter(|(seen, links, _)| seen >= links)
+        .map(|(_, _, bytes)| bytes)
+        .sum();
+    total + freed_links
 }
 
 #[cfg(test)]
@@ -354,6 +365,15 @@ mod tests {
         let found = home_categories(home.path(), &rules);
         assert_eq!(paths(&found.user_cache), [home.path().join(".cache/other")]);
         assert!(found.user_cache.note.is_some());
+    }
+
+    #[test]
+    fn disk_usage_leaves_out_files_linked_from_elsewhere() {
+        let home = TestDir::new();
+        let file = home.file(".cache/uv/a", 100_000);
+        home.dir("project");
+        fs::hard_link(&file, home.path().join("project/a")).unwrap();
+        assert!(disk_usage(&home.path().join(".cache/uv")) < 100_000);
     }
 
     #[test]

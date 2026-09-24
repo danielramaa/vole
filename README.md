@@ -135,7 +135,7 @@ In `clean`:
 |---|---|
 | `Space` | Select or deselect the Item (on a Category, the whole Category) |
 | `a` | Select or deselect every Item in the current Category |
-| `Enter` | Review the selection, then `y` to remove it or `n` to go back. Items in use by a running program ask once more. |
+| `Enter` | Review the selection, then `y` to remove it or `n` to go back. If an Item is in use by a running program, removing it takes `Y` (shift+y) on a second screen. While removing, `Esc` stops after the current Item. |
 
 ## Configuration
 

@@ -109,11 +109,24 @@ fn remove_regenerable(path: &Path, rules: &Rules, mounts: &Mounts) -> Result<(),
 /// Removes what is inside the trash, not the trash folder itself.
 fn empty_trash(trash: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), String> {
     final_check(trash, rules, mounts)?;
-    if !fs::symlink_metadata(trash).is_ok_and(|meta| meta.is_dir()) {
+    let trash_meta =
+        fs::symlink_metadata(trash).map_err(|err| format!("{}: {err}", trash.display()))?;
+    if !trash_meta.is_dir() {
         return Err(format!("refused: {} is not a folder", trash.display()));
     }
     let mut first_error = None;
     for part in trash_parts(trash, rules) {
+        // A part mounted from elsewhere is not the trash's to empty.
+        let same_device = fs::symlink_metadata(&part).is_ok_and(|m| m.dev() == trash_meta.dev());
+        let checked = final_check(&part, rules, mounts).and_then(|_| {
+            same_device
+                .then_some(())
+                .ok_or_else(|| format!("refused: {} is a mount point", part.display()))
+        });
+        if let Err(err) = checked {
+            first_error.get_or_insert(err);
+            continue;
+        }
         let entries = fs::read_dir(&part).map_err(|err| format!("{}: {err}", part.display()))?;
         for entry in entries {
             let result = entry
@@ -425,6 +438,18 @@ mod tests {
         assert_eq!(fs::read_dir(trash.join("files")).unwrap().count(), 0);
         assert_eq!(fs::read_dir(trash.join("info")).unwrap().count(), 0);
         assert!(trash.join("files").is_dir());
+    }
+
+    #[test]
+    fn does_not_empty_a_mounted_trash_part() {
+        let s = setup(TestDir::new());
+        let mounted = s.home.file(".local/share/Trash/files/project", 10);
+        s.home.file(".local/share/Trash/info/old.trashinfo", 10);
+        let trash = s.home.path().join(".local/share/Trash");
+        let mounts = Mounts::from_paths([trash.join("files")]);
+        let outcomes = apply_items(&s, vec![selected(Kind::Trash(trash.clone()))], &mounts);
+        assert!(outcomes[0].error.as_ref().unwrap().contains("mount point"));
+        assert!(mounted.exists());
     }
 
     #[test]

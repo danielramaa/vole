@@ -15,23 +15,23 @@ pub fn pacman(keep: u32) -> Category {
         category.note = Some("paccache not found; install pacman-contrib".into());
         return category;
     }
-    // `-k<n>` covers uninstalled packages too, and paccache can't leave them out. So the
-    // uninstalled Item gets all of them, and the installed Item only what `-k<n>` removes
-    // beyond that: the sizes don't overlap, and removing the uninstalled ones first (M2)
-    // frees exactly both.
+    // `-k<n>` covers uninstalled packages too, and paccache can't leave them out. So that
+    // Item says so, and the uninstalled Item only gets what `-k<n>` leaves of them. It then
+    // can't be selected without the first one (`RootCommand::requires`), and runs after it,
+    // so what is removed is always what the selected sizes add up to.
     let sizes = [
         (
-            format!("older versions of installed packages (keeping {keep})"),
+            format!("older versions of every package, installed or not (keeping {keep})"),
             RootCommand::PacmanKeep(keep),
-            paccache_dry_run(&[format!("-k{keep}")]).and_then(|all| {
-                let uninstalled = paccache_dry_run(&["-u".into(), format!("-k{keep}")])?;
-                Ok(all.saturating_sub(uninstalled))
-            }),
+            paccache_dry_run(&[format!("-k{keep}")]),
         ),
         (
-            "all versions of uninstalled packages".into(),
+            "remaining versions of uninstalled packages".into(),
             RootCommand::PacmanUninstalled,
-            paccache_dry_run(&["-u".into(), "-k0".into()]),
+            paccache_dry_run(&["-u".into(), "-k0".into()]).and_then(|all| {
+                let trimmed = paccache_dry_run(&["-u".into(), format!("-k{keep}")])?;
+                Ok(all.saturating_sub(trimmed))
+            }),
         ),
     ];
     let mut errors: Vec<String> = Vec::new();

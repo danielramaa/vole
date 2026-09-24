@@ -7,6 +7,7 @@ mod scan;
 mod screen;
 
 use std::path::Path;
+use std::thread;
 
 use anyhow::{Context, Result};
 
@@ -19,19 +20,31 @@ pub use screen::Screen;
 pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
     let rules = Rules::new(home, scan::ALLOWED_ROOTS, &config.protected_paths(home))
         .with_context(|| format!("resolving {}", home.display()))?;
-    let found = scan::home_categories(home, &rules, &scan::Mounts::load());
+    // The measurements don't depend on each other, so the tools run while the disk is walked.
+    let (pacman, journal, found, open) = thread::scope(|scope| {
+        let pacman = scope.spawn(|| root::pacman(config.pacman_keep_versions));
+        let journal = scope.spawn(|| root::journal(config.journal_max_mb));
+        let open = scope.spawn(in_use::open_paths);
+        let found = scan::home_categories(home, &rules, &scan::Mounts::load());
+        let join = "a measuring thread panicked";
+        (
+            pacman.join().expect(join),
+            journal.join().expect(join),
+            found,
+            open.join().expect(join),
+        )
+    });
     let mut plan = Plan {
         categories: vec![
-            root::pacman(config.pacman_keep_versions),
+            pacman,
             found.yay,
             found.developer,
-            root::journal(config.journal_max_mb),
+            journal,
             found.user_cache,
             found.trash,
         ],
     };
 
-    let open = in_use::open_paths();
     for item in plan.items_mut() {
         let in_use = item
             .path()

@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use serde::Serialize;
 
 use super::plan::{Item, Kind, Plan, RootCommand};
-use super::scan::{Mounts, trash_parts};
+use super::scan::{Mounts, is_real_dir, trash_parts};
 use crate::safety::Rules;
 use crate::term::Ran;
 
@@ -124,12 +124,9 @@ pub fn not_attempted(item: &Item, why: &str) -> Outcome {
 
 /// The last check before removing `path`: the path rules, and not a mount point.
 fn final_check(path: &Path, rules: &Rules, mounts: &Mounts) -> Result<PathBuf, String> {
-    rules
+    let real = rules
         .check(path)
         .map_err(|refusal| format!("refused: {} is {refusal}", path.display()))?;
-    let real = rules
-        .resolve(path)
-        .ok_or_else(|| format!("refused: {} moved", path.display()))?;
     if mounts.contains(&real) {
         return Err(format!("refused: {} is a mount point", path.display()));
     }
@@ -144,11 +141,11 @@ fn remove_regenerable(path: &Path, rules: &Rules, mounts: &Mounts) -> Result<(),
 /// Removes what is inside the trash, not the trash folder itself.
 fn empty_trash(trash: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), String> {
     final_check(trash, rules, mounts)?;
-    let trash_meta =
-        fs::symlink_metadata(trash).map_err(|err| format!("{}: {err}", trash.display()))?;
-    if !trash_meta.is_dir() {
+    if !is_real_dir(trash) {
         return Err(format!("refused: {} is not a folder", trash.display()));
     }
+    let trash_meta =
+        fs::symlink_metadata(trash).map_err(|err| format!("{}: {err}", trash.display()))?;
     let mut first_error = None;
     let mut usable = Vec::new();
     for part in trash_parts(trash, rules) {

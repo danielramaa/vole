@@ -144,11 +144,10 @@ impl<'a> Builder<'a> {
             return false;
         }
         // A mount point is not the cache's to remove, even when it holds the same filesystem.
-        let allowed = self.rules.check(path).is_ok()
-            && !self
-                .rules
-                .resolve(path)
-                .is_some_and(|real| self.mounts.contains(&real));
+        let allowed = self
+            .rules
+            .check(path)
+            .is_ok_and(|real| !self.mounts.contains(&real));
         if !allowed {
             self.refused += 1;
         }
@@ -209,7 +208,7 @@ pub fn trash_parts(trash: &Path, rules: &Rules) -> Vec<PathBuf> {
         .collect()
 }
 
-fn is_real_dir(path: &Path) -> bool {
+pub(super) fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 

@@ -1,11 +1,14 @@
 use std::io::{self, stdout};
 use std::process::{Command, ExitStatus};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use ratatui::DefaultTerminal;
 use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use signal_hook::consts::{SIGINT, SIGQUIT};
 
 /// Pauses the TUI, runs `commands` one after another in the normal terminal (so `sudo` can ask
 /// for the password itself), then brings the TUI back. Returns each command's exit status.
@@ -15,7 +18,9 @@ pub fn run_external(
     terminal: &mut DefaultTerminal,
     commands: &mut [Command],
 ) -> io::Result<Vec<io::Result<ExitStatus>>> {
-    let paused = pause(terminal);
+    // Ctrl+C at the password prompt goes to the whole foreground process group. Like
+    // system(3), vole ignores it while it waits, so only the command stops.
+    let paused = ignore_interrupts(true).and_then(|()| pause(terminal));
     let statuses = match &paused {
         Ok(()) => commands
             .iter_mut()
@@ -27,10 +32,29 @@ pub fn run_external(
         Err(_) => Vec::new(),
     };
     let resumed = resume(terminal);
+    let _ = ignore_interrupts(false);
 
     paused?;
     resumed?;
     Ok(statuses)
+}
+
+/// Makes SIGINT and SIGQUIT do nothing to vole (`true`), or act as usual again (`false`).
+/// vole's handler is replaced by the default on `exec`, so the commands it runs still get them.
+fn ignore_interrupts(ignore: bool) -> io::Result<()> {
+    static ACT: OnceLock<Arc<AtomicBool>> = OnceLock::new();
+    let act = match ACT.get() {
+        Some(act) => act,
+        None => {
+            let act = Arc::new(AtomicBool::new(true));
+            for signal in [SIGINT, SIGQUIT] {
+                signal_hook::flag::register_conditional_default(signal, Arc::clone(&act))?;
+            }
+            ACT.get_or_init(|| act)
+        }
+    };
+    act.store(!ignore, Ordering::SeqCst);
+    Ok(())
 }
 
 /// The command line, as shown to the user before it runs.
@@ -58,4 +82,22 @@ fn resume(terminal: &mut DefaultTerminal) -> io::Result<()> {
         terminal.clear(),
     ];
     steps.into_iter().collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn interrupts_can_be_ignored_while_a_command_runs() {
+        ignore_interrupts(true).unwrap();
+        signal_hook::low_level::raise(SIGINT).unwrap();
+        // vole is still running, but a command it starts gets the default action.
+        let status = Command::new("sh")
+            .args(["-c", "kill -INT $$; exit 0"])
+            .status()
+            .unwrap();
+        ignore_interrupts(false).unwrap();
+        assert!(!status.success());
+    }
 }

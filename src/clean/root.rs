@@ -34,14 +34,23 @@ pub fn pacman(keep: u32) -> Category {
             paccache_dry_run(&["-u".into(), "-k0".into()]),
         ),
     ];
+    let mut errors: Vec<String> = Vec::new();
     for (label, command, size) in sizes {
         match size {
             Ok(0) => {}
             Ok(size) => category
                 .items
                 .push(Item::new(label, Kind::Root(command), size)),
-            Err(err) => category.note = Some(format!("{err:#}")),
+            Err(err) => {
+                let err = format!("{err:#}");
+                if !errors.contains(&err) {
+                    errors.push(err);
+                }
+            }
         }
+    }
+    if !errors.is_empty() {
+        category.note = Some(errors.join("; "));
     }
     category
 }
@@ -106,9 +115,17 @@ fn run(program: &str, args: &[String]) -> Result<String> {
     let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
     text.push_str(&String::from_utf8_lossy(&output.stderr));
     if !output.status.success() {
-        bail!("{program} failed: {}", text.trim());
+        // Notes are shown on one row, so only the first line of the tool's message.
+        bail!("{program} failed: {}", first_line(&text));
     }
     Ok(text)
+}
+
+fn first_line(text: &str) -> &str {
+    text.lines()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or("")
 }
 
 /// Reads e.g. `==> finished dry run: 5 candidates (disk space saved: 164.84 MiB)`.
@@ -168,6 +185,15 @@ mod tests {
         dir.dir("machine-id");
         assert!(can_read_system_journal(dir.path()));
         assert!(can_read_system_journal(&dir.path().join("missing")));
+    }
+
+    #[test]
+    fn errors_keep_only_the_first_line() {
+        assert_eq!(
+            first_line("\n  error: no cache dir\nusage: paccache ...\n"),
+            "error: no cache dir"
+        );
+        assert_eq!(first_line(""), "");
     }
 
     #[test]

@@ -20,16 +20,23 @@ pub struct Screen {
 }
 
 enum State {
+    /// The scan starts on the first tick, so creating the screen touches nothing.
+    NotStarted(Config),
     Scanning(Receiver<Result<Plan, String>>),
     Ready(PlanView),
     Failed(String),
 }
 
 impl Screen {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            state: State::NotStarted(config.clone()),
+        }
+    }
+
     /// Starts building the Plan in the background.
-    pub fn start(config: &Config) -> Self {
+    fn start(config: Config) -> Receiver<Result<Plan, String>> {
         let (sender, receiver) = mpsc::channel();
-        let config = config.clone();
         thread::spawn(move || {
             let plan = match dirs::home_dir() {
                 Some(home) => build_plan(&home, &config).map_err(|err| format!("{err:#}")),
@@ -38,9 +45,7 @@ impl Screen {
             // The user may have left the screen already; then nobody is listening.
             let _ = sender.send(plan);
         });
-        Self {
-            state: State::Scanning(receiver),
-        }
+        receiver
     }
 
     #[cfg(test)]
@@ -50,8 +55,16 @@ impl Screen {
         }
     }
 
-    /// Picks up the Plan once the scan is done.
+    #[cfg(test)]
+    pub fn has_plan(&self) -> bool {
+        matches!(self.state, State::Ready(_))
+    }
+
+    /// Starts the scan, then picks up the Plan once it is done.
     pub fn tick(&mut self) {
+        if let State::NotStarted(config) = &self.state {
+            self.state = State::Scanning(Self::start(config.clone()));
+        }
         let State::Scanning(receiver) = &self.state else {
             return;
         };
@@ -69,21 +82,21 @@ impl Screen {
     pub fn on_key(&mut self, key: KeyEvent) -> bool {
         match &mut self.state {
             State::Ready(view) => view.on_key(key),
-            State::Scanning(_) | State::Failed(_) => false,
+            State::NotStarted(_) | State::Scanning(_) | State::Failed(_) => false,
         }
     }
 
     pub fn hint(&self) -> &'static str {
         match self.state {
             State::Ready(_) => "↑↓/jk move · space select · a select category",
-            State::Scanning(_) | State::Failed(_) => "",
+            State::NotStarted(_) | State::Scanning(_) | State::Failed(_) => "",
         }
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered().title(" clean ");
         match &mut self.state {
-            State::Scanning(_) => frame.render_widget(
+            State::NotStarted(_) | State::Scanning(_) => frame.render_widget(
                 Paragraph::new("Measuring caches, the pacman cache and the journal…").block(block),
                 area,
             ),

@@ -75,7 +75,7 @@ impl App {
     fn open(&mut self, module: Option<Module>) {
         self.module = module;
         if module == Some(Module::Clean) && self.clean.is_none() {
-            self.clean = Some(clean::Screen::start(&self.config));
+            self.clean = Some(clean::Screen::new(&self.config));
         }
     }
 
@@ -212,9 +212,33 @@ mod tests {
 
     #[test]
     fn q_quits_when_opened_directly() {
-        let mut app = App::new(Some(Module::Status), Config::default());
+        for module in Module::all() {
+            let mut app = App::new(Some(*module), Config::default());
+            press(&mut app, KeyCode::Char('q'));
+            assert!(app.quit, "{module:?}");
+        }
+    }
+
+    #[test]
+    fn clean_leaves_on_q_and_esc_once_the_plan_is_shown() {
+        for code in [KeyCode::Char('q'), KeyCode::Esc] {
+            let mut app = App::new(None, Config::default());
+            press(&mut app, KeyCode::Enter);
+            app.clean = Some(clean::Screen::with_plan(Default::default()));
+            press(&mut app, code);
+            assert_eq!(app.module, None);
+        }
+    }
+
+    #[test]
+    fn reopening_clean_keeps_its_screen() {
+        let mut app = App::new(None, Config::default());
+        press(&mut app, KeyCode::Enter);
+        app.clean = Some(clean::Screen::with_plan(Default::default()));
         press(&mut app, KeyCode::Char('q'));
-        assert!(app.quit);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.module, Some(Module::Clean));
+        assert!(app.clean.as_ref().is_some_and(clean::Screen::has_plan));
     }
 
     #[test]

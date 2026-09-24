@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootCommand {
     /// Old versions of installed packages, keeping this many of each (`paccache -k<n>`).
+    /// paccache applies this to uninstalled packages too, so `PacmanUninstalled` runs first.
     PacmanKeep(u32),
     /// Every cached version of uninstalled packages (`paccache -uk0`).
     PacmanUninstalled,
@@ -15,24 +16,6 @@ pub enum RootCommand {
 
 pub const PACCACHE: &str = "/usr/bin/paccache";
 pub const JOURNALCTL: &str = "/usr/bin/journalctl";
-
-impl RootCommand {
-    pub fn program(self) -> &'static str {
-        match self {
-            RootCommand::PacmanKeep(_) | RootCommand::PacmanUninstalled => PACCACHE,
-            RootCommand::JournalVacuum(_) => JOURNALCTL,
-        }
-    }
-
-    /// The `paccache` options that pick the packages, shared by the dry run and the removal.
-    pub fn paccache_selection(self) -> Option<Vec<String>> {
-        match self {
-            RootCommand::PacmanKeep(keep) => Some(vec![format!("-k{keep}")]),
-            RootCommand::PacmanUninstalled => Some(vec!["-u".into(), "-k0".into()]),
-            RootCommand::JournalVacuum(_) => None,
-        }
-    }
-}
 
 /// What an Item is, and so how it may be removed. Every kind has exactly one way (ADR 0003).
 #[derive(Debug, Clone, PartialEq, Eq)]

@@ -173,14 +173,14 @@ impl App {
                 frame.render_widget(Line::from(" ↑↓/jk move · enter/l open · q quit"), footer);
             }
             Some(module) => {
-                let mut hint = String::from(" ");
+                let mut hints = Vec::new();
+                // Whether q leaves the module here, or the module uses it (e.g. to go back).
+                let mut can_leave = true;
                 match (module, &mut self.clean) {
                     (Module::Clean, Some(clean)) => {
                         clean.draw(frame, body);
-                        if !clean.hint().is_empty() {
-                            hint.push_str(clean.hint());
-                            hint.push_str(" · ");
-                        }
+                        hints.push(clean.hint());
+                        can_leave = clean.can_leave();
                     }
                     _ => frame.render_widget(
                         Paragraph::new(format!("{}\n\nComing soon.", module.description()))
@@ -188,12 +188,15 @@ impl App {
                         body,
                     ),
                 }
-                hint.push_str(if self.started_on_menu {
-                    "q/h back"
-                } else {
-                    "q quit"
-                });
-                frame.render_widget(Line::from(hint), footer);
+                if can_leave {
+                    hints.push(if self.started_on_menu {
+                        "q/h back"
+                    } else {
+                        "q quit"
+                    });
+                }
+                hints.retain(|hint| !hint.is_empty());
+                frame.render_widget(Line::from(format!(" {}", hints.join(" · "))), footer);
             }
         }
     }
@@ -236,6 +239,34 @@ mod tests {
             press(&mut app, code);
             assert_eq!(app.module, None);
         }
+    }
+
+    fn footer(app: &mut App) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 6);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..80).map(|x| buffer[(x, 5)].symbol()).collect()
+    }
+
+    #[test]
+    fn footer_offers_quit_only_where_q_quits() {
+        let mut first = crate::clean::plan::Category::new("Test");
+        let mut item = crate::clean::plan::Item::new(
+            "a",
+            crate::clean::plan::Kind::Regenerable("/a".into()),
+            1,
+        );
+        item.selected = true;
+        first.items = vec![item];
+        let mut app = App::new(Some(Module::Clean), Config::default());
+        app.clean = Some(clean::Screen::with_plan(crate::clean::plan::Plan {
+            categories: vec![first],
+        }));
+        assert!(footer(&mut app).contains("q quit"));
+        press(&mut app, KeyCode::Enter);
+        let confirming = footer(&mut app);
+        assert!(confirming.contains("n back") && !confirming.contains("q quit"));
     }
 
     #[test]

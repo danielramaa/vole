@@ -385,6 +385,7 @@ fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome]) 
         Line::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
         Line::default(),
     ];
+    let dim = Style::new().add_modifier(Modifier::DIM);
     for outcome in outcomes {
         match &outcome.error {
             None => lines.push(right_aligned(
@@ -394,11 +395,11 @@ fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome]) 
             )),
             Some(err) => {
                 lines.push(Line::from(format!("  ✗ {}", outcome.label)));
-                lines.push(Line::styled(
-                    format!("      {err}"),
-                    Style::new().add_modifier(Modifier::DIM),
-                ));
+                lines.push(Line::styled(format!("      {err}"), dim));
             }
+        }
+        if let Some(err) = &outcome.log_error {
+            lines.push(Line::styled(format!("      ! {err}"), dim));
         }
     }
     frame.render_widget(Paragraph::new(lines).block(block), area);

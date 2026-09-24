@@ -166,11 +166,13 @@ impl<'a> Builder<'a> {
             self.refused += 1;
             return;
         }
-        let size = trash_parts(&path, self.rules)
+        let entries: Vec<PathBuf> = trash_parts(&path, self.rules)
             .iter()
             .flat_map(|part| fs::read_dir(part).into_iter().flatten().flatten())
-            .map(|entry| disk_usage(&entry.path(), self.mounts))
-            .sum();
+            .map(|entry| entry.path())
+            .collect();
+        // One walk over every entry, so a file linked from two entries counts once.
+        let size = disk_usage_all(&entries, self.mounts);
         self.push("empty the trash".into(), Kind::Trash(path), size);
     }
 
@@ -256,31 +258,42 @@ fn unescape_octal(field: &str) -> PathBuf {
 }
 
 /// Space freed by removing `path`: allocated blocks, not following symlinks, not crossing into
-/// other filesystems or mount points. A hard-linked file only counts when all of its links are inside `path`,
-/// since otherwise removing `path` doesn't free it.
+/// other filesystems or mount points. A hard-linked file only counts when all of its links are
+/// inside `path`, since otherwise removing `path` doesn't free it.
 pub fn disk_usage(path: &Path, mounts: &Mounts) -> u64 {
-    let Ok(meta) = fs::symlink_metadata(path) else {
-        return 0;
-    };
-    // Walk the real path, so it can be compared with the mount points.
-    let path = if meta.is_symlink() {
-        path.to_path_buf()
-    } else {
-        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
-    };
-    let device = meta.dev();
-    // Inode → (links seen, links in total, bytes).
-    let mut linked: HashMap<u64, (u64, u64, u64)> = HashMap::new();
+    disk_usage_all(std::slice::from_ref(&path.to_path_buf()), mounts)
+}
+
+/// [`disk_usage`] of several paths removed together, measured in one walk.
+pub fn disk_usage_all(paths: &[PathBuf], mounts: &Mounts) -> u64 {
+    // (path, metadata, device of the path it was reached from)
+    let mut stack: Vec<(PathBuf, Metadata, u64)> = Vec::new();
+    for path in paths {
+        let Ok(meta) = fs::symlink_metadata(path) else {
+            continue;
+        };
+        // Walk the real path, so it can be compared with the mount points.
+        let path = if meta.is_symlink() {
+            path.clone()
+        } else {
+            fs::canonicalize(path).unwrap_or_else(|_| path.clone())
+        };
+        let device = meta.dev();
+        stack.push((path, meta, device));
+    }
+    // (device, inode) → (links seen, links in total, bytes).
+    let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
     let mut total = 0;
-    let mut stack: Vec<(PathBuf, Metadata)> = vec![(path, meta)];
-    while let Some((path, meta)) = stack.pop() {
+    while let Some((path, meta, device)) = stack.pop() {
         if meta.dev() != device || (meta.is_dir() && mounts.contains(&path)) {
             continue;
         }
         if !meta.is_dir() && meta.nlink() > 1 {
-            let entry = linked
-                .entry(meta.ino())
-                .or_insert((0, meta.nlink(), meta.blocks() * 512));
+            let entry = linked.entry((meta.dev(), meta.ino())).or_insert((
+                0,
+                meta.nlink(),
+                meta.blocks() * 512,
+            ));
             entry.0 += 1;
             continue;
         }
@@ -289,7 +302,7 @@ pub fn disk_usage(path: &Path, mounts: &Mounts) -> u64 {
             for entry in fs::read_dir(&path).into_iter().flatten().flatten() {
                 // `DirEntry::metadata` doesn't follow symlinks.
                 if let Ok(meta) = entry.metadata() {
-                    stack.push((entry.path(), meta));
+                    stack.push((entry.path(), meta, device));
                 }
             }
         }
@@ -478,6 +491,16 @@ mod tests {
             disk_usage(&home.path().join("dir"), &Mounts::default()),
             dir + one
         );
+    }
+
+    #[test]
+    fn trash_entries_sharing_a_file_count_it_once() {
+        let home = TestDir::new();
+        let file = home.file(".local/share/Trash/files/a", 100_000);
+        fs::hard_link(&file, home.path().join(".local/share/Trash/files/b")).unwrap();
+        let found = home_categories(home.path(), &rules(&home), &Mounts::default());
+        let one = fs::metadata(&file).unwrap().blocks() * 512;
+        assert_eq!(found.trash.items[0].size, one);
     }
 
     #[test]

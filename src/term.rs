@@ -7,25 +7,40 @@ use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
 
-/// Pauses the TUI, runs `command` in the normal terminal (so `sudo` can ask for the
-/// password itself), then brings the TUI back.
+/// Pauses the TUI, runs `commands` one after another in the normal terminal (so `sudo` can ask
+/// for the password itself), then brings the TUI back. Returns each command's exit status.
 ///
-/// The TUI is always brought back, even when pausing or the command fails.
-#[allow(dead_code)] // first used by `clean` in M2
+/// The TUI is always brought back, even when pausing or a command fails.
 pub fn run_external(
     terminal: &mut DefaultTerminal,
-    command: &mut Command,
-) -> io::Result<ExitStatus> {
+    commands: &mut [Command],
+) -> io::Result<Vec<io::Result<ExitStatus>>> {
     let paused = pause(terminal);
-    let status = match &paused {
-        Ok(()) => command.status(),
-        Err(_) => Err(io::Error::other("terminal could not be paused")),
+    let statuses = match &paused {
+        Ok(()) => commands
+            .iter_mut()
+            .map(|command| {
+                println!("vole: running {}", describe(command));
+                command.status()
+            })
+            .collect(),
+        Err(_) => Vec::new(),
     };
     let resumed = resume(terminal);
 
     paused?;
     resumed?;
-    status
+    Ok(statuses)
+}
+
+/// The command line, as shown to the user before it runs.
+pub fn describe(command: &Command) -> String {
+    let mut line = command.get_program().to_string_lossy().into_owned();
+    for arg in command.get_args() {
+        line.push(' ');
+        line.push_str(&arg.to_string_lossy());
+    }
+    line
 }
 
 fn pause(terminal: &mut DefaultTerminal) -> io::Result<()> {

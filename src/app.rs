@@ -12,6 +12,7 @@ use ratatui::widgets::{Block, List, ListState, Paragraph};
 
 use crate::clean;
 use crate::config::Config;
+use crate::term;
 
 /// The modules of vole. The doc comments are used both for `--help` and for the menu.
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
@@ -85,6 +86,12 @@ impl App {
                 clean.tick();
             }
             terminal.draw(|frame| self.draw(frame))?;
+            if let Some(clean) = &mut self.clean
+                && clean.is_removing()
+            {
+                clean.remove(&mut |commands| term::run_external(terminal, commands));
+                continue;
+            }
             // Wake up now and then, so background work (the clean scan) shows up.
             if event::poll(Duration::from_millis(100))?
                 && let Event::Key(key) = event::read()?

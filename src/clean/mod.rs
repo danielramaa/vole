@@ -2,6 +2,7 @@
 
 mod in_use;
 pub mod plan;
+mod remove;
 mod root;
 mod scan;
 mod screen;

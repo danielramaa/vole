@@ -51,7 +51,8 @@ pub struct App {
     started_on_menu: bool,
     menu: ListState,
     config: Config,
-    /// The `clean` screen, while `clean` is open.
+    /// The `clean` screen once `clean` has been opened. It is kept when leaving, so opening
+    /// `clean` again shows the same Plan instead of starting another scan.
     clean: Option<clean::Screen>,
     quit: bool,
 }
@@ -73,7 +74,9 @@ impl App {
     /// Opens `module`, or the menu for `None`.
     fn open(&mut self, module: Option<Module>) {
         self.module = module;
-        self.clean = (module == Some(Module::Clean)).then(|| clean::Screen::start(&self.config));
+        if module == Some(Module::Clean) && self.clean.is_none() {
+            self.clean = Some(clean::Screen::start(&self.config));
+        }
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {

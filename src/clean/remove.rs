@@ -24,7 +24,10 @@ pub struct Outcome {
     pub label: String,
     /// Bytes freed; for root commands, the Plan's estimate.
     pub size: u64,
+    /// Why the Item wasn't (fully) removed.
     pub error: Option<String>,
+    /// Why the attempt is missing from the Operation Log, whatever its result.
+    pub log_error: Option<String>,
 }
 
 /// Runs root commands, all under one pause of the TUI.
@@ -115,6 +118,7 @@ pub fn not_attempted(item: &Item, why: &str) -> Outcome {
         label: item.label.clone(),
         size: item.size,
         error: Some(why.to_string()),
+        log_error: None,
     }
 }
 
@@ -338,18 +342,13 @@ impl Log {
             error: result.as_ref().err().map(String::as_str),
         };
         let written = self.write(&entry);
-        let mut error = result.err();
-        if let Err(err) = written {
-            let note = format!("not written to the operation log: {err}");
-            error = Some(match error {
-                Some(error) => format!("{error}; {note}"),
-                None => note,
-            });
-        }
         Outcome {
             label: item.label.clone(),
             size: item.size,
-            error,
+            error: result.err(),
+            log_error: written
+                .err()
+                .map(|err| format!("not written to the operation log: {err}")),
         }
     }
 
@@ -455,6 +454,31 @@ mod tests {
             &Mounts::default(),
         );
         assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0]);
+    }
+
+    #[test]
+    fn a_failed_log_write_does_not_fail_the_removal() {
+        let s = setup(TestDir::new());
+        let cache = s.home.dir(".cache/app");
+        let mut category = Category::new("Test");
+        category.items = vec![selected(Kind::Regenerable(cache.clone()))];
+        let plan = Plan {
+            categories: vec![category],
+        };
+        // Every write to /dev/full fails with "no space left".
+        let mut log = Log::open(Path::new("/dev/full")).unwrap();
+        let stop = AtomicBool::new(false);
+        let outcomes = remove_home(
+            &plan,
+            &s.rules,
+            &Mounts::default(),
+            &mut log,
+            &mut |_, _, _| {},
+            &stop,
+        );
+        assert!(!cache.exists());
+        assert!(outcomes[0].error.is_none());
+        assert!(outcomes[0].log_error.is_some());
     }
 
     #[test]

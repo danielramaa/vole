@@ -73,20 +73,23 @@ pub fn home_categories(home: &Path, rules: &Rules, mounts: &Mounts) -> HomeCateg
 
     let mut yay = Builder::new("yay cache", rules, mounts);
     let path = home.join(YAY);
-    claims.claim(&path);
-    yay.add_regenerable(format!("~/{YAY}"), path);
+    if claims.claim(&path) {
+        yay.add_regenerable(format!("~/{YAY}"), path);
+    }
 
     let mut developer = Builder::new("Developer caches", rules, mounts);
     for (name, relative) in DEVELOPER {
         let path = home.join(relative);
-        claims.claim(&path);
-        developer.add_regenerable(format!("{name} (~/{relative})"), path);
+        if claims.claim(&path) {
+            developer.add_regenerable(format!("{name} (~/{relative})"), path);
+        }
     }
 
     let mut trash = Builder::new("Trash", rules, mounts);
     let path = home.join(TRASH);
-    claims.claim(&path);
-    trash.add_trash(path);
+    if claims.claim(&path) {
+        trash.add_trash(path);
+    }
 
     let mut user_cache = Builder::new("User cache", rules, mounts);
     let mut folders: Vec<PathBuf> = fs::read_dir(home.join(USER_CACHE))
@@ -340,6 +343,17 @@ mod tests {
         assert!(!claims.claim(Path::new("/h/.cache/pip/wheels")));
         assert!(!claims.claim(Path::new("/h/.cache")));
         assert!(claims.claim(Path::new("/h/.cache/pipx")));
+    }
+
+    #[test]
+    fn specific_paths_do_not_overlap() {
+        let mut claims = Claims::default();
+        let specific = [YAY, TRASH]
+            .into_iter()
+            .chain(DEVELOPER.iter().map(|(_, relative)| *relative));
+        for relative in specific {
+            assert!(claims.claim(&Path::new("/h").join(relative)), "{relative}");
+        }
     }
 
     #[test]

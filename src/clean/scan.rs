@@ -1,0 +1,336 @@
+//! The Categories inside the home directory, measured by walking the disk.
+
+use std::collections::HashSet;
+use std::fs::{self, Metadata};
+use std::os::unix::fs::MetadataExt;
+use std::path::{Path, PathBuf};
+
+use super::plan::{Category, Item, Kind};
+use crate::safety::Rules;
+
+/// Where `clean` may propose Items on its own (relative to the home directory).
+pub const ALLOWED_ROOTS: &[&str] = &[
+    ".cache",
+    ".local/share/Trash",
+    ".npm",
+    ".cargo/registry",
+    ".cargo/git",
+    "go/pkg/mod",
+];
+
+const YAY: &str = ".cache/yay";
+
+const DEVELOPER: &[(&str, &str)] = &[
+    ("pip", ".cache/pip"),
+    ("npm", ".npm/_cacache"),
+    ("cargo registry", ".cargo/registry/cache"),
+    ("cargo sources", ".cargo/registry/src"),
+    ("cargo git", ".cargo/git/db"),
+    ("cargo git checkouts", ".cargo/git/checkouts"),
+    ("go modules", "go/pkg/mod"),
+    ("go build", ".cache/go-build"),
+];
+
+const USER_CACHE: &str = ".cache";
+
+const TRASH: &str = ".local/share/Trash";
+/// The folders inside the trash that hold trashed files; the trash folder itself stays.
+pub const TRASH_PARTS: &[&str] = &["files", "info", "expunged"];
+
+/// The home Categories, in the order they claim their paths.
+pub struct HomeCategories {
+    pub yay: Category,
+    pub developer: Category,
+    pub trash: Category,
+    pub user_cache: Category,
+}
+
+/// Paths already taken by a Category. A path overlapping a claimed one can't be claimed again,
+/// so no byte is counted twice.
+#[derive(Default)]
+pub struct Claims(Vec<PathBuf>);
+
+impl Claims {
+    pub fn claim(&mut self, path: &Path) -> bool {
+        if self
+            .0
+            .iter()
+            .any(|claimed| claimed.starts_with(path) || path.starts_with(claimed))
+        {
+            return false;
+        }
+        self.0.push(path.to_path_buf());
+        true
+    }
+}
+
+/// Builds the home Categories. Specific Categories claim their paths before the general
+/// user cache, which gets whatever is left in `~/.cache`.
+pub fn home_categories(home: &Path, rules: &Rules) -> HomeCategories {
+    let mut claims = Claims::default();
+
+    let mut yay = Builder::new("yay cache", rules);
+    let path = home.join(YAY);
+    claims.claim(&path);
+    yay.add_regenerable(format!("~/{YAY}"), path);
+
+    let mut developer = Builder::new("Developer caches", rules);
+    for (name, relative) in DEVELOPER {
+        let path = home.join(relative);
+        claims.claim(&path);
+        developer.add_regenerable(format!("{name} (~/{relative})"), path);
+    }
+
+    let mut trash = Builder::new("Trash", rules);
+    let path = home.join(TRASH);
+    claims.claim(&path);
+    trash.add_trash(path);
+
+    let mut user_cache = Builder::new("User cache", rules);
+    let mut folders: Vec<PathBuf> = fs::read_dir(home.join(USER_CACHE))
+        .into_iter()
+        .flatten()
+        .flatten()
+        // Not following symlinks: a symlinked folder is not part of the cache.
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .map(|entry| entry.path())
+        .collect();
+    folders.sort();
+    for path in folders {
+        if claims.claim(&path) {
+            let name = path.file_name().unwrap_or_default().to_string_lossy();
+            user_cache.add_regenerable(format!("~/{USER_CACHE}/{name}"), path.clone());
+        }
+    }
+    let mut user_cache = user_cache.finish();
+    user_cache.items.sort_by(|a, b| b.size.cmp(&a.size));
+
+    HomeCategories {
+        yay: yay.finish(),
+        developer: developer.finish(),
+        trash: trash.finish(),
+        user_cache,
+    }
+}
+
+struct Builder<'a> {
+    category: Category,
+    rules: &'a Rules,
+    refused: usize,
+}
+
+impl<'a> Builder<'a> {
+    fn new(name: &'static str, rules: &'a Rules) -> Self {
+        Self {
+            category: Category::new(name),
+            rules,
+            refused: 0,
+        }
+    }
+
+    /// Whether `path` exists and the path rules allow proposing it.
+    fn allowed(&mut self, path: &Path) -> bool {
+        if fs::symlink_metadata(path).is_err() {
+            return false;
+        }
+        let allowed = self.rules.check(path).is_ok();
+        if !allowed {
+            self.refused += 1;
+        }
+        allowed
+    }
+
+    fn add_regenerable(&mut self, label: String, path: PathBuf) {
+        if self.allowed(&path) {
+            let size = disk_usage(&path);
+            self.push(label, Kind::Regenerable(path), size);
+        }
+    }
+
+    fn add_trash(&mut self, path: PathBuf) {
+        if self.allowed(&path) {
+            let size = TRASH_PARTS
+                .iter()
+                .flat_map(|part| {
+                    fs::read_dir(path.join(part))
+                        .into_iter()
+                        .flatten()
+                        .flatten()
+                })
+                .map(|entry| disk_usage(&entry.path()))
+                .sum();
+            self.push("empty the trash".into(), Kind::Trash(path), size);
+        }
+    }
+
+    fn push(&mut self, label: String, kind: Kind, size: u64) {
+        if size > 0 {
+            self.category.items.push(Item::new(label, kind, size));
+        }
+    }
+
+    fn finish(mut self) -> Category {
+        if self.refused > 0 {
+            self.category.note = Some(format!(
+                "{} path(s) left out by the safety rules",
+                self.refused
+            ));
+        }
+        self.category
+    }
+}
+
+/// Space freed by removing `path`: allocated blocks, not following symlinks, not crossing into
+/// other filesystems, and counting hard-linked files once.
+pub fn disk_usage(path: &Path) -> u64 {
+    let Ok(meta) = fs::symlink_metadata(path) else {
+        return 0;
+    };
+    let device = meta.dev();
+    let mut seen = HashSet::new();
+    let mut total = 0;
+    let mut stack: Vec<(PathBuf, Metadata)> = vec![(path.to_path_buf(), meta)];
+    while let Some((path, meta)) = stack.pop() {
+        if meta.dev() != device {
+            continue;
+        }
+        if !meta.is_dir() && meta.nlink() > 1 && !seen.insert(meta.ino()) {
+            continue;
+        }
+        total += meta.blocks() * 512;
+        if meta.is_dir() {
+            for entry in fs::read_dir(&path).into_iter().flatten().flatten() {
+                // `DirEntry::metadata` doesn't follow symlinks.
+                if let Ok(meta) = entry.metadata() {
+                    stack.push((entry.path(), meta));
+                }
+            }
+        }
+    }
+    total
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testdir::TestDir;
+
+    fn rules(home: &TestDir) -> Rules {
+        Rules::new(home.path(), ALLOWED_ROOTS, &[]).unwrap()
+    }
+
+    fn paths(category: &Category) -> Vec<PathBuf> {
+        category
+            .items
+            .iter()
+            .map(|item| item.path().unwrap().to_path_buf())
+            .collect()
+    }
+
+    #[test]
+    fn claims_do_not_overlap() {
+        let mut claims = Claims::default();
+        assert!(claims.claim(Path::new("/h/.cache/pip")));
+        assert!(!claims.claim(Path::new("/h/.cache/pip")));
+        assert!(!claims.claim(Path::new("/h/.cache/pip/wheels")));
+        assert!(!claims.claim(Path::new("/h/.cache")));
+        assert!(claims.claim(Path::new("/h/.cache/pipx")));
+    }
+
+    #[test]
+    fn specific_categories_claim_before_the_user_cache() {
+        let home = TestDir::new();
+        home.file(".cache/yay/pkg/a.tar", 5000);
+        home.file(".cache/pip/http/b", 5000);
+        home.file(".cache/go-build/c", 5000);
+        home.file(".cache/thumbnails/d.png", 5000);
+        home.file(".npm/_cacache/e", 5000);
+        let found = home_categories(home.path(), &rules(&home));
+
+        assert_eq!(paths(&found.yay), [home.path().join(".cache/yay")]);
+        assert_eq!(
+            paths(&found.developer),
+            [
+                home.path().join(".cache/pip"),
+                home.path().join(".npm/_cacache"),
+                home.path().join(".cache/go-build"),
+            ]
+        );
+        assert_eq!(
+            paths(&found.user_cache),
+            [home.path().join(".cache/thumbnails")]
+        );
+    }
+
+    #[test]
+    fn user_cache_has_one_item_per_folder_largest_first() {
+        let home = TestDir::new();
+        home.file(".cache/small/a", 100);
+        home.file(".cache/big/a", 100_000);
+        home.file(".cache/loose-file", 100);
+        home.symlink(".cache/linked", &home.dir("Documents"));
+        let found = home_categories(home.path(), &rules(&home));
+        assert_eq!(
+            paths(&found.user_cache),
+            [
+                home.path().join(".cache/big"),
+                home.path().join(".cache/small")
+            ]
+        );
+    }
+
+    #[test]
+    fn nothing_is_pre_selected_and_caches_are_regenerable() {
+        let home = TestDir::new();
+        home.file(".cache/thumbnails/a", 100);
+        home.file(".local/share/Trash/files/old.txt", 100);
+        let found = home_categories(home.path(), &rules(&home));
+        let cache = &found.user_cache.items[0];
+        assert!(cache.is_regenerable() && !cache.selected);
+        let trash = &found.trash.items[0];
+        assert!(!trash.is_regenerable() && !trash.selected);
+    }
+
+    #[test]
+    fn empty_trash_is_not_proposed() {
+        let home = TestDir::new();
+        home.dir(".local/share/Trash/files");
+        home.dir(".local/share/Trash/info");
+        let found = home_categories(home.path(), &rules(&home));
+        assert!(found.trash.items.is_empty());
+    }
+
+    #[test]
+    fn protected_folders_are_left_out_and_noted() {
+        let home = TestDir::new();
+        home.file(".cache/keep/a", 100);
+        home.file(".cache/other/a", 100);
+        let rules = Rules::new(
+            home.path(),
+            ALLOWED_ROOTS,
+            &[home.path().join(".cache/keep")],
+        )
+        .unwrap();
+        let found = home_categories(home.path(), &rules);
+        assert_eq!(paths(&found.user_cache), [home.path().join(".cache/other")]);
+        assert!(found.user_cache.note.is_some());
+    }
+
+    #[test]
+    fn disk_usage_counts_blocks_and_hard_links_once() {
+        let home = TestDir::new();
+        let file = home.file("dir/a", 10_000);
+        fs::hard_link(&file, home.path().join("dir/b")).unwrap();
+        let one = fs::metadata(&file).unwrap().blocks() * 512;
+        let dir = fs::metadata(home.path().join("dir")).unwrap().blocks() * 512;
+        assert_eq!(disk_usage(&home.path().join("dir")), dir + one);
+    }
+
+    #[test]
+    fn disk_usage_does_not_follow_symlinks() {
+        let home = TestDir::new();
+        home.file("big/a", 100_000);
+        let link = home.symlink("link", &home.path().join("big"));
+        assert!(disk_usage(&link) < 100_000);
+    }
+}

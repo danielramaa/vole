@@ -57,7 +57,7 @@ pub fn pacman(keep: u32) -> Category {
 
 /// What `paccache -d <selection>` says it would free.
 fn paccache_dry_run(selection: &[String]) -> Result<u64> {
-    let mut args = vec!["-d".to_string()];
+    let mut args = vec!["-d".to_string(), "--nocolor".to_string()];
     args.extend_from_slice(selection);
     let output = run(PACCACHE, &args)?;
     parse_paccache(&output).context("could not read paccache's dry run")
@@ -130,7 +130,6 @@ fn first_line(text: &str) -> &str {
 
 /// Reads e.g. `==> finished dry run: 5 candidates (disk space saved: 164.84 MiB)`.
 pub fn parse_paccache(output: &str) -> Option<u64> {
-    let output = strip_ansi(output);
     if let Some(rest) = output.split("disk space saved:").nth(1) {
         return size::parse(rest.split(')').next()?);
     }
@@ -143,25 +142,6 @@ pub fn parse_journal_usage(output: &str) -> Option<u64> {
     size::parse(rest.split_whitespace().next()?)
 }
 
-/// Removes terminal color codes, in case a tool colors its output anyway.
-fn strip_ansi(text: &str) -> String {
-    let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars();
-    while let Some(c) = chars.next() {
-        if c == '\x1b' {
-            // Skip `[`, the parameters, and the final letter.
-            for c in chars.by_ref() {
-                if c.is_ascii_alphabetic() {
-                    break;
-                }
-            }
-        } else {
-            out.push(c);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -170,8 +150,6 @@ mod tests {
     fn reads_paccache_dry_runs() {
         let output = "==> finished dry run: 5 candidates (disk space saved: 164.84 MiB)\n";
         assert_eq!(parse_paccache(output), size::parse("164.84 MiB"));
-        let colored = "\x1b[1;32m==>\x1b[0m\x1b[1m finished dry run: 1 candidates (disk space saved: 2 GiB)\x1b[0m";
-        assert_eq!(parse_paccache(colored), Some(2 * 1024 * size::MIB));
         assert_eq!(
             parse_paccache("==> no candidate packages found for pruning"),
             Some(0)

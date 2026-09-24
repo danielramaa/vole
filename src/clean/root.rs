@@ -1,5 +1,6 @@
 //! Root-owned Categories, measured only through the official tools (ADR 0001).
 
+use std::fs;
 use std::path::Path;
 use std::process::Command;
 
@@ -58,11 +59,16 @@ pub fn journal(max_mb: u32) -> Category {
     let usage = run(JOURNALCTL, &["--disk-usage".to_string()]).and_then(|output| {
         parse_journal_usage(&output).context("could not read journalctl --disk-usage")
     });
+    // An estimate: `--disk-usage` counts the active files too, which the vacuum only reaches
+    // because M2 rotates them into archived files first (`--rotate --vacuum-size`).
     match usage {
         Ok(usage) => {
+            if !can_read_system_journal(Path::new(JOURNAL_DIR)) {
+                category.note = Some("only the journal files you can read are counted".into());
+            }
             let freed = usage.saturating_sub(u64::from(max_mb) * size::MIB);
             if freed > 0 {
-                let label = format!("shrink from {} to {max_mb} MiB", size::format(usage));
+                let label = format!("shrink from about {} to {max_mb} MiB", size::format(usage));
                 category.items.push(Item::new(
                     label,
                     Kind::Root(RootCommand::JournalVacuum(max_mb)),
@@ -73,6 +79,21 @@ pub fn journal(max_mb: u32) -> Category {
         Err(err) => category.note = Some(format!("{err:#}")),
     }
     category
+}
+
+const JOURNAL_DIR: &str = "/var/log/journal";
+
+/// Whether the user can list every persistent journal folder (users outside the `wheel`, `adm`
+/// and `systemd-journal` groups can't, and then `--disk-usage` only counts their own files).
+fn can_read_system_journal(dir: &Path) -> bool {
+    let Ok(entries) = fs::read_dir(dir) else {
+        // No persistent journal, or not even this folder is readable.
+        return !dir.exists();
+    };
+    entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|t| t.is_dir()))
+        .all(|entry| fs::read_dir(entry.path()).is_ok())
 }
 
 /// Runs a measuring command as the user, in the C locale so its output can be parsed.
@@ -139,6 +160,14 @@ mod tests {
             Some(0)
         );
         assert_eq!(parse_paccache("something else"), None);
+    }
+
+    #[test]
+    fn a_readable_or_missing_journal_folder_is_fully_counted() {
+        let dir = crate::testdir::TestDir::new();
+        dir.dir("machine-id");
+        assert!(can_read_system_journal(dir.path()));
+        assert!(can_read_system_journal(&dir.path().join("missing")));
     }
 
     #[test]

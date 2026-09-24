@@ -1,7 +1,9 @@
 //! The Categories inside the home directory, measured by walking the disk.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ffi::OsString;
 use std::fs::{self, Metadata};
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 
@@ -66,27 +68,27 @@ impl Claims {
 
 /// Builds the home Categories. Specific Categories claim their paths before the general
 /// user cache, which gets whatever is left in `~/.cache`.
-pub fn home_categories(home: &Path, rules: &Rules) -> HomeCategories {
+pub fn home_categories(home: &Path, rules: &Rules, mounts: &Mounts) -> HomeCategories {
     let mut claims = Claims::default();
 
-    let mut yay = Builder::new("yay cache", rules);
+    let mut yay = Builder::new("yay cache", rules, mounts);
     let path = home.join(YAY);
     claims.claim(&path);
     yay.add_regenerable(format!("~/{YAY}"), path);
 
-    let mut developer = Builder::new("Developer caches", rules);
+    let mut developer = Builder::new("Developer caches", rules, mounts);
     for (name, relative) in DEVELOPER {
         let path = home.join(relative);
         claims.claim(&path);
         developer.add_regenerable(format!("{name} (~/{relative})"), path);
     }
 
-    let mut trash = Builder::new("Trash", rules);
+    let mut trash = Builder::new("Trash", rules, mounts);
     let path = home.join(TRASH);
     claims.claim(&path);
     trash.add_trash(path);
 
-    let mut user_cache = Builder::new("User cache", rules);
+    let mut user_cache = Builder::new("User cache", rules, mounts);
     let mut folders: Vec<PathBuf> = fs::read_dir(home.join(USER_CACHE))
         .into_iter()
         .flatten()
@@ -116,14 +118,16 @@ pub fn home_categories(home: &Path, rules: &Rules) -> HomeCategories {
 struct Builder<'a> {
     category: Category,
     rules: &'a Rules,
+    mounts: &'a Mounts,
     refused: usize,
 }
 
 impl<'a> Builder<'a> {
-    fn new(name: &'static str, rules: &'a Rules) -> Self {
+    fn new(name: &'static str, rules: &'a Rules, mounts: &'a Mounts) -> Self {
         Self {
             category: Category::new(name),
             rules,
+            mounts,
             refused: 0,
         }
     }
@@ -133,7 +137,12 @@ impl<'a> Builder<'a> {
         if fs::symlink_metadata(path).is_err() {
             return false;
         }
-        let allowed = self.rules.check(path).is_ok();
+        // A mount point is not the cache's to remove, even when it holds the same filesystem.
+        let allowed = self.rules.check(path).is_ok()
+            && !self
+                .rules
+                .resolve(path)
+                .is_some_and(|real| self.mounts.contains(&real));
         if !allowed {
             self.refused += 1;
         }
@@ -142,7 +151,7 @@ impl<'a> Builder<'a> {
 
     fn add_regenerable(&mut self, label: String, path: PathBuf) {
         if self.allowed(&path) {
-            let size = disk_usage(&path);
+            let size = disk_usage(&path, self.mounts);
             self.push(label, Kind::Regenerable(path), size);
         }
     }
@@ -160,7 +169,7 @@ impl<'a> Builder<'a> {
         let size = trash_parts(&path, self.rules)
             .iter()
             .flat_map(|part| fs::read_dir(part).into_iter().flatten().flatten())
-            .map(|entry| disk_usage(&entry.path()))
+            .map(|entry| disk_usage(&entry.path(), self.mounts))
             .sum();
         self.push("empty the trash".into(), Kind::Trash(path), size);
     }
@@ -196,20 +205,76 @@ fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
+/// Every mount point, bind mounts included, from `/proc/self/mountinfo`.
+#[derive(Default)]
+pub struct Mounts(HashSet<PathBuf>);
+
+impl Mounts {
+    pub fn load() -> Self {
+        fs::read_to_string("/proc/self/mountinfo")
+            .map(|text| Self::parse(&text))
+            .unwrap_or_default()
+    }
+
+    fn parse(mountinfo: &str) -> Self {
+        Self(
+            mountinfo
+                .lines()
+                .filter_map(|line| line.split(' ').nth(4))
+                .map(unescape_octal)
+                .collect(),
+        )
+    }
+
+    pub fn contains(&self, path: &Path) -> bool {
+        self.0.contains(path)
+    }
+}
+
+/// Decodes the `\040`-style escapes mountinfo uses for spaces and other special bytes.
+fn unescape_octal(field: &str) -> PathBuf {
+    let bytes = field.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        let code = bytes.get(i + 1..i + 4).and_then(|digits| {
+            let digits = std::str::from_utf8(digits).ok()?;
+            u8::from_str_radix(digits, 8).ok()
+        });
+        match code {
+            Some(code) if bytes[i] == b'\\' => {
+                out.push(code);
+                i += 4;
+            }
+            _ => {
+                out.push(bytes[i]);
+                i += 1;
+            }
+        }
+    }
+    PathBuf::from(OsString::from_vec(out))
+}
+
 /// Space freed by removing `path`: allocated blocks, not following symlinks, not crossing into
-/// other filesystems. A hard-linked file only counts when all of its links are inside `path`,
+/// other filesystems or mount points. A hard-linked file only counts when all of its links are inside `path`,
 /// since otherwise removing `path` doesn't free it.
-pub fn disk_usage(path: &Path) -> u64 {
+pub fn disk_usage(path: &Path, mounts: &Mounts) -> u64 {
     let Ok(meta) = fs::symlink_metadata(path) else {
         return 0;
+    };
+    // Walk the real path, so it can be compared with the mount points.
+    let path = if meta.is_symlink() {
+        path.to_path_buf()
+    } else {
+        fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
     };
     let device = meta.dev();
     // Inode → (links seen, links in total, bytes).
     let mut linked: HashMap<u64, (u64, u64, u64)> = HashMap::new();
     let mut total = 0;
-    let mut stack: Vec<(PathBuf, Metadata)> = vec![(path.to_path_buf(), meta)];
+    let mut stack: Vec<(PathBuf, Metadata)> = vec![(path, meta)];
     while let Some((path, meta)) = stack.pop() {
-        if meta.dev() != device {
+        if meta.dev() != device || (meta.is_dir() && mounts.contains(&path)) {
             continue;
         }
         if !meta.is_dir() && meta.nlink() > 1 {
@@ -272,7 +337,7 @@ mod tests {
         home.file(".cache/go-build/c", 5000);
         home.file(".cache/thumbnails/d.png", 5000);
         home.file(".npm/_cacache/e", 5000);
-        let found = home_categories(home.path(), &rules(&home));
+        let found = home_categories(home.path(), &rules(&home), &Mounts::default());
 
         assert_eq!(paths(&found.yay), [home.path().join(".cache/yay")]);
         assert_eq!(
@@ -296,7 +361,7 @@ mod tests {
         home.file(".cache/big/a", 100_000);
         home.file(".cache/loose-file", 100);
         home.symlink(".cache/linked", &home.dir("Documents"));
-        let found = home_categories(home.path(), &rules(&home));
+        let found = home_categories(home.path(), &rules(&home), &Mounts::default());
         assert_eq!(
             paths(&found.user_cache),
             [
@@ -311,7 +376,7 @@ mod tests {
         let home = TestDir::new();
         home.file(".cache/thumbnails/a", 100);
         home.file(".local/share/Trash/files/old.txt", 100);
-        let found = home_categories(home.path(), &rules(&home));
+        let found = home_categories(home.path(), &rules(&home), &Mounts::default());
         let cache = &found.user_cache.items[0];
         assert!(cache.is_regenerable() && !cache.selected);
         let trash = &found.trash.items[0];
@@ -323,7 +388,7 @@ mod tests {
         let home = TestDir::new();
         home.dir(".local/share/Trash/files");
         home.dir(".local/share/Trash/info");
-        let found = home_categories(home.path(), &rules(&home));
+        let found = home_categories(home.path(), &rules(&home), &Mounts::default());
         assert!(found.trash.items.is_empty());
     }
 
@@ -334,7 +399,7 @@ mod tests {
         home.symlink(".local/share/Trash/files", keys.parent().unwrap());
         home.file(".local/share/Trash/info/old.trashinfo", 100);
         let rules = rules(&home);
-        let found = home_categories(home.path(), &rules);
+        let found = home_categories(home.path(), &rules, &Mounts::default());
         assert!(found.trash.items[0].size < 100_000);
         let trash = home.path().join(TRASH);
         assert_eq!(trash_parts(&trash, &rules), [trash.join("info")]);
@@ -346,7 +411,7 @@ mod tests {
         let documents = home.dir("Documents");
         home.file("Documents/files/thesis.pdf", 100_000);
         home.symlink(".local/share/Trash", &documents);
-        let found = home_categories(home.path(), &rules(&home));
+        let found = home_categories(home.path(), &rules(&home), &Mounts::default());
         assert!(found.trash.items.is_empty());
         assert!(found.trash.note.is_some());
     }
@@ -362,8 +427,34 @@ mod tests {
             &[home.path().join(".cache/keep")],
         )
         .unwrap();
-        let found = home_categories(home.path(), &rules);
+        let found = home_categories(home.path(), &rules, &Mounts::default());
         assert_eq!(paths(&found.user_cache), [home.path().join(".cache/other")]);
+        assert!(found.user_cache.note.is_some());
+    }
+
+    #[test]
+    fn reads_mount_points() {
+        let mounts = Mounts::parse(
+            "36 35 98:0 / /home/me/.cache/my\\040disk rw,noatime master:1 - ext3 /dev/root rw\n\
+             37 35 98:0 /mnt /home/me/.cache/bind rw - ext4 /dev/sda1 rw\n",
+        );
+        assert!(mounts.contains(Path::new("/home/me/.cache/my disk")));
+        assert!(mounts.contains(Path::new("/home/me/.cache/bind")));
+        assert!(!mounts.contains(Path::new("/home/me/.cache")));
+    }
+
+    #[test]
+    fn mount_points_are_not_walked_or_proposed() {
+        let home = TestDir::new();
+        home.file(".cache/app/a", 1000);
+        let bind = home.dir(".cache/app/bind");
+        home.file(".cache/app/bind/projects", 100_000);
+        let mounted = home.dir(".cache/mounted");
+        home.file(".cache/mounted/a", 100_000);
+        let mounts = Mounts([bind, mounted].into_iter().collect());
+        let found = home_categories(home.path(), &rules(&home), &mounts);
+        assert_eq!(paths(&found.user_cache), [home.path().join(".cache/app")]);
+        assert!(found.user_cache.items[0].size < 100_000);
         assert!(found.user_cache.note.is_some());
     }
 
@@ -373,7 +464,7 @@ mod tests {
         let file = home.file(".cache/uv/a", 100_000);
         home.dir("project");
         fs::hard_link(&file, home.path().join("project/a")).unwrap();
-        assert!(disk_usage(&home.path().join(".cache/uv")) < 100_000);
+        assert!(disk_usage(&home.path().join(".cache/uv"), &Mounts::default()) < 100_000);
     }
 
     #[test]
@@ -383,7 +474,10 @@ mod tests {
         fs::hard_link(&file, home.path().join("dir/b")).unwrap();
         let one = fs::metadata(&file).unwrap().blocks() * 512;
         let dir = fs::metadata(home.path().join("dir")).unwrap().blocks() * 512;
-        assert_eq!(disk_usage(&home.path().join("dir")), dir + one);
+        assert_eq!(
+            disk_usage(&home.path().join("dir"), &Mounts::default()),
+            dir + one
+        );
     }
 
     #[test]
@@ -391,6 +485,6 @@ mod tests {
         let home = TestDir::new();
         home.file("big/a", 100_000);
         let link = home.symlink("link", &home.path().join("big"));
-        assert!(disk_usage(&link) < 100_000);
+        assert!(disk_usage(&link, &Mounts::default()) < 100_000);
     }
 }

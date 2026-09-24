@@ -19,7 +19,7 @@ pub use screen::Screen;
 pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
     let rules = Rules::new(home, scan::ALLOWED_ROOTS, &config.protected_paths(home))
         .with_context(|| format!("resolving {}", home.display()))?;
-    let found = scan::home_categories(home, &rules);
+    let found = scan::home_categories(home, &rules, &scan::Mounts::load());
     let mut plan = Plan {
         categories: vec![
             root::pacman(config.pacman_keep_versions),

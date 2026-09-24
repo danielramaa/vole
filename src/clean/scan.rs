@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
+use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -217,10 +218,8 @@ fn is_real_dir(path: &Path) -> bool {
 pub struct Mounts(HashSet<PathBuf>);
 
 impl Mounts {
-    pub fn load() -> Self {
-        fs::read_to_string("/proc/self/mountinfo")
-            .map(|text| Self::parse(&text))
-            .unwrap_or_default()
+    pub fn load() -> io::Result<Self> {
+        fs::read_to_string("/proc/self/mountinfo").map(|text| Self::parse(&text))
     }
 
     fn parse(mountinfo: &str) -> Self {
@@ -475,6 +474,11 @@ mod tests {
         assert!(mounts.contains(Path::new("/home/me/.cache/my disk")));
         assert!(mounts.contains(Path::new("/home/me/.cache/bind")));
         assert!(!mounts.contains(Path::new("/home/me/.cache")));
+    }
+
+    #[test]
+    fn loads_the_mount_points_of_this_system() {
+        assert!(Mounts::load().unwrap().contains(Path::new("/")));
     }
 
     #[test]

@@ -26,7 +26,9 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
         let pacman = scope.spawn(|| root::pacman(config.pacman_keep_versions));
         let journal = scope.spawn(|| root::journal(config.journal_max_mb));
         let open = scope.spawn(in_use::open_paths);
-        let found = scan::home_categories(home, &rules, &scan::Mounts::load());
+        // Measuring only: without the mount points, the walk still stops at other filesystems.
+        let mounts = scan::Mounts::load().unwrap_or_default();
+        let found = scan::home_categories(home, &rules, &mounts);
         let join = "a measuring thread panicked";
         (
             pacman.join().expect(join),

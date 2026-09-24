@@ -235,7 +235,11 @@ fn remove(path: &Path, mounts: &Mounts) -> io::Result<()> {
         Ok(meta) => meta,
         Err(err) => return gone_is_fine(Err(err)),
     };
-    remove_tree(path, &meta, meta.dev(), mounts)
+    // The folder above is the baseline, so an Item that is itself on another filesystem is
+    // caught even without the mount points.
+    let parent = path.parent().unwrap_or(path);
+    let device = fs::symlink_metadata(parent)?.dev();
+    remove_tree(path, &meta, device, mounts)
 }
 
 fn gone_is_fine(result: io::Result<()>) -> io::Result<()> {

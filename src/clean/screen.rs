@@ -297,6 +297,21 @@ impl Screen {
         }
     }
 
+    /// Whether q leaves `clean` here; while confirming or removing, it doesn't.
+    pub fn can_leave(&self) -> bool {
+        match self.state {
+            State::NotStarted
+            | State::Scanning(_)
+            | State::Ready(_)
+            | State::Done { .. }
+            | State::Failed(_) => true,
+            State::Confirm { .. }
+            | State::Removing(_)
+            | State::RemovingHome { .. }
+            | State::RootPending { .. } => false,
+        }
+    }
+
     #[cfg(test)]
     pub fn is_removing(&self) -> bool {
         matches!(self.state, State::Removing(_))
@@ -698,7 +713,9 @@ mod tests {
         press(&mut screen, KeyCode::Enter);
         assert!(is_confirming(&screen, false));
         // Backing out keeps the selection, and q goes back instead of leaving.
+        assert!(!screen.can_leave());
         assert!(press(&mut screen, KeyCode::Char('q')));
+        assert!(screen.can_leave());
         assert_eq!(selected_size(&screen), 30);
         press(&mut screen, KeyCode::Enter);
         press(&mut screen, KeyCode::Char('y'));

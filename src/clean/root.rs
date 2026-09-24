@@ -14,18 +14,27 @@ pub fn pacman(keep: u32) -> Category {
         category.note = Some("paccache not found; install pacman-contrib".into());
         return category;
     }
-    let commands = [
+    // `-k<n>` covers uninstalled packages too, and paccache can't leave them out. So the
+    // uninstalled Item gets all of them, and the installed Item only what `-k<n>` removes
+    // beyond that: the sizes don't overlap, and removing the uninstalled ones first (M2)
+    // frees exactly both.
+    let sizes = [
         (
             format!("older versions of installed packages (keeping {keep})"),
             RootCommand::PacmanKeep(keep),
+            paccache_dry_run(&[format!("-k{keep}")]).and_then(|all| {
+                let uninstalled = paccache_dry_run(&["-u".into(), format!("-k{keep}")])?;
+                Ok(all.saturating_sub(uninstalled))
+            }),
         ),
         (
             "all versions of uninstalled packages".into(),
             RootCommand::PacmanUninstalled,
+            paccache_dry_run(&["-u".into(), "-k0".into()]),
         ),
     ];
-    for (label, command) in commands {
-        match paccache_dry_run(command) {
+    for (label, command, size) in sizes {
+        match size {
             Ok(0) => {}
             Ok(size) => category
                 .items
@@ -36,11 +45,11 @@ pub fn pacman(keep: u32) -> Category {
     category
 }
 
-/// What `paccache -d` says the command would free.
-fn paccache_dry_run(command: RootCommand) -> Result<u64> {
+/// What `paccache -d <selection>` says it would free.
+fn paccache_dry_run(selection: &[String]) -> Result<u64> {
     let mut args = vec!["-d".to_string()];
-    args.extend(command.paccache_selection().unwrap_or_default());
-    let output = run(command.program(), &args)?;
+    args.extend_from_slice(selection);
+    let output = run(PACCACHE, &args)?;
     parse_paccache(&output).context("could not read paccache's dry run")
 }
 

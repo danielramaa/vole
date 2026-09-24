@@ -11,10 +11,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
-use super::build_plan;
 use super::plan::{Item, Plan};
 use super::remove::{self, Log, Outcome, RunRoot};
 use super::scan::{ALLOWED_ROOTS, Mounts};
+use super::{build_plan, refresh_in_use};
 use crate::config::Config;
 use crate::safety::Rules;
 use crate::size;
@@ -102,8 +102,9 @@ impl Screen {
         let yes = matches!(key.code, KeyCode::Char('y'));
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
-            State::Ready(view) if key.code == KeyCode::Enter => {
+            State::Ready(mut view) if key.code == KeyCode::Enter => {
                 if view.plan.selected().next().is_some() {
+                    refresh_in_use(&mut view.plan, &self.config);
                     (
                         State::Confirm {
                             view,
@@ -119,7 +120,8 @@ impl Screen {
                 let used = view.on_key(key);
                 (State::Ready(view), used)
             }
-            State::Confirm { view, in_use } if yes => {
+            State::Confirm { mut view, in_use } if yes => {
+                refresh_in_use(&mut view.plan, &self.config);
                 let any_in_use = view.plan.selected().any(|item| item.in_use);
                 if any_in_use && !in_use {
                     (State::Confirm { view, in_use: true }, true)

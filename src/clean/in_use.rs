@@ -6,15 +6,16 @@ use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
 
 /// Executables, working folders, open files and memory-mapped files of every process the user
-/// can see.
+/// can see, except vole itself: its own scan has folders open while this runs.
 pub fn open_paths() -> Vec<PathBuf> {
+    let own = std::process::id().to_string();
     let mut paths = Vec::new();
     let processes = fs::read_dir("/proc").into_iter().flatten().flatten();
     for process in processes {
         let is_pid = process
             .file_name()
             .to_str()
-            .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()));
+            .is_some_and(|name| name.bytes().all(|b| b.is_ascii_digit()) && name != own);
         if !is_pid {
             continue;
         }
@@ -103,8 +104,22 @@ mod tests {
     }
 
     #[test]
-    fn sees_this_process() {
+    fn sees_other_processes_but_not_this_one() {
+        let dir = crate::testdir::TestDir::new();
+        let held = dir.file("held", 1);
+        let mut child = std::process::Command::new("sleep")
+            .arg("30")
+            .stdin(fs::File::open(&held).unwrap())
+            .spawn()
+            .unwrap();
+        // This process has `dir` open too while listing it.
+        let listing = fs::read_dir(dir.path()).unwrap();
+        let open = open_paths();
+        child.kill().unwrap();
+        child.wait().unwrap();
+        drop(listing);
+        assert!(is_in_use(&held, &open));
         let exe = fs::canonicalize(std::env::current_exe().unwrap()).unwrap();
-        assert!(is_in_use(&exe, &open_paths()));
+        assert!(!is_in_use(&exe, &open));
     }
 }

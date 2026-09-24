@@ -148,19 +148,21 @@ impl<'a> Builder<'a> {
     }
 
     fn add_trash(&mut self, path: PathBuf) {
-        if self.allowed(&path) {
-            let size = TRASH_PARTS
-                .iter()
-                .flat_map(|part| {
-                    fs::read_dir(path.join(part))
-                        .into_iter()
-                        .flatten()
-                        .flatten()
-                })
-                .map(|entry| disk_usage(&entry.path()))
-                .sum();
-            self.push("empty the trash".into(), Kind::Trash(path), size);
+        if !self.allowed(&path) {
+            return;
         }
+        // Emptying works on what is inside, so unlike other Items the trash folder itself
+        // must not be a symlink.
+        if !is_real_dir(&path) {
+            self.refused += 1;
+            return;
+        }
+        let size = trash_parts(&path, self.rules)
+            .iter()
+            .flat_map(|part| fs::read_dir(part).into_iter().flatten().flatten())
+            .map(|entry| disk_usage(&entry.path()))
+            .sum();
+        self.push("empty the trash".into(), Kind::Trash(path), size);
     }
 
     fn push(&mut self, label: String, kind: Kind, size: u64) {
@@ -178,6 +180,20 @@ impl<'a> Builder<'a> {
         }
         self.category
     }
+}
+
+/// The folders of the trash whose contents may be removed: real folders (not symlinks) that the
+/// path rules allow.
+pub fn trash_parts(trash: &Path, rules: &Rules) -> Vec<PathBuf> {
+    TRASH_PARTS
+        .iter()
+        .map(|part| trash.join(part))
+        .filter(|part| is_real_dir(part) && rules.check(part).is_ok())
+        .collect()
+}
+
+fn is_real_dir(path: &Path) -> bool {
+    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
 /// Space freed by removing `path`: allocated blocks, not following symlinks, not crossing into
@@ -298,6 +314,30 @@ mod tests {
         home.dir(".local/share/Trash/info");
         let found = home_categories(home.path(), &rules(&home));
         assert!(found.trash.items.is_empty());
+    }
+
+    #[test]
+    fn trash_is_not_read_through_symlinks() {
+        let home = TestDir::new();
+        let keys = home.file(".ssh/id_ed25519", 100_000);
+        home.symlink(".local/share/Trash/files", keys.parent().unwrap());
+        home.file(".local/share/Trash/info/old.trashinfo", 100);
+        let rules = rules(&home);
+        let found = home_categories(home.path(), &rules);
+        assert!(found.trash.items[0].size < 100_000);
+        let trash = home.path().join(TRASH);
+        assert_eq!(trash_parts(&trash, &rules), [trash.join("info")]);
+    }
+
+    #[test]
+    fn a_symlinked_trash_is_refused() {
+        let home = TestDir::new();
+        let documents = home.dir("Documents");
+        home.file("Documents/files/thesis.pdf", 100_000);
+        home.symlink(".local/share/Trash", &documents);
+        let found = home_categories(home.path(), &rules(&home));
+        assert!(found.trash.items.is_empty());
+        assert!(found.trash.note.is_some());
     }
 
     #[test]

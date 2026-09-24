@@ -1,6 +1,11 @@
 mod app;
+mod clean;
 mod config;
+mod safety;
+mod size;
 mod term;
+#[cfg(test)]
+mod testdir;
 
 use anyhow::{Result, bail};
 use clap::Parser;

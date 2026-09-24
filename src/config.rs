@@ -1,13 +1,13 @@
 use std::fs;
 use std::io::ErrorKind;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use serde::Deserialize;
 
 /// User settings from `~/.config/vole/config.toml`.
-/// Only plain numbers here, because some of them reach commands run with sudo (ADR 0001).
-#[derive(Debug, Deserialize)]
+/// Only plain numbers reach commands run with sudo (ADR 0001); paths here only ever exclude things.
+#[derive(Debug, Clone, Deserialize)]
 #[serde(default, deny_unknown_fields)]
 pub struct Config {
     /// Cached versions of each installed package to keep. At least 1, so a downgrade stays possible.
@@ -16,6 +16,8 @@ pub struct Config {
     pub journal_max_mb: u32,
     /// Refresh interval of the status dashboard, in milliseconds.
     pub status_refresh_ms: u32,
+    /// Extra paths for the Protected List, absolute or starting with `~/`.
+    pub protected_paths: Vec<String>,
 }
 
 impl Default for Config {
@@ -24,6 +26,7 @@ impl Default for Config {
             pacman_keep_versions: 2,
             journal_max_mb: 200,
             status_refresh_ms: 1000,
+            protected_paths: Vec::new(),
         }
     }
 }
@@ -61,7 +64,23 @@ impl Config {
         if !(250..=5000).contains(&self.status_refresh_ms) {
             bail!("status_refresh_ms must be between 250 and 5000");
         }
+        for path in &self.protected_paths {
+            if !(path.starts_with('/') || path.starts_with("~/")) {
+                bail!("protected_paths must be absolute or start with ~/, got {path:?}");
+            }
+        }
         Ok(())
+    }
+
+    /// `protected_paths` with `~/` expanded to `home`.
+    pub fn protected_paths(&self, home: &Path) -> Vec<PathBuf> {
+        self.protected_paths
+            .iter()
+            .map(|path| match path.strip_prefix("~/") {
+                Some(relative) => home.join(relative),
+                None => PathBuf::from(path),
+            })
+            .collect()
     }
 }
 
@@ -85,6 +104,26 @@ mod tests {
     #[test]
     fn rejects_keeping_zero_package_versions() {
         let config: Config = toml::from_str("pacman_keep_versions = 0").unwrap();
+        assert!(config.validate().is_err());
+    }
+
+    #[test]
+    fn expands_protected_paths() {
+        let config: Config =
+            toml::from_str(r#"protected_paths = ["~/.cache/keep", "/mnt/data"]"#).unwrap();
+        assert!(config.validate().is_ok());
+        assert_eq!(
+            config.protected_paths(Path::new("/home/me")),
+            [
+                PathBuf::from("/home/me/.cache/keep"),
+                PathBuf::from("/mnt/data")
+            ]
+        );
+    }
+
+    #[test]
+    fn rejects_relative_protected_paths() {
+        let config: Config = toml::from_str(r#"protected_paths = [".cache/keep"]"#).unwrap();
         assert!(config.validate().is_err());
     }
 

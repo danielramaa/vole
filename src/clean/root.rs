@@ -1,0 +1,141 @@
+//! Root-owned Categories, measured only through the official tools (ADR 0001).
+
+use std::path::Path;
+use std::process::Command;
+
+use anyhow::{Context, Result, bail};
+
+use super::plan::{Category, Item, JOURNALCTL, Kind, PACCACHE, RootCommand};
+use crate::size;
+
+pub fn pacman(keep: u32) -> Category {
+    let mut category = Category::new("Pacman cache");
+    if !Path::new(PACCACHE).exists() {
+        category.note = Some("paccache not found; install pacman-contrib".into());
+        return category;
+    }
+    let commands = [
+        (
+            format!("older versions of installed packages (keeping {keep})"),
+            RootCommand::PacmanKeep(keep),
+        ),
+        (
+            "all versions of uninstalled packages".into(),
+            RootCommand::PacmanUninstalled,
+        ),
+    ];
+    for (label, command) in commands {
+        match paccache_dry_run(command) {
+            Ok(0) => {}
+            Ok(size) => category
+                .items
+                .push(Item::new(label, Kind::Root(command), size)),
+            Err(err) => category.note = Some(format!("{err:#}")),
+        }
+    }
+    category
+}
+
+/// What `paccache -d` says the command would free.
+fn paccache_dry_run(command: RootCommand) -> Result<u64> {
+    let mut args = vec!["-d".to_string()];
+    args.extend(command.paccache_selection().unwrap_or_default());
+    let output = run(command.program(), &args)?;
+    parse_paccache(&output).context("could not read paccache's dry run")
+}
+
+pub fn journal(max_mb: u32) -> Category {
+    let mut category = Category::new("Journal");
+    let usage = run(JOURNALCTL, &["--disk-usage".to_string()]).and_then(|output| {
+        parse_journal_usage(&output).context("could not read journalctl --disk-usage")
+    });
+    match usage {
+        Ok(usage) => {
+            let freed = usage.saturating_sub(u64::from(max_mb) * size::MIB);
+            if freed > 0 {
+                let label = format!("shrink from {} to {max_mb} MiB", size::format(usage));
+                category.items.push(Item::new(
+                    label,
+                    Kind::Root(RootCommand::JournalVacuum(max_mb)),
+                    freed,
+                ));
+            }
+        }
+        Err(err) => category.note = Some(format!("{err:#}")),
+    }
+    category
+}
+
+/// Runs a measuring command as the user, in the C locale so its output can be parsed.
+fn run(program: &str, args: &[String]) -> Result<String> {
+    let output = Command::new(program)
+        .args(args)
+        .env("LC_ALL", "C")
+        .output()
+        .with_context(|| format!("running {program}"))?;
+    let mut text = String::from_utf8_lossy(&output.stdout).into_owned();
+    text.push_str(&String::from_utf8_lossy(&output.stderr));
+    if !output.status.success() {
+        bail!("{program} failed: {}", text.trim());
+    }
+    Ok(text)
+}
+
+/// Reads e.g. `==> finished dry run: 5 candidates (disk space saved: 164.84 MiB)`.
+pub fn parse_paccache(output: &str) -> Option<u64> {
+    let output = strip_ansi(output);
+    if let Some(rest) = output.split("disk space saved:").nth(1) {
+        return size::parse(rest.split(')').next()?);
+    }
+    output.contains("no candidate packages found").then_some(0)
+}
+
+/// Reads e.g. `Archived and active journals take up 1.2G in the file system.`
+pub fn parse_journal_usage(output: &str) -> Option<u64> {
+    let rest = output.split("take up ").nth(1)?;
+    size::parse(rest.split_whitespace().next()?)
+}
+
+/// Removes terminal color codes, in case a tool colors its output anyway.
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars();
+    while let Some(c) = chars.next() {
+        if c == '\x1b' {
+            // Skip `[`, the parameters, and the final letter.
+            for c in chars.by_ref() {
+                if c.is_ascii_alphabetic() {
+                    break;
+                }
+            }
+        } else {
+            out.push(c);
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn reads_paccache_dry_runs() {
+        let output = "==> finished dry run: 5 candidates (disk space saved: 164.84 MiB)\n";
+        assert_eq!(parse_paccache(output), size::parse("164.84 MiB"));
+        let colored = "\x1b[1;32m==>\x1b[0m\x1b[1m finished dry run: 1 candidates (disk space saved: 2 GiB)\x1b[0m";
+        assert_eq!(parse_paccache(colored), Some(2 * 1024 * size::MIB));
+        assert_eq!(
+            parse_paccache("==> no candidate packages found for pruning"),
+            Some(0)
+        );
+        assert_eq!(parse_paccache("something else"), None);
+    }
+
+    #[test]
+    fn reads_journal_usage() {
+        let output = "Archived and active journals take up 1.5G in the file system.\n";
+        assert_eq!(parse_journal_usage(output), Some(1536 * size::MIB));
+        assert_eq!(parse_journal_usage("No journal files were found."), None);
+    }
+}

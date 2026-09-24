@@ -489,8 +489,8 @@ mod tests {
         assert_eq!(
             ran,
             [
-                "/usr/bin/sudo /usr/bin/paccache -r -u -k0",
                 "/usr/bin/sudo /usr/bin/paccache -r -k2",
+                "/usr/bin/sudo /usr/bin/paccache -r -u -k0",
                 "/usr/bin/sudo /usr/bin/journalctl --rotate --vacuum-size=200M",
             ]
         );

@@ -325,10 +325,7 @@ impl PlanView {
             KeyCode::Down | KeyCode::Char('j') => self.list.select(Some((index + 1).min(last))),
             KeyCode::Up | KeyCode::Char('k') => self.list.select(Some(index.saturating_sub(1))),
             KeyCode::Char(' ') => match self.current() {
-                Some(Row::Item(c, i)) => {
-                    let item = &mut self.plan.categories[c].items[i];
-                    item.selected = !item.selected;
-                }
+                Some(Row::Item(c, i)) => self.plan.categories[c].toggle(i),
                 Some(Row::Category(c)) => self.plan.categories[c].toggle_all(),
                 None => {}
             },

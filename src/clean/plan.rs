@@ -5,10 +5,11 @@ use std::path::{Path, PathBuf};
 /// A root-owned cleanup, only ever done by an official tool through `sudo` (ADR 0001).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RootCommand {
-    /// Old versions of installed packages, keeping this many of each (`paccache -k<n>`).
-    /// paccache applies this to uninstalled packages too, so `PacmanUninstalled` runs first.
+    /// Old versions of every package, installed or not, keeping this many of each
+    /// (`paccache -k<n>`; paccache can't leave uninstalled packages out).
     PacmanKeep(u32),
-    /// Every cached version of uninstalled packages (`paccache -uk0`).
+    /// Every remaining version of uninstalled packages (`paccache -uk0`). Sized as what is left
+    /// after `PacmanKeep`, so it runs after it and can't be selected without it.
     PacmanUninstalled,
     /// Shrink the systemd journal to this many MB (`journalctl --rotate --vacuum-size=<n>M`;
     /// rotating first lets the vacuum reach what is in the active files).
@@ -37,14 +38,22 @@ impl RootCommand {
         }
     }
 
-    /// Commands run in this order: uninstalled packages go before `PacmanKeep`, which
-    /// would otherwise also trim them.
+    /// Commands run in this order: `PacmanUninstalled` is sized as what `PacmanKeep` leaves.
     pub fn order(self) -> u8 {
         match self {
-            RootCommand::PacmanUninstalled => 0,
-            RootCommand::PacmanKeep(_) => 1,
+            RootCommand::PacmanKeep(_) => 0,
+            RootCommand::PacmanUninstalled => 1,
             RootCommand::JournalVacuum(_) => 2,
         }
+    }
+
+    /// Whether `self` can only be selected together with `other`, because its size assumes
+    /// `other` ran first.
+    pub fn requires(self, other: RootCommand) -> bool {
+        matches!(
+            (self, other),
+            (RootCommand::PacmanUninstalled, RootCommand::PacmanKeep(_))
+        )
     }
 }
 
@@ -120,6 +129,26 @@ impl Category {
             .filter(|item| item.selected)
             .map(|item| item.size)
             .sum()
+    }
+
+    /// Selects or deselects one Item, together with the Items it requires (when selecting)
+    /// or that require it (when deselecting), so what is removed always matches the sizes.
+    pub fn toggle(&mut self, index: usize) {
+        let select = !self.items[index].selected;
+        self.items[index].selected = select;
+        let Kind::Root(toggled) = self.items[index].kind else {
+            return;
+        };
+        for item in &mut self.items {
+            if let Kind::Root(other) = item.kind {
+                if select && toggled.requires(other) {
+                    item.selected = true;
+                }
+                if !select && other.requires(toggled) {
+                    item.selected = false;
+                }
+            }
+        }
     }
 
     /// Selects every Item, or deselects them all when they already are.
@@ -205,6 +234,27 @@ mod tests {
         };
         assert_eq!(plan.size(), 15);
         assert_eq!(plan.selected_size(), 0);
+    }
+
+    #[test]
+    fn uninstalled_packages_come_with_older_versions() {
+        let mut category = Category::new("Pacman cache");
+        category.items = vec![
+            Item::new("older", Kind::Root(RootCommand::PacmanKeep(2)), 10),
+            Item::new("uninstalled", Kind::Root(RootCommand::PacmanUninstalled), 5),
+        ];
+        category.toggle(1);
+        assert_eq!(category.selected_size(), 15);
+        category.toggle(0);
+        assert_eq!(category.selected_size(), 0);
+        // Older versions alone are fine.
+        category.toggle(0);
+        assert_eq!(category.selected_size(), 10);
+        // Without the older-versions Item (nothing to trim), uninstalled stands alone.
+        category.items.remove(0);
+        category.items[0].selected = false;
+        category.toggle(0);
+        assert_eq!(category.selected_size(), 5);
     }
 
     #[test]

@@ -4,7 +4,7 @@ use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
-use std::process::{Command, ExitStatus};
+use std::process::Command;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
@@ -12,6 +12,7 @@ use serde::Serialize;
 use super::plan::{Item, Kind, Plan};
 use super::scan::{Mounts, trash_parts};
 use crate::safety::Rules;
+use crate::term::Ran;
 
 const SUDO: &str = "/usr/bin/sudo";
 
@@ -25,17 +26,18 @@ pub struct Outcome {
 }
 
 /// Runs root commands, all under one pause of the TUI.
-pub type RunRoot<'a> = dyn FnMut(&mut [Command]) -> io::Result<Vec<io::Result<ExitStatus>>> + 'a;
+pub type RunRoot<'a> = dyn FnMut(&mut [Command]) -> Ran + 'a;
 
 /// Removes every selected Item: home Items directly, each after a last safety check, then the
-/// root commands through `sudo`. Every attempt is written to `log`.
+/// root commands through `sudo`. Every attempt is written to `log`. Also returns whether the
+/// TUI could be paused and brought back for the root commands.
 pub fn apply(
     plan: &Plan,
     rules: &Rules,
     mounts: &Mounts,
     log: &mut Log,
     run_root: &mut RunRoot,
-) -> Vec<Outcome> {
+) -> (Vec<Outcome>, io::Result<()>) {
     let mut outcomes = Vec::new();
     let mut root = Vec::new();
     for item in plan.categories.iter().flat_map(|c| &c.items) {
@@ -64,29 +66,25 @@ pub fn apply(
         })
         .collect();
     if commands.is_empty() {
-        return outcomes;
+        return (outcomes, Ok(()));
     }
     let targets: Vec<String> = commands.iter().map(crate::term::describe).collect();
-    let mut statuses = match run_root(&mut commands) {
-        Ok(statuses) => statuses.into_iter(),
-        Err(err) => {
-            let err = format!("the terminal could not be paused: {err}");
-            for ((_, item), target) in root.iter().zip(&targets) {
-                outcomes.push(log.record(item, target, Err(err.clone())));
-            }
-            return outcomes;
-        }
+    let ran = run_root(&mut commands);
+    let not_run = match &ran.terminal {
+        Err(err) if ran.statuses.is_empty() => format!("the terminal could not be paused: {err}"),
+        _ => "did not run".to_string(),
     };
+    let mut statuses = ran.statuses.into_iter();
     for ((_, item), target) in root.iter().zip(&targets) {
         let result = match statuses.next() {
             Some(Ok(status)) if status.success() => Ok(()),
             Some(Ok(status)) => Err(format!("{target} failed ({status})")),
             Some(Err(err)) => Err(format!("{target} could not run: {err}")),
-            None => Err(format!("{target} did not run")),
+            None => Err(format!("{target} {not_run}")),
         };
         outcomes.push(log.record(item, target, result));
     }
-    outcomes
+    (outcomes, ran.terminal)
 }
 
 /// The last check before removing `path`: the path rules, and not a mount point.
@@ -247,6 +245,7 @@ mod tests {
     use crate::clean::scan::ALLOWED_ROOTS;
     use crate::testdir::TestDir;
     use std::os::unix::process::ExitStatusExt;
+    use std::process::ExitStatus;
 
     struct Setup {
         home: TestDir,
@@ -277,10 +276,8 @@ mod tests {
             categories: vec![category],
         };
         let mut log = Log::open(&setup.log_path).unwrap();
-        let mut no_root = |_: &mut [Command]| -> io::Result<Vec<io::Result<ExitStatus>>> {
-            panic!("no root command expected")
-        };
-        apply(&plan, &setup.rules, mounts, &mut log, &mut no_root)
+        let mut no_root = |_: &mut [Command]| -> Ran { panic!("no root command expected") };
+        apply(&plan, &setup.rules, mounts, &mut log, &mut no_root).0
     }
 
     fn log_lines(setup: &Setup) -> Vec<serde_json::Value> {
@@ -443,6 +440,25 @@ mod tests {
     }
 
     #[test]
+    fn keeps_root_results_when_the_tui_cannot_come_back() {
+        let s = setup(TestDir::new());
+        let mut category = Category::new("Root");
+        category.items = vec![selected(Kind::Root(RootCommand::PacmanUninstalled))];
+        let plan = Plan {
+            categories: vec![category],
+        };
+        let mut log = Log::open(&s.log_path).unwrap();
+        let mut run = |_: &mut [Command]| Ran {
+            statuses: vec![Ok(ExitStatus::from_raw(0))],
+            terminal: Err(io::Error::other("no tty")),
+        };
+        let (outcomes, terminal) = apply(&plan, &s.rules, &Mounts::default(), &mut log, &mut run);
+        assert!(outcomes[0].error.is_none());
+        assert!(terminal.is_err());
+        assert_eq!(log_lines(&s)[0]["removed"], true);
+    }
+
+    #[test]
     fn runs_root_commands_through_sudo_in_order() {
         let s = setup(TestDir::new());
         let mut category = Category::new("Root");
@@ -456,16 +472,20 @@ mod tests {
         };
         let mut log = Log::open(&s.log_path).unwrap();
         let mut ran = Vec::new();
-        let mut run = |commands: &mut [Command]| -> io::Result<Vec<io::Result<ExitStatus>>> {
+        let mut run = |commands: &mut [Command]| -> Ran {
             ran = commands.iter().map(crate::term::describe).collect();
             // The journal vacuum fails.
-            Ok(vec![
-                Ok(ExitStatus::from_raw(0)),
-                Ok(ExitStatus::from_raw(0)),
-                Ok(ExitStatus::from_raw(1 << 8)),
-            ])
+            Ran {
+                statuses: vec![
+                    Ok(ExitStatus::from_raw(0)),
+                    Ok(ExitStatus::from_raw(0)),
+                    Ok(ExitStatus::from_raw(1 << 8)),
+                ],
+                terminal: Ok(()),
+            }
         };
-        let outcomes = apply(&plan, &s.rules, &Mounts::default(), &mut log, &mut run);
+        let (outcomes, terminal) = apply(&plan, &s.rules, &Mounts::default(), &mut log, &mut run);
+        assert!(terminal.is_ok());
         assert_eq!(
             ran,
             [

@@ -89,7 +89,7 @@ impl App {
             if let Some(clean) = &mut self.clean
                 && clean.is_removing()
             {
-                clean.remove(&mut |commands| term::run_external(terminal, commands));
+                clean.remove(&mut |commands| term::run_external(terminal, commands))?;
                 continue;
             }
             // Wake up now and then, so background work (the clean scan) shows up.

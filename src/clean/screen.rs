@@ -202,7 +202,6 @@ impl Screen {
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
         );
-        let yes = matches!(key.code, KeyCode::Char('y'));
         if let State::RemovingHome { stop, .. } = &self.state
             && key.code == KeyCode::Esc
         {
@@ -230,9 +229,11 @@ impl Screen {
                 let used = view.on_key(key);
                 (State::Ready(view), used)
             }
+            // The In Use step takes another key (Y), so a double-tap or auto-repeat of y can't
+            // pass it before it is even drawn.
             State::Confirm {
                 mut view, in_use, ..
-            } if yes => {
+            } if key.code == KeyCode::Char(if in_use { 'Y' } else { 'y' }) => {
                 refresh_in_use(&mut view.plan, &self.config);
                 let any_in_use = view.plan.selected().any(|item| item.in_use);
                 if any_in_use && !in_use {
@@ -286,7 +287,8 @@ impl Screen {
     pub fn hint(&self) -> &'static str {
         match &self.state {
             State::Ready(_) => "↑↓/jk move · space select · a select category · enter remove…",
-            State::Confirm { .. } => "↑↓ scroll · y remove · n back",
+            State::Confirm { in_use: false, .. } => "↑↓ scroll · y remove · n back",
+            State::Confirm { in_use: true, .. } => "↑↓ scroll · Y remove anyway · n back",
             State::RemovingHome { .. } => "esc stop after this Item",
             State::Done { .. } => "↑↓ scroll · enter scan again",
             State::Failed(_) => "enter scan again",
@@ -429,7 +431,7 @@ fn draw_confirm(
             bold,
         ));
         lines.push(Line::from(
-            "Removing them can make those programs misbehave. Remove them anyway?",
+            "Removing them can make those programs misbehave. Press Y (shift+y) to remove them anyway.",
         ));
     } else {
         lines.push(Line::styled(
@@ -739,7 +741,10 @@ mod tests {
         assert!(screen.has_plan());
         press(&mut screen, KeyCode::Enter);
         press(&mut screen, KeyCode::Char('y'));
+        // A second y (a double-tap, auto-repeat) doesn't pass the In Use step.
         press(&mut screen, KeyCode::Char('y'));
+        assert!(is_confirming(&screen, true));
+        press(&mut screen, KeyCode::Char('Y'));
         assert!(screen.is_removing());
     }
 

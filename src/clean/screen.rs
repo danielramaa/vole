@@ -35,6 +35,7 @@ enum State {
     Confirm {
         view: PlanView,
         in_use: bool,
+        scroll: u16,
     },
     /// Confirmed: the removal starts on the next tick.
     Removing(PlanView),
@@ -51,7 +52,10 @@ enum State {
         outcomes: Vec<Outcome>,
         log: Log,
     },
-    Done(Vec<Outcome>),
+    Done {
+        outcomes: Vec<Outcome>,
+        scroll: u16,
+    },
     Failed(String),
 }
 
@@ -127,10 +131,16 @@ impl Screen {
                             outcomes.extend(root.map(|item| {
                                 remove::not_attempted(item, "stopped before removing it")
                             }));
-                            break State::Done(outcomes);
+                            break State::Done {
+                                outcomes,
+                                scroll: 0,
+                            };
                         }
                         if root.count() == 0 {
-                            break State::Done(outcomes);
+                            break State::Done {
+                                outcomes,
+                                scroll: 0,
+                            };
                         }
                         break State::RootPending {
                             plan,
@@ -208,6 +218,7 @@ impl Screen {
                         State::Confirm {
                             view,
                             in_use: false,
+                            scroll: 0,
                         },
                         true,
                     )
@@ -219,22 +230,52 @@ impl Screen {
                 let used = view.on_key(key);
                 (State::Ready(view), used)
             }
-            State::Confirm { mut view, in_use } if yes => {
+            State::Confirm {
+                mut view, in_use, ..
+            } if yes => {
                 refresh_in_use(&mut view.plan, &self.config);
                 let any_in_use = view.plan.selected().any(|item| item.in_use);
                 if any_in_use && !in_use {
-                    (State::Confirm { view, in_use: true }, true)
+                    (
+                        State::Confirm {
+                            view,
+                            in_use: true,
+                            scroll: 0,
+                        },
+                        true,
+                    )
                 } else {
                     (State::Removing(view), true)
                 }
             }
             State::Confirm { view, .. } if back => (State::Ready(view), true),
-            state @ (State::Confirm { .. }
-            | State::Removing(_)
+            State::Confirm {
+                view,
+                in_use,
+                scroll,
+            } => (
+                State::Confirm {
+                    view,
+                    in_use,
+                    scroll: scrolled(scroll, key),
+                },
+                true,
+            ),
+            state @ (State::Removing(_)
             | State::RemovingHome { .. }
             | State::RootPending { .. }) => (state, true),
-            State::Done(_) | State::Failed(_) if matches!(key.code, KeyCode::Enter) => {
+            State::Done { .. } | State::Failed(_) if matches!(key.code, KeyCode::Enter) => {
                 (State::NotStarted, true)
+            }
+            State::Done { outcomes, scroll } => {
+                let next = scrolled(scroll, key);
+                (
+                    State::Done {
+                        outcomes,
+                        scroll: next,
+                    },
+                    next != scroll,
+                )
             }
             state => (state, false),
         };
@@ -245,9 +286,10 @@ impl Screen {
     pub fn hint(&self) -> &'static str {
         match &self.state {
             State::Ready(_) => "↑↓/jk move · space select · a select category · enter remove…",
-            State::Confirm { .. } => "y remove · n back",
+            State::Confirm { .. } => "↑↓ scroll · y remove · n back",
             State::RemovingHome { .. } => "esc stop after this Item",
-            State::Done(_) | State::Failed(_) => "enter scan again",
+            State::Done { .. } => "↑↓ scroll · enter scan again",
+            State::Failed(_) => "enter scan again",
             State::NotStarted
             | State::Scanning(_)
             | State::Removing(_)
@@ -280,7 +322,10 @@ impl Screen {
         };
         let (root, terminal) = remove::remove_root(&plan, &mut log, run_root);
         outcomes.extend(root);
-        self.state = State::Done(outcomes);
+        self.state = State::Done {
+            outcomes,
+            scroll: 0,
+        };
         terminal
     }
 
@@ -309,9 +354,11 @@ impl Screen {
                 frame.render_widget(Paragraph::new(err.as_str()).block(block), area)
             }
             State::Ready(view) => view.draw(frame, area, block),
-            State::Confirm { view, in_use } => {
-                draw_confirm(frame, area, block, &view.plan, *in_use)
-            }
+            State::Confirm {
+                view,
+                in_use,
+                scroll,
+            } => draw_confirm(frame, area, block, &view.plan, *in_use, scroll),
             State::Removing(_) | State::RootPending { .. } => {
                 frame.render_widget(Paragraph::new("Removing…").block(block), area)
             }
@@ -323,12 +370,39 @@ impl Screen {
                 };
                 frame.render_widget(Paragraph::new(text).block(block), area)
             }
-            State::Done(outcomes) => draw_done(frame, area, block, outcomes),
+            State::Done { outcomes, scroll } => draw_done(frame, area, block, outcomes, scroll),
         }
     }
 }
 
-fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, in_use: bool) {
+/// The scroll offset after `key`: j/k and the arrows move one line.
+fn scrolled(scroll: u16, key: KeyEvent) -> u16 {
+    match key.code {
+        KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
+        KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+        _ => scroll,
+    }
+}
+
+/// Draws `lines` scrolled by `scroll`, which is first kept within the lines that don't fit.
+fn draw_scrolled(frame: &mut Frame, area: Rect, block: Block, lines: Vec<Line>, scroll: &mut u16) {
+    let height = usize::from(block.inner(area).height);
+    let most = u16::try_from(lines.len().saturating_sub(height)).unwrap_or(u16::MAX);
+    *scroll = (*scroll).min(most);
+    frame.render_widget(
+        Paragraph::new(lines).block(block).scroll((*scroll, 0)),
+        area,
+    );
+}
+
+fn draw_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block,
+    plan: &Plan,
+    in_use: bool,
+    scroll: &mut u16,
+) {
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let selected: Vec<&Item> = plan.selected().collect();
     let width = usize::from(block.inner(area).width);
@@ -366,10 +440,10 @@ fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, in_use
         }
         lines.push(right_aligned(spans, size::format(item.size), width));
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    draw_scrolled(frame, area, block, lines, scroll);
 }
 
-fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome]) {
+fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome], scroll: &mut u16) {
     let width = usize::from(block.inner(area).width);
     let freed: u64 = outcomes
         .iter()
@@ -402,7 +476,7 @@ fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome]) 
             lines.push(Line::styled(format!("      ! {err}"), dim));
         }
     }
-    frame.render_widget(Paragraph::new(lines).block(block), area);
+    draw_scrolled(frame, area, block, lines, scroll);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -650,6 +724,42 @@ mod tests {
         press(&mut screen, KeyCode::Char('y'));
         press(&mut screen, KeyCode::Char('y'));
         assert!(screen.is_removing());
+    }
+
+    #[test]
+    fn long_lists_scroll_within_bounds() {
+        let mut first = Category::new("Many");
+        first.items = (0..40)
+            .map(|i| {
+                Item::new(
+                    format!("item {i}"),
+                    Kind::Regenerable(format!("/{i}").into()),
+                    1,
+                )
+            })
+            .collect();
+        let mut screen = Screen::with_plan(Plan {
+            categories: vec![first],
+        });
+        press(&mut screen, KeyCode::Char('a'));
+        press(&mut screen, KeyCode::Enter);
+        for _ in 0..100 {
+            press(&mut screen, KeyCode::Char('j'));
+        }
+        let backend = ratatui::backend::TestBackend::new(40, 12);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, frame.area()))
+            .unwrap();
+        let State::Confirm { scroll, .. } = screen.state else {
+            panic!("not confirming");
+        };
+        // 2 heading lines, a blank one and 40 Items, in 10 rows.
+        assert_eq!(scroll, 43 - 10);
+        let last_row: String = (0..40)
+            .map(|x| terminal.backend().buffer()[(x, 10)].symbol().to_string())
+            .collect();
+        assert!(last_row.contains("item 39"), "{last_row}");
     }
 
     #[test]

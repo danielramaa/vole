@@ -10,7 +10,8 @@ pub enum RootCommand {
     PacmanKeep(u32),
     /// Every cached version of uninstalled packages (`paccache -uk0`).
     PacmanUninstalled,
-    /// Shrink the systemd journal to this many MB (`journalctl --vacuum-size=<n>M`).
+    /// Shrink the systemd journal to this many MB (`journalctl --rotate --vacuum-size=<n>M`;
+    /// rotating first lets the vacuum reach what is in the active files).
     JournalVacuum(u32),
 }
 

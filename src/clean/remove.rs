@@ -6,11 +6,12 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
-use super::plan::{Item, Kind, Plan};
+use super::plan::{Item, Kind, Plan, RootCommand};
 use super::scan::{Mounts, trash_parts};
 use crate::safety::Rules;
 use crate::term::Ran;
@@ -29,34 +30,53 @@ pub struct Outcome {
 /// Runs root commands, all under one pause of the TUI.
 pub type RunRoot<'a> = dyn FnMut(&mut [Command]) -> Ran + 'a;
 
-/// Removes every selected Item: home Items directly, each after a last safety check, then the
-/// root commands through `sudo`. Every attempt is written to `log`. Also returns whether the
-/// TUI could be paused and brought back for the root commands.
-pub fn apply(
+/// Removes the selected home Items, each after a last safety check, and writes each attempt
+/// to `log`. `progress` is told about each Item before it is removed. Once `stop` is set, the
+/// Items not started yet are left alone.
+pub fn remove_home(
     plan: &Plan,
     rules: &Rules,
     mounts: &Mounts,
     log: &mut Log,
-    run_root: &mut RunRoot,
-) -> (Vec<Outcome>, io::Result<()>) {
+    progress: &mut dyn FnMut(usize, usize, &str),
+    stop: &AtomicBool,
+) -> Vec<Outcome> {
+    let items: Vec<&Item> = plan
+        .selected()
+        .filter(|item| item.path().is_some())
+        .collect();
     let mut outcomes = Vec::new();
-    let mut root = Vec::new();
-    for item in plan.categories.iter().flat_map(|c| &c.items) {
-        if !item.selected {
+    for (done, item) in items.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            outcomes.push(not_attempted(item, "stopped before removing it"));
             continue;
         }
+        progress(done, items.len(), &item.label);
         let result = match &item.kind {
             Kind::Regenerable(path) => remove_regenerable(path, rules, mounts),
             Kind::Trash(path) => empty_trash(path, rules, mounts),
-            Kind::Root(command) => {
-                root.push((*command, item));
-                continue;
-            }
+            Kind::Root(_) => continue,
         };
         let target = item.path().unwrap_or(Path::new("")).display().to_string();
         outcomes.push(log.record(item, &target, result));
     }
+    outcomes
+}
 
+/// Runs the selected root commands through `sudo`, in order, and writes each to `log`. Also
+/// returns whether the TUI could be paused and brought back for them.
+pub fn remove_root(
+    plan: &Plan,
+    log: &mut Log,
+    run_root: &mut RunRoot,
+) -> (Vec<Outcome>, io::Result<()>) {
+    let mut root: Vec<(RootCommand, &Item)> = plan
+        .selected()
+        .filter_map(|item| match item.kind {
+            Kind::Root(command) => Some((command, item)),
+            Kind::Regenerable(_) | Kind::Trash(_) => None,
+        })
+        .collect();
     root.sort_by_key(|(command, _)| command.order());
     let mut commands: Vec<Command> = root
         .iter()
@@ -67,7 +87,7 @@ pub fn apply(
         })
         .collect();
     if commands.is_empty() {
-        return (outcomes, Ok(()));
+        return (Vec::new(), Ok(()));
     }
     let targets: Vec<String> = commands.iter().map(crate::term::describe).collect();
     let ran = run_root(&mut commands);
@@ -76,6 +96,7 @@ pub fn apply(
         _ => "did not run".to_string(),
     };
     let mut statuses = ran.statuses.into_iter();
+    let mut outcomes = Vec::new();
     for ((_, item), target) in root.iter().zip(&targets) {
         let result = match statuses.next() {
             Some(Ok(status)) if status.success() => Ok(()),
@@ -86,6 +107,15 @@ pub fn apply(
         outcomes.push(log.record(item, target, result));
     }
     (outcomes, ran.terminal)
+}
+
+/// The Outcome of an Item vole didn't try to remove, so there is nothing to log.
+pub fn not_attempted(item: &Item, why: &str) -> Outcome {
+    Outcome {
+        label: item.label.clone(),
+        size: item.size,
+        error: Some(why.to_string()),
+    }
 }
 
 /// The last check before removing `path`: the path rules, and not a mount point.
@@ -364,8 +394,16 @@ mod tests {
             categories: vec![category],
         };
         let mut log = Log::open(&setup.log_path).unwrap();
-        let mut no_root = |_: &mut [Command]| -> Ran { panic!("no root command expected") };
-        apply(&plan, &setup.rules, mounts, &mut log, &mut no_root).0
+        let mut no_progress = |_: usize, _: usize, _: &str| {};
+        let stop = AtomicBool::new(false);
+        remove_home(
+            &plan,
+            &setup.rules,
+            mounts,
+            &mut log,
+            &mut no_progress,
+            &stop,
+        )
     }
 
     fn log_lines(setup: &Setup) -> Vec<serde_json::Value> {
@@ -571,6 +609,40 @@ mod tests {
     }
 
     #[test]
+    fn stopping_leaves_the_remaining_items_alone() {
+        let s = setup(TestDir::new());
+        let first = s.home.dir(".cache/first");
+        let second = s.home.dir(".cache/second");
+        let mut category = Category::new("Test");
+        category.items = vec![
+            selected(Kind::Regenerable(first.clone())),
+            selected(Kind::Regenerable(second.clone())),
+        ];
+        let plan = Plan {
+            categories: vec![category],
+        };
+        let mut log = Log::open(&s.log_path).unwrap();
+        let stop = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let mut progress = |done: usize, total: usize, _: &str| {
+            seen.push((done, total));
+            stop.store(true, Ordering::Relaxed);
+        };
+        let outcomes = remove_home(
+            &plan,
+            &s.rules,
+            &Mounts::default(),
+            &mut log,
+            &mut progress,
+            &stop,
+        );
+        assert_eq!(seen, [(0, 2)]);
+        assert!(!first.exists() && second.exists());
+        assert!(outcomes[0].error.is_none() && outcomes[1].error.is_some());
+        assert_eq!(log_lines(&s).len(), 1);
+    }
+
+    #[test]
     fn keeps_root_results_when_the_tui_cannot_come_back() {
         let s = setup(TestDir::new());
         let mut category = Category::new("Root");
@@ -583,7 +655,7 @@ mod tests {
             statuses: vec![Ok(ExitStatus::from_raw(0))],
             terminal: Err(io::Error::other("no tty")),
         };
-        let (outcomes, terminal) = apply(&plan, &s.rules, &Mounts::default(), &mut log, &mut run);
+        let (outcomes, terminal) = remove_root(&plan, &mut log, &mut run);
         assert!(outcomes[0].error.is_none());
         assert!(terminal.is_err());
         assert_eq!(log_lines(&s)[0]["removed"], true);
@@ -615,7 +687,7 @@ mod tests {
                 terminal: Ok(()),
             }
         };
-        let (outcomes, terminal) = apply(&plan, &s.rules, &Mounts::default(), &mut log, &mut run);
+        let (outcomes, terminal) = remove_root(&plan, &mut log, &mut run);
         assert!(terminal.is_ok());
         assert_eq!(
             ran,

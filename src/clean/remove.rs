@@ -2,6 +2,7 @@
 
 use std::fs::{self, File, OpenOptions, Permissions};
 use std::io::{self, Write};
+use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -115,6 +116,7 @@ fn empty_trash(trash: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), Strin
         return Err(format!("refused: {} is not a folder", trash.display()));
     }
     let mut first_error = None;
+    let mut usable = Vec::new();
     for part in trash_parts(trash, rules) {
         // A part mounted from elsewhere is not the trash's to empty.
         let same_device = fs::symlink_metadata(&part).is_ok_and(|m| m.dev() == trash_meta.dev());
@@ -123,21 +125,76 @@ fn empty_trash(trash: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), Strin
                 .then_some(())
                 .ok_or_else(|| format!("refused: {} is a mount point", part.display()))
         });
-        if let Err(err) = checked {
-            first_error.get_or_insert(err);
-            continue;
-        }
-        let entries = fs::read_dir(&part).map_err(|err| format!("{}: {err}", part.display()))?;
-        for entry in entries {
-            let result = entry
-                .map_err(|err| err.to_string())
-                .and_then(|entry| remove_regenerable(&entry.path(), rules, mounts));
-            if let Err(err) = result {
+        match checked {
+            Ok(()) => usable.push(part),
+            Err(err) => {
                 first_error.get_or_insert(err);
             }
         }
     }
+    let mut note = |result: Result<(), String>| {
+        if let Err(err) = result {
+            first_error.get_or_insert(err);
+        }
+    };
+    let files = trash.join("files");
+    let info = trash.join("info");
+    let expunged = trash.join("expunged");
+
+    // Each trashed file, then its .trashinfo, which is kept when the file couldn't go so the
+    // desktop trash still lists it.
+    if usable.contains(&files) {
+        for entry in read_entries(&files, &mut note) {
+            let removed = remove_regenerable(&entry, rules, mounts);
+            if removed.is_ok() && usable.contains(&info) {
+                let mut name = entry.file_name().unwrap_or_default().to_os_string();
+                name.push(".trashinfo");
+                note(remove_regenerable(&info.join(name), rules, mounts));
+            }
+            note(removed);
+        }
+        // .trashinfo files whose trashed file is already gone.
+        if usable.contains(&info) {
+            for entry in read_entries(&info, &mut note) {
+                let name = entry.file_name().unwrap_or_default().as_bytes();
+                let Some(stem) = name.strip_suffix(b".trashinfo") else {
+                    continue;
+                };
+                let file = files.join(std::ffi::OsStr::from_bytes(stem));
+                if fs::symlink_metadata(&file)
+                    .is_err_and(|err| err.kind() == io::ErrorKind::NotFound)
+                {
+                    note(remove_regenerable(&entry, rules, mounts));
+                }
+            }
+        }
+    }
+    if usable.contains(&expunged) {
+        for entry in read_entries(&expunged, &mut note) {
+            note(remove_regenerable(&entry, rules, mounts));
+        }
+    }
     first_error.map_or(Ok(()), Err)
+}
+
+/// The paths inside `dir`. Errors go to `note`, and the entries that could be read are still
+/// returned.
+fn read_entries(dir: &Path, note: &mut impl FnMut(Result<(), String>)) -> Vec<PathBuf> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) => {
+            note(Err(format!("{}: {err}", dir.display())));
+            return Vec::new();
+        }
+    };
+    let mut paths = Vec::new();
+    for entry in entries {
+        match entry {
+            Ok(entry) => paths.push(entry.path()),
+            Err(err) => note(Err(format!("{}: {err}", dir.display()))),
+        }
+    }
+    paths
 }
 
 /// Removes `path` (a real path) without following symlinks and without entering other
@@ -469,6 +526,24 @@ mod tests {
         assert_eq!(fs::read_dir(trash.join("files")).unwrap().count(), 0);
         assert_eq!(fs::read_dir(trash.join("info")).unwrap().count(), 0);
         assert!(trash.join("files").is_dir());
+    }
+
+    #[test]
+    fn keeps_the_trashinfo_of_what_could_not_be_removed() {
+        let s = setup(TestDir::new());
+        let stuck = s.home.file(".local/share/Trash/files/stuck/mounted/a", 10);
+        s.home.file(".local/share/Trash/files/gone.txt", 10);
+        let trash = s.home.path().join(".local/share/Trash");
+        let stuck_info = s.home.file(".local/share/Trash/info/stuck.trashinfo", 10);
+        let gone_info = s
+            .home
+            .file(".local/share/Trash/info/gone.txt.trashinfo", 10);
+        let orphan_info = s.home.file(".local/share/Trash/info/orphan.trashinfo", 10);
+        let mounts = Mounts::from_paths([stuck.parent().unwrap().to_path_buf()]);
+        let outcomes = apply_items(&s, vec![selected(Kind::Trash(trash))], &mounts);
+        assert!(outcomes[0].error.is_some());
+        assert!(stuck.exists() && stuck_info.exists());
+        assert!(!gone_info.exists() && !orphan_info.exists());
     }
 
     #[test]

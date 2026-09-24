@@ -225,10 +225,12 @@ impl PlanView {
 
 /// `spans` on the left, `right` at the right edge of `width`.
 fn right_aligned(mut spans: Vec<Span<'static>>, right: String, width: usize) -> Line<'static> {
-    let used: usize = spans.iter().map(|span| span.content.chars().count()).sum();
-    let gap = width.saturating_sub(used + right.chars().count()).max(1);
+    // Terminal columns, not chars: wide characters take two.
+    let right = Span::raw(right);
+    let used: usize = spans.iter().map(Span::width).sum();
+    let gap = width.saturating_sub(used + right.width()).max(1);
     spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(Span::raw(right));
+    spans.push(right);
     Line::from(spans)
 }
 
@@ -295,6 +297,12 @@ mod tests {
         }
         press(&mut screen, KeyCode::Char(' '));
         assert_eq!(selected_size(&screen), 40);
+    }
+
+    #[test]
+    fn sizes_line_up_with_wide_characters() {
+        let line = right_aligned(vec![Span::raw("~/.cache/日本")], "1 B".into(), 20);
+        assert_eq!(line.width(), 20);
     }
 
     #[test]

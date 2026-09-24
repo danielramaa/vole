@@ -110,7 +110,7 @@ impl Screen {
                 }
             },
             State::Removing(view) => match self.prepare() {
-                Ok((rules, log)) => Self::start_removal(view.plan, rules, log),
+                Ok((rules, mounts, log)) => Self::start_removal(view.plan, rules, mounts, log),
                 Err(err) => State::Failed(format!("Nothing was removed: {err}")),
             },
             State::RemovingHome {
@@ -159,7 +159,7 @@ impl Screen {
     }
 
     /// Removes the home Items on a worker thread, so the screen keeps drawing.
-    fn start_removal(plan: Plan, rules: Rules, mut log: Log) -> State {
+    fn start_removal(plan: Plan, rules: Rules, mounts: Mounts, mut log: Log) -> State {
         let (sender, receiver) = mpsc::channel();
         let stop = Arc::new(AtomicBool::new(false));
         let worker_plan = plan.clone();
@@ -171,7 +171,7 @@ impl Screen {
             let outcomes = remove::remove_home(
                 &worker_plan,
                 &rules,
-                &Mounts::load(),
+                &mounts,
                 &mut log,
                 &mut progress,
                 &worker_stop,
@@ -284,15 +284,18 @@ impl Screen {
         terminal
     }
 
-    /// Fresh path rules, and the Operation Log: nothing is removed if it can't be written.
-    fn prepare(&self) -> Result<(Rules, Log), String> {
+    /// Fresh path rules and mount points, and the Operation Log. Nothing is removed without all
+    /// three: bind mounts can only be told apart through the mount points.
+    fn prepare(&self) -> Result<(Rules, Mounts, Log), String> {
         let home = dirs::home_dir().ok_or("the home directory could not be found")?;
         let rules = Rules::new(&home, ALLOWED_ROOTS, &self.config.protected_paths(&home))
             .map_err(|err| format!("resolving {}: {err}", home.display()))?;
+        let mounts = Mounts::load()
+            .map_err(|err| format!("reading the mount points from /proc/self/mountinfo: {err}"))?;
         let path = Log::path().ok_or("the operation log's folder could not be found")?;
         let log = Log::open(&path)
             .map_err(|err| format!("opening the operation log {}: {err}", path.display()))?;
-        Ok((rules, log))
+        Ok((rules, mounts, log))
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {

@@ -142,14 +142,25 @@ fn empty_trash(trash: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), Strin
 
 /// Removes `path` (a real path) without following symlinks and without entering other
 /// filesystems or mount points. Read-only folders, like Go's module cache, are made writable.
+/// Anything that disappears meanwhile (a program cleaning its own cache) counts as removed.
 fn remove(path: &Path, mounts: &Mounts) -> io::Result<()> {
-    let meta = fs::symlink_metadata(path)?;
+    let meta = match fs::symlink_metadata(path) {
+        Ok(meta) => meta,
+        Err(err) => return gone_is_fine(Err(err)),
+    };
     remove_tree(path, &meta, meta.dev(), mounts)
+}
+
+fn gone_is_fine(result: io::Result<()>) -> io::Result<()> {
+    match result {
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        result => result,
+    }
 }
 
 fn remove_tree(path: &Path, meta: &fs::Metadata, device: u64, mounts: &Mounts) -> io::Result<()> {
     if !meta.is_dir() {
-        return fs::remove_file(path);
+        return gone_is_fine(fs::remove_file(path));
     }
     if meta.dev() != device || mounts.contains(path) {
         return Err(io::Error::other(format!(
@@ -159,13 +170,20 @@ fn remove_tree(path: &Path, meta: &fs::Metadata, device: u64, mounts: &Mounts) -
     }
     let mode = meta.permissions().mode();
     if mode & 0o700 != 0o700 {
-        fs::set_permissions(path, Permissions::from_mode(mode | 0o700))?;
+        gone_is_fine(fs::set_permissions(
+            path,
+            Permissions::from_mode(mode | 0o700),
+        ))?;
     }
+    let entries = match fs::read_dir(path) {
+        Ok(entries) => entries,
+        Err(err) => return gone_is_fine(Err(err)),
+    };
     let mut first_error = None;
-    for entry in fs::read_dir(path)? {
-        let result = entry.and_then(|entry| {
-            let meta = entry.metadata()?;
-            remove_tree(&entry.path(), &meta, device, mounts)
+    for entry in entries {
+        let result = entry.and_then(|entry| match entry.metadata() {
+            Ok(meta) => remove_tree(&entry.path(), &meta, device, mounts),
+            Err(err) => gone_is_fine(Err(err)),
         });
         if let Err(err) = result {
             first_error.get_or_insert(err);
@@ -173,7 +191,7 @@ fn remove_tree(path: &Path, meta: &fs::Metadata, device: u64, mounts: &Mounts) -
     }
     match first_error {
         Some(err) => Err(err),
-        None => fs::remove_dir(path),
+        None => gone_is_fine(fs::remove_dir(path)),
     }
 }
 
@@ -325,6 +343,19 @@ mod tests {
         assert_eq!(log[0]["removed"], true);
         assert_eq!(log[0]["kind"], "regenerable");
         assert_eq!(log[0]["target"], cache.display().to_string());
+    }
+
+    #[test]
+    fn an_item_that_is_already_gone_counts_as_removed() {
+        let s = setup(TestDir::new());
+        s.home.dir(".cache");
+        let gone = s.home.path().join(".cache/gone");
+        let outcomes = apply_items(
+            &s,
+            vec![selected(Kind::Regenerable(gone))],
+            &Mounts::default(),
+        );
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0]);
     }
 
     #[test]

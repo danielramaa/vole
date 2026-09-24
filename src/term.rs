@@ -1,4 +1,4 @@
-use std::io::{self, stdout};
+use std::io::{self, Write, stdout};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
@@ -30,7 +30,7 @@ pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) ->
     // Ctrl+C at the password prompt goes to the whole foreground process group. Like
     // system(3), vole ignores it while it waits, so only the command stops.
     let paused = ignore_interrupts(true).and_then(|()| pause(terminal));
-    let statuses = match &paused {
+    let statuses: Vec<io::Result<ExitStatus>> = match &paused {
         Ok(()) => commands
             .iter_mut()
             .map(|command| {
@@ -40,6 +40,13 @@ pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) ->
             .collect(),
         Err(_) => Vec::new(),
     };
+    // Coming back would hide why a command failed (a wrong password, not in sudoers, …).
+    if !statuses
+        .iter()
+        .all(|s| s.as_ref().is_ok_and(ExitStatus::success))
+    {
+        wait_for_enter();
+    }
     let resumed = resume(terminal);
     let _ = ignore_interrupts(false);
     // Keys typed while the TUI was paused are not meant for it.
@@ -53,6 +60,12 @@ pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) ->
         statuses,
         terminal: paused.and(resumed),
     }
+}
+
+fn wait_for_enter() {
+    print!("vole: a command failed; its output is above. Press Enter to go back to vole.");
+    let _ = stdout().flush();
+    let _ = io::stdin().read_line(&mut String::new());
 }
 
 /// Makes SIGINT and SIGQUIT do nothing to vole (`true`), or act as usual again (`false`).

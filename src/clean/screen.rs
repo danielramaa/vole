@@ -1,5 +1,6 @@
 //! The `clean` screens: scanning, the Plan with selection, confirmation, and the result.
 
+use std::io;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
@@ -151,22 +152,23 @@ impl Screen {
     }
 
     /// Removes the confirmed Items. `run_root` runs the `sudo` commands with the TUI paused.
-    pub fn remove(&mut self, run_root: &mut RunRoot) {
+    /// Fails when the TUI couldn't be brought back afterwards; the result is logged either way.
+    pub fn remove(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let State::Removing(view) = state else {
             self.state = state;
-            return;
+            return Ok(());
         };
-        self.state = match self.prepare() {
-            Ok((rules, mut log)) => State::Done(remove::apply(
-                &view.plan,
-                &rules,
-                &Mounts::load(),
-                &mut log,
-                run_root,
-            )),
-            Err(err) => State::Failed(format!("Nothing was removed: {err}")),
+        let (state, terminal) = match self.prepare() {
+            Ok((rules, mut log)) => {
+                let (outcomes, terminal) =
+                    remove::apply(&view.plan, &rules, &Mounts::load(), &mut log, run_root);
+                (State::Done(outcomes), terminal)
+            }
+            Err(err) => (State::Failed(format!("Nothing was removed: {err}")), Ok(())),
         };
+        self.state = state;
+        terminal
     }
 
     /// Fresh path rules, and the Operation Log: nothing is removed if it can't be written.

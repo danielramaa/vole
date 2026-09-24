@@ -10,14 +10,21 @@ use ratatui::crossterm::terminal::{
 };
 use signal_hook::consts::{SIGINT, SIGQUIT};
 
+/// What happened while the TUI was paused.
+pub struct Ran {
+    /// The exit status of each command that ran, in order. Empty when the TUI couldn't be
+    /// paused, since then nothing ran.
+    pub statuses: Vec<io::Result<ExitStatus>>,
+    /// The first error pausing the TUI or bringing it back.
+    pub terminal: io::Result<()>,
+}
+
 /// Pauses the TUI, runs `commands` one after another in the normal terminal (so `sudo` can ask
-/// for the password itself), then brings the TUI back. Returns each command's exit status.
+/// for the password itself), then brings the TUI back.
 ///
-/// The TUI is always brought back, even when pausing or a command fails.
-pub fn run_external(
-    terminal: &mut DefaultTerminal,
-    commands: &mut [Command],
-) -> io::Result<Vec<io::Result<ExitStatus>>> {
+/// The TUI is always brought back, even when pausing or a command fails, and the statuses are
+/// kept even when bringing it back fails.
+pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) -> Ran {
     // Ctrl+C at the password prompt goes to the whole foreground process group. Like
     // system(3), vole ignores it while it waits, so only the command stops.
     let paused = ignore_interrupts(true).and_then(|()| pause(terminal));
@@ -34,9 +41,10 @@ pub fn run_external(
     let resumed = resume(terminal);
     let _ = ignore_interrupts(false);
 
-    paused?;
-    resumed?;
-    Ok(statuses)
+    Ran {
+        statuses,
+        terminal: paused.and(resumed),
+    }
 }
 
 /// Makes SIGINT and SIGQUIT do nothing to vole (`true`), or act as usual again (`false`).

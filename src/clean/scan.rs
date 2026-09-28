@@ -3,6 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::ffi::OsString;
 use std::fs::{self, Metadata};
+use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
@@ -143,11 +144,10 @@ impl<'a> Builder<'a> {
             return false;
         }
         // A mount point is not the cache's to remove, even when it holds the same filesystem.
-        let allowed = self.rules.check(path).is_ok()
-            && !self
-                .rules
-                .resolve(path)
-                .is_some_and(|real| self.mounts.contains(&real));
+        let allowed = self
+            .rules
+            .check(path)
+            .is_ok_and(|real| !self.mounts.contains(&real));
         if !allowed {
             self.refused += 1;
         }
@@ -208,7 +208,7 @@ pub fn trash_parts(trash: &Path, rules: &Rules) -> Vec<PathBuf> {
         .collect()
 }
 
-fn is_real_dir(path: &Path) -> bool {
+pub(super) fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
@@ -217,10 +217,8 @@ fn is_real_dir(path: &Path) -> bool {
 pub struct Mounts(HashSet<PathBuf>);
 
 impl Mounts {
-    pub fn load() -> Self {
-        fs::read_to_string("/proc/self/mountinfo")
-            .map(|text| Self::parse(&text))
-            .unwrap_or_default()
+    pub fn load() -> io::Result<Self> {
+        fs::read_to_string("/proc/self/mountinfo").map(|text| Self::parse(&text))
     }
 
     fn parse(mountinfo: &str) -> Self {
@@ -235,6 +233,11 @@ impl Mounts {
 
     pub fn contains(&self, path: &Path) -> bool {
         self.0.contains(path)
+    }
+
+    #[cfg(test)]
+    pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
+        Self(paths.into_iter().collect())
     }
 }
 
@@ -470,6 +473,11 @@ mod tests {
         assert!(mounts.contains(Path::new("/home/me/.cache/my disk")));
         assert!(mounts.contains(Path::new("/home/me/.cache/bind")));
         assert!(!mounts.contains(Path::new("/home/me/.cache")));
+    }
+
+    #[test]
+    fn loads_the_mount_points_of_this_system() {
+        assert!(Mounts::load().unwrap().contains(Path::new("/")));
     }
 
     #[test]

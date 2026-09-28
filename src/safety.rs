@@ -105,9 +105,10 @@ impl Rules {
         all
     }
 
-    /// Checks that `path` may be proposed (and, right before removal, removed) by a module.
-    /// `path` itself may be a symlink: removing it only removes the link.
-    pub fn check(&self, path: &Path) -> Result<(), Refusal> {
+    /// Checks that `path` may be proposed (and, right before removal, removed) by a module, and
+    /// returns where it really is (see [`Rules::resolve`]). `path` itself may be a symlink:
+    /// removing it only removes the link.
+    pub fn check(&self, path: &Path) -> Result<PathBuf, Refusal> {
         if !path.is_absolute()
             || path
                 .components()
@@ -131,7 +132,7 @@ impl Rules {
         if overlaps(&real, &self.protected) {
             return Err(Refusal::Protected);
         }
-        Ok(())
+        Ok(real)
     }
 
     /// Where `path` (inside the home directory) really is, without following `path` itself.
@@ -166,10 +167,12 @@ mod tests {
     fn allows_paths_under_a_root() {
         let home = TestDir::new();
         let path = home.dir(".cache/foo");
-        assert_eq!(rules(&home, &[]).check(&path), Ok(()));
+        assert_eq!(rules(&home, &[]).check(&path), Ok(path.clone()));
         // The root itself, and paths that don't exist yet.
-        assert_eq!(rules(&home, &[]).check(&home.path().join(".cache")), Ok(()));
-        assert_eq!(rules(&home, &[]).check(&path.join("missing")), Ok(()));
+        let cache = home.path().join(".cache");
+        assert_eq!(rules(&home, &[]).check(&cache), Ok(cache));
+        let missing = path.join("missing");
+        assert_eq!(rules(&home, &[]).check(&missing), Ok(missing));
     }
 
     #[test]
@@ -232,7 +235,8 @@ mod tests {
             rules.check(&home.path().join(".cache")),
             Err(Refusal::Protected)
         );
-        assert_eq!(rules.check(&home.dir(".cache/other")), Ok(()));
+        let other = home.dir(".cache/other");
+        assert_eq!(rules.check(&other), Ok(other));
     }
 
     #[test]
@@ -245,7 +249,8 @@ mod tests {
         let escape = home.path().join(".cache/link/important");
         assert_eq!(rules.check(&escape), Err(Refusal::Symlinked));
         // The link itself can go: removing it doesn't touch what it points to.
-        assert_eq!(rules.check(&home.path().join(".cache/link")), Ok(()));
+        let link = home.path().join(".cache/link");
+        assert_eq!(rules.check(&link), Ok(link));
     }
 
     #[test]

@@ -36,6 +36,23 @@ pub struct Ran {
     pub terminal: io::Result<()>,
 }
 
+impl Ran {
+    /// Why the command at `index`, called `what` here, didn't succeed; `None` when it did.
+    pub fn error(&self, index: usize, what: &str) -> Option<String> {
+        match self.statuses.get(index) {
+            Some(Ok(status)) if status.success() => None,
+            Some(Ok(status)) => Some(format!("{what} failed ({status})")),
+            Some(Err(err)) => Some(format!("{what} could not run: {err}")),
+            None => Some(match &self.terminal {
+                Err(err) if self.statuses.is_empty() => {
+                    format!("{what} did not run: the terminal could not be paused: {err}")
+                }
+                _ => format!("{what} did not run"),
+            }),
+        }
+    }
+}
+
 /// Pauses the TUI, runs `commands` one after another in the normal terminal (so `sudo` can ask
 /// for the password itself), then brings the TUI back.
 ///
@@ -145,6 +162,31 @@ fn resume(terminal: &mut DefaultTerminal) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn says_why_a_command_did_not_succeed() {
+        let ran = Ran {
+            statuses: vec![
+                Ok(ExitStatus::from_raw(0)),
+                Ok(ExitStatus::from_raw(1 << 8)),
+                Err(io::Error::other("no such file")),
+            ],
+            terminal: Ok(()),
+        };
+        assert_eq!(ran.error(0, "a"), None);
+        assert_eq!(ran.error(1, "b").unwrap(), "b failed (exit status: 1)");
+        assert_eq!(ran.error(2, "c").unwrap(), "c could not run: no such file");
+        assert_eq!(ran.error(3, "d").unwrap(), "d did not run");
+        let not_paused = Ran {
+            statuses: Vec::new(),
+            terminal: Err(io::Error::other("no tty")),
+        };
+        assert_eq!(
+            not_paused.error(0, "a").unwrap(),
+            "a did not run: the terminal could not be paused: no tty"
+        );
+    }
 
     #[test]
     fn interrupts_can_be_ignored_while_a_command_runs() {

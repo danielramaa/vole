@@ -59,15 +59,7 @@ pub fn remove(
     }
 
     let ran = run_root(std::slice::from_mut(&mut command));
-    let failed = match ran.statuses.first() {
-        Some(Ok(status)) if status.success() => None,
-        Some(Ok(status)) => Some(format!("sudo pacman -Rns failed ({status})")),
-        Some(Err(err)) => Some(format!("sudo pacman -Rns could not run: {err}")),
-        None => Some(match &ran.terminal {
-            Err(err) => format!("the terminal could not be paused: {err}"),
-            Ok(()) => "sudo pacman -Rns did not run".into(),
-        }),
-    };
+    let failed = ran.error(0, "sudo pacman -Rns");
     // What is still installed decides, whatever the exit status: the user may have declined
     // pacman's own question, or a failed transaction may have removed part of it.
     let installed = pacman.installed();

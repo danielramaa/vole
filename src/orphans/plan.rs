@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::pacman::Info;
+use super::pacman::{Backup, Info};
 
 /// An Orphaned Package: one Item of the Plan.
 #[derive(Debug, Clone)]
@@ -22,6 +22,8 @@ pub struct Package {
     /// Installed packages that stay but list this one as an optional dependency: `pacman -Rns`
     /// removes it anyway once nothing depends on it.
     pub optional_for: Vec<String>,
+    /// The config files that go with it: `-n` deletes even the changed ones.
+    pub backup: Vec<Backup>,
     pub selected: bool,
     /// The packages of the Plan that depend on this one.
     required_by: Vec<usize>,
@@ -38,6 +40,7 @@ impl Package {
             nested: false,
             also_needs: Vec::new(),
             optional_for: Vec::new(),
+            backup: Vec::new(),
             selected: false,
             required_by: Vec::new(),
             needs: Vec::new(),

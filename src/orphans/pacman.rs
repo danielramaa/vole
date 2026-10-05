@@ -22,6 +22,25 @@ pub struct Info {
     pub required_by: Vec<String>,
     /// The installed packages that list this one as an optional dependency.
     pub optional_for: Vec<String>,
+    /// The package's config files; only `pacman -Qii` lists them.
+    pub backup: Vec<Backup>,
+}
+
+/// A config file of a package (in its `backup` array). Removing the package with `-n` deletes
+/// it even when it was changed, instead of keeping a `.pacsave` copy.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Backup {
+    pub path: String,
+    pub state: BackupState,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BackupState {
+    Unmodified,
+    /// Changed since it was installed.
+    Modified,
+    /// The user can't read it, so whether it was changed is unknown.
+    Unreadable,
 }
 
 /// The packages `pacman -Qdtq` lists: installed as dependencies, and neither required nor
@@ -47,6 +66,15 @@ fn orphan_names(output: &Output) -> Result<Vec<String>> {
 /// Every installed package (`pacman -Qi`).
 pub fn installed() -> Result<Vec<Info>> {
     let output = query(&["-Qi"])?;
+    check(&output)?;
+    Ok(parse_info(&String::from_utf8_lossy(&output.stdout)))
+}
+
+/// The config files of the packages `names` (`pacman -Qii`).
+pub fn backup_files(names: &[&str]) -> Result<Vec<Info>> {
+    let mut args = vec!["-Qii", "--"];
+    args.extend_from_slice(names);
+    let output = query(&args)?;
     check(&output)?;
     Ok(parse_info(&String::from_utf8_lossy(&output.stdout)))
 }
@@ -130,6 +158,26 @@ fn info(fields: &[(&str, Vec<&str>)]) -> Option<Info> {
         dependency: first("Install Reason") == "Installed as a dependency for another package",
         required_by: names("Required By"),
         optional_for: names("Optional For"),
+        backup: values("Backup Files")
+            .iter()
+            .filter_map(|line| backup(line))
+            .collect(),
+    })
+}
+
+/// Reads e.g. `/etc/pacman.conf [modified]`. A missing file is left out: nothing to remove.
+fn backup(line: &str) -> Option<Backup> {
+    let (path, state) = line.rsplit_once(' ')?;
+    let state = match state {
+        "[unmodified]" => BackupState::Unmodified,
+        "[modified]" => BackupState::Modified,
+        "[missing]" => return None,
+        // `[unreadable]`, or `[unknown]` for any other error.
+        _ => BackupState::Unreadable,
+    };
+    Some(Backup {
+        path: path.trim_end().to_string(),
+        state,
     })
 }
 
@@ -180,6 +228,35 @@ Install Reason  : Explicitly installed
         assert!(infos[0].required_by.is_empty() && infos[0].optional_for.is_empty());
         // Wrapped onto a second line.
         assert_eq!(infos[1].required_by, ["python-lexicon", "python-paramiko"]);
+    }
+
+    #[test]
+    fn reads_config_files_and_whether_they_changed() {
+        let qii = "\
+Name            : pacman
+Backup Files    : /etc/pacman.conf [modified]
+                  /etc/makepkg.conf [unmodified]
+                  /etc/makepkg.conf.d/my conf.conf [unreadable]
+                  /etc/gone.conf [missing]
+Extended Data   : pkgtype=pkg
+
+Name            : zstd
+Backup Files    : None
+";
+        let infos = parse_info(qii);
+        let backup = |path: &str, state| Backup {
+            path: path.into(),
+            state,
+        };
+        assert_eq!(
+            infos[0].backup,
+            [
+                backup("/etc/pacman.conf", BackupState::Modified),
+                backup("/etc/makepkg.conf", BackupState::Unmodified),
+                backup("/etc/makepkg.conf.d/my conf.conf", BackupState::Unreadable),
+            ]
+        );
+        assert!(infos[1].backup.is_empty());
     }
 
     #[test]

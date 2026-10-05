@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet};
 
 use super::backup::OldBackup;
-use super::configs::OrphanedConfig;
+use super::configs::{OrphanedConfig, PackageOwned};
 use super::pacman::{ConfigFile, Info};
 
 /// An Orphaned Package: one Item of the Plan.
@@ -64,6 +64,8 @@ pub struct Plan {
     pub configs_note: Option<String>,
     /// The Backups old enough to delete, oldest first.
     pub backups: Vec<OldBackup>,
+    /// The configs only packages own, which removing them leaves behind.
+    pub package_owned: Vec<PackageOwned>,
 }
 
 impl Plan {

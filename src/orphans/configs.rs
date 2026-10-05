@@ -5,7 +5,7 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
-use super::owners::Owners;
+use super::owners::{Owner, Owners};
 use crate::disk::{self, Mounts};
 use crate::safety::Rules;
 use crate::{date, in_use};
@@ -69,6 +69,23 @@ pub struct OrphanedConfig {
     pub selected: bool,
 }
 
+/// A config only packages own: removing them leaves it behind.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PackageOwned {
+    pub path: PathBuf,
+    /// The path as shown, starting with `~/`.
+    pub label: String,
+    pub packages: Vec<String>,
+}
+
+/// What [`find`] found.
+#[derive(Debug, Default)]
+pub struct Found {
+    /// The Orphaned Configs, High Confidence first and largest first within each.
+    pub orphans: Vec<OrphanedConfig>,
+    pub package_owned: Vec<PackageOwned>,
+}
+
 /// The files and folders directly in the [`ROOTS`] and the dotfiles directly in `home` that the
 /// path rules allow, not following symlinks; also how many the rules left out.
 pub fn candidates(home: &Path, rules: &Rules, mounts: &Mounts) -> (Vec<Candidate>, usize) {
@@ -119,28 +136,43 @@ fn is_loose_dotfile(home: &Path, path: &Path) -> bool {
             .any(|root| root.split('/').next() == Some(name.as_ref()))
 }
 
-/// The `candidates` no Owner accounts for, measured, High Confidence first and largest first
-/// within each.
+/// The `candidates` no Owner accounts for, measured, and those only packages own.
 pub fn find(
     home: &Path,
     candidates: &[Candidate],
     owners: &Owners,
     mounts: &Mounts,
     now: SystemTime,
-) -> Vec<OrphanedConfig> {
-    let mut orphans = Vec::new();
+) -> Found {
+    let mut found = Found::default();
     for candidate in candidates {
         let name = candidate.name();
-        if !owners.of(&candidate.real, &name).is_empty() {
+        let relative = candidate.path.strip_prefix(home).unwrap_or(&candidate.path);
+        let label = format!("~/{}", relative.display());
+        let of = owners.of(&candidate.real, &name);
+        if !of.is_empty() {
+            let packages: Option<Vec<String>> = of
+                .iter()
+                .map(|owner| match owner {
+                    Owner::Package(name) => Some(name.clone()),
+                    _ => None,
+                })
+                .collect();
+            if let Some(packages) = packages {
+                found.package_owned.push(PackageOwned {
+                    path: candidate.path.clone(),
+                    label,
+                    packages,
+                });
+            }
             continue;
         }
         let usage = disk::usage(&candidate.path, mounts);
         let (confidence, reason) =
             confidence(candidate.loose, owners.close_to(&name), usage.newest, now);
-        let relative = candidate.path.strip_prefix(home).unwrap_or(&candidate.path);
-        orphans.push(OrphanedConfig {
+        found.orphans.push(OrphanedConfig {
             path: candidate.path.clone(),
-            label: format!("~/{}", relative.display()),
+            label,
             size: usage.bytes,
             confidence,
             reason,
@@ -148,8 +180,29 @@ pub fn find(
             selected: false,
         });
     }
-    orphans.sort_by_key(|orphan| (orphan.confidence, Reverse(orphan.size)));
-    orphans
+    found
+        .orphans
+        .sort_by_key(|orphan| (orphan.confidence, Reverse(orphan.size)));
+    found
+}
+
+/// Puts first the configs that packages just removed `left` behind (each path with who left
+/// it), as High: their owner is surely gone.
+pub fn mark_left_behind(configs: &mut [OrphanedConfig], left: &[(PathBuf, String)]) {
+    let left_by = |config: &OrphanedConfig| left.iter().find(|(path, _)| *path == config.path);
+    for config in configs.iter_mut() {
+        if let Some((_, packages)) = left_by(config) {
+            config.confidence = Confidence::High;
+            config.reason = format!("left by {packages}");
+        }
+    }
+    configs.sort_by_key(|config| {
+        (
+            left_by(config).is_none(),
+            config.confidence,
+            Reverse(config.size),
+        )
+    });
 }
 
 /// Flags the configs held by a running program; `open` is from [`in_use::open_paths`].
@@ -309,6 +362,15 @@ mod tests {
             &owners::wanted(names.iter().map(String::as_str)),
         );
         let found = find(home.path(), &candidates, &owners, &Mounts::default(), now);
+        assert_eq!(
+            found.package_owned,
+            [PackageOwned {
+                path: home.path().join(".config/htop"),
+                label: "~/.config/htop".into(),
+                packages: vec!["htop".into()],
+            }]
+        );
+        let found = found.orphans;
         let summary: Vec<(String, Confidence, String)> = found
             .iter()
             .map(|o| (o.label.clone(), o.confidence, o.reason.clone()))
@@ -363,6 +425,28 @@ mod tests {
         let mut configs = [config(held.clone()), config(home.dir(".config/free"))];
         mark_in_use(&mut configs, &rules(&home), &[held.join("db.sqlite")]);
         assert!(configs[0].in_use && !configs[1].in_use);
+    }
+
+    #[test]
+    fn what_removed_packages_left_comes_first() {
+        let config = |path: &str, confidence, size| OrphanedConfig {
+            path: path.into(),
+            label: path.into(),
+            size,
+            confidence,
+            reason: "changed today".into(),
+            in_use: false,
+            selected: false,
+        };
+        let mut configs = [
+            config("/h/.config/big", Confidence::High, 100),
+            config("/h/.config/htop", Confidence::Medium, 1),
+        ];
+        mark_left_behind(&mut configs, &[("/h/.config/htop".into(), "htop".into())]);
+        assert_eq!(configs[0].label, "/h/.config/htop");
+        assert_eq!(configs[0].confidence, Confidence::High);
+        assert_eq!(configs[0].reason, "left by htop");
+        assert_eq!(configs[1].reason, "changed today");
     }
 
     #[test]

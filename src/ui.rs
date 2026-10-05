@@ -55,7 +55,12 @@ pub fn draw_outcomes(
     outcomes: &[Outcome],
     scroll: &mut u16,
 ) {
-    let width = usize::from(block.inner(area).width);
+    let lines = outcome_lines(outcomes, usize::from(block.inner(area).width));
+    draw_scrolled(frame, area, block, lines, scroll);
+}
+
+/// The lines of the result screen, `width` wide.
+pub fn outcome_lines(outcomes: &[Outcome], width: usize) -> Vec<Line<'static>> {
     let done = |moved: bool| -> u64 {
         outcomes
             .iter()
@@ -101,7 +106,7 @@ pub fn draw_outcomes(
             lines.push(Line::styled(format!("      ! {err}"), dim));
         }
     }
-    draw_scrolled(frame, area, block, lines, scroll);
+    lines
 }
 
 #[cfg(test)]

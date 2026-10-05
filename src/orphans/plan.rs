@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::configs::OrphanedConfig;
 use super::pacman::{ConfigFile, Info};
 
 /// An Orphaned Package: one Item of the Plan.
@@ -56,6 +57,10 @@ impl Package {
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     pub packages: Vec<Package>,
+    /// The Orphaned Configs, High Confidence first.
+    pub configs: Vec<OrphanedConfig>,
+    /// Shown next to the configs, e.g. how many paths the safety rules left out.
+    pub configs_note: Option<String>,
 }
 
 impl Plan {
@@ -63,7 +68,10 @@ impl Plan {
     /// installed package, says about them.
     pub fn build(installed: &[Info], orphans: &[String]) -> Self {
         let system = System::new(installed);
-        system.plan(&system.chain(orphans))
+        Self {
+            packages: system.plan(&system.chain(orphans)),
+            ..Self::default()
+        }
     }
 
     pub fn size(&self) -> u64 {
@@ -318,7 +326,7 @@ impl<'a> System<'a> {
 
     /// The packages of `chain` that need nothing else removed first, by name, each followed by
     /// the packages that wait for it. A package that waits for several comes after the first.
-    fn plan(&self, chain: &[bool]) -> Plan {
+    fn plan(&self, chain: &[bool]) -> Vec<Package> {
         let name = |p: usize| self.infos[p].name.as_str();
         let mut members: Vec<usize> = (0..chain.len()).filter(|&p| chain[p]).collect();
         members.sort_by_key(|&p| name(p));
@@ -352,7 +360,7 @@ impl<'a> System<'a> {
         let position: HashMap<usize, usize> =
             order.iter().enumerate().map(|(i, &p)| (p, i)).collect();
         let positions = |ids: &[usize]| ids.iter().map(|q| position[q]).collect();
-        let packages = order
+        order
             .iter()
             .map(|&p| Package {
                 nested: !leads(p),
@@ -378,8 +386,7 @@ impl<'a> System<'a> {
                 needs: positions(self.needs(p)),
                 ..Package::new(name(p), self.infos[p].size)
             })
-            .collect();
-        Plan { packages }
+            .collect()
     }
 }
 

@@ -151,7 +151,10 @@ mod tests {
         ];
         packages[0].selected = true;
         packages[1].selected = true;
-        Plan { packages }
+        Plan {
+            packages,
+            ..Plan::default()
+        }
     }
 
     struct Run {

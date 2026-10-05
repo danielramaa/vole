@@ -1,6 +1,7 @@
 mod app;
 mod clean;
 mod config;
+mod date;
 mod disk;
 mod in_use;
 mod log;

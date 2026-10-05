@@ -102,7 +102,8 @@ impl App {
                     .get_or_insert_with(|| clean::Screen::new(&self.config));
             }
             Some(Module::Orphans) => {
-                self.orphans.get_or_insert_with(orphans::Screen::new);
+                self.orphans
+                    .get_or_insert_with(|| orphans::Screen::new(&self.config));
             }
             Some(Module::Analyze | Module::Status) | None => {}
         }
@@ -313,6 +314,7 @@ mod tests {
         let mut app = App::new(Some(Module::Orphans), Config::default());
         app.orphans = Some(orphans::Screen::with_plan(orphans::plan::Plan {
             packages: vec![package],
+            ..Default::default()
         }));
         assert!(footer(&mut app).contains("q quit"));
         press(&mut app, KeyCode::Enter);
@@ -330,6 +332,7 @@ mod tests {
         let mut app = App::new(Some(Module::Orphans), Config::default());
         app.orphans = Some(orphans::Screen::with_plan(orphans::plan::Plan {
             packages: vec![package],
+            ..Default::default()
         }));
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('y'));

@@ -1,15 +1,16 @@
 //! Applying the Plan: removing the selected Items and writing the Operation Log.
 
-use std::fs::{self, Permissions};
+use std::fs;
 use std::io;
 use std::os::unix::ffi::OsStrExt;
-use std::os::unix::fs::{MetadataExt, PermissionsExt};
+use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::plan::{Item, Kind, Plan, RootCommand};
-use super::scan::{Mounts, is_real_dir, trash_parts};
+use super::scan::trash_parts;
+use crate::disk::{self, Mounts, is_real_dir};
 use crate::log::{Log, Outcome};
 use crate::safety::Rules;
 use crate::term::{self, RunRoot};
@@ -120,7 +121,7 @@ fn final_check(path: &Path, rules: &Rules, mounts: &Mounts) -> Result<PathBuf, S
 
 fn remove_regenerable(path: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), String> {
     let real = final_check(path, rules, mounts)?;
-    remove(&real, mounts).map_err(|err| format!("{}: {err}", path.display()))
+    disk::remove_all(&real, mounts).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Removes what is inside the trash, not the trash folder itself.
@@ -213,65 +214,6 @@ fn read_entries(dir: &Path, note: &mut impl FnMut(Result<(), String>)) -> Vec<Pa
     paths
 }
 
-/// Removes `path` (a real path) without following symlinks and without entering other
-/// filesystems or mount points. Read-only folders, like Go's module cache, are made writable.
-/// Anything that disappears meanwhile (a program cleaning its own cache) counts as removed.
-fn remove(path: &Path, mounts: &Mounts) -> io::Result<()> {
-    let meta = match fs::symlink_metadata(path) {
-        Ok(meta) => meta,
-        Err(err) => return gone_is_fine(Err(err)),
-    };
-    // The folder above is the baseline, so an Item that is itself on another filesystem is
-    // caught even without the mount points.
-    let parent = path.parent().unwrap_or(path);
-    let device = fs::symlink_metadata(parent)?.dev();
-    remove_tree(path, &meta, device, mounts)
-}
-
-fn gone_is_fine(result: io::Result<()>) -> io::Result<()> {
-    match result {
-        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
-        result => result,
-    }
-}
-
-fn remove_tree(path: &Path, meta: &fs::Metadata, device: u64, mounts: &Mounts) -> io::Result<()> {
-    if !meta.is_dir() {
-        return gone_is_fine(fs::remove_file(path));
-    }
-    if meta.dev() != device || mounts.contains(path) {
-        return Err(io::Error::other(format!(
-            "{} is a mount point",
-            path.display()
-        )));
-    }
-    let mode = meta.permissions().mode();
-    if mode & 0o700 != 0o700 {
-        gone_is_fine(fs::set_permissions(
-            path,
-            Permissions::from_mode(mode | 0o700),
-        ))?;
-    }
-    let entries = match fs::read_dir(path) {
-        Ok(entries) => entries,
-        Err(err) => return gone_is_fine(Err(err)),
-    };
-    let mut first_error = None;
-    for entry in entries {
-        let result = entry.and_then(|entry| match entry.metadata() {
-            Ok(meta) => remove_tree(&entry.path(), &meta, device, mounts),
-            Err(err) => gone_is_fine(Err(err)),
-        });
-        if let Err(err) = result {
-            first_error.get_or_insert(err);
-        }
-    }
-    match first_error {
-        Some(err) => Err(err),
-        None => gone_is_fine(fs::remove_dir(path)),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -279,6 +221,8 @@ mod tests {
     use crate::clean::scan::ALLOWED_ROOTS;
     use crate::term::Ran;
     use crate::testdir::TestDir;
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
 

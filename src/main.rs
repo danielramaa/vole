@@ -1,6 +1,7 @@
 mod app;
 mod clean;
 mod config;
+mod disk;
 mod in_use;
 mod log;
 mod orphans;

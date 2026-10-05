@@ -20,7 +20,7 @@ use super::{build_plan, refresh_in_use};
 use crate::config::Config;
 use crate::log::{Log, Outcome};
 use crate::safety::Rules;
-use crate::size;
+use crate::{size, ui};
 
 pub struct Screen {
     config: Config,
@@ -259,7 +259,7 @@ impl Screen {
                 State::Confirm {
                     view,
                     in_use,
-                    scroll: scrolled(scroll, key),
+                    scroll: ui::scrolled(scroll, key),
                 },
                 true,
             ),
@@ -270,7 +270,7 @@ impl Screen {
                 (State::NotStarted, true)
             }
             State::Done { outcomes, scroll } => {
-                let next = scrolled(scroll, key);
+                let next = ui::scrolled(scroll, key);
                 (
                     State::Done {
                         outcomes,
@@ -388,29 +388,11 @@ impl Screen {
                 };
                 frame.render_widget(Paragraph::new(text).block(block), area)
             }
-            State::Done { outcomes, scroll } => draw_done(frame, area, block, outcomes, scroll),
+            State::Done { outcomes, scroll } => {
+                ui::draw_outcomes(frame, area, block, outcomes, scroll)
+            }
         }
     }
-}
-
-/// The scroll offset after `key`: j/k and the arrows move one line.
-fn scrolled(scroll: u16, key: KeyEvent) -> u16 {
-    match key.code {
-        KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
-        KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
-        _ => scroll,
-    }
-}
-
-/// Draws `lines` scrolled by `scroll`, which is first kept within the lines that don't fit.
-fn draw_scrolled(frame: &mut Frame, area: Rect, block: Block, lines: Vec<Line>, scroll: &mut u16) {
-    let height = usize::from(block.inner(area).height);
-    let most = u16::try_from(lines.len().saturating_sub(height)).unwrap_or(u16::MAX);
-    *scroll = (*scroll).min(most);
-    frame.render_widget(
-        Paragraph::new(lines).block(block).scroll((*scroll, 0)),
-        area,
-    );
 }
 
 fn draw_confirm(
@@ -456,45 +438,9 @@ fn draw_confirm(
         if item.in_use {
             spans.push(Span::styled("  in use", bold));
         }
-        lines.push(right_aligned(spans, size::format(item.size), width));
+        lines.push(ui::right_aligned(spans, size::format(item.size), width));
     }
-    draw_scrolled(frame, area, block, lines, scroll);
-}
-
-fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome], scroll: &mut u16) {
-    let width = usize::from(block.inner(area).width);
-    let freed: u64 = outcomes
-        .iter()
-        .filter(|o| o.error.is_none())
-        .map(|o| o.size)
-        .sum();
-    let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
-    let mut summary = format!("Freed about {}", size::format(freed));
-    if failed > 0 {
-        summary.push_str(&format!(" · {failed} failed"));
-    }
-    let mut lines = vec![
-        Line::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
-        Line::default(),
-    ];
-    let dim = Style::new().add_modifier(Modifier::DIM);
-    for outcome in outcomes {
-        match &outcome.error {
-            None => lines.push(right_aligned(
-                vec![Span::raw(format!("  ✓ {}", outcome.label))],
-                size::format(outcome.size),
-                width,
-            )),
-            Some(err) => {
-                lines.push(Line::from(format!("  ✗ {}", outcome.label)));
-                lines.push(Line::styled(format!("      {err}"), dim));
-            }
-        }
-        if let Some(err) = &outcome.log_error {
-            lines.push(Line::styled(format!("      ! {err}"), dim));
-        }
-    }
-    draw_scrolled(frame, area, block, lines, scroll);
+    ui::draw_scrolled(frame, area, block, lines, scroll);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -600,7 +546,7 @@ impl PlanView {
                 } else {
                     size::format(category.size())
                 };
-                right_aligned(spans, size, width)
+                ui::right_aligned(spans, size, width)
             }
             Row::Item(c, i) => {
                 let item = &self.plan.categories[c].items[i];
@@ -615,21 +561,10 @@ impl PlanView {
                         Style::new().add_modifier(Modifier::BOLD),
                     ));
                 }
-                right_aligned(spans, size::format(item.size), width)
+                ui::right_aligned(spans, size::format(item.size), width)
             }
         }
     }
-}
-
-/// `spans` on the left, `right` at the right edge of `width`.
-fn right_aligned(mut spans: Vec<Span<'static>>, right: String, width: usize) -> Line<'static> {
-    // Terminal columns, not chars: wide characters take two.
-    let right = Span::raw(right);
-    let used: usize = spans.iter().map(Span::width).sum();
-    let gap = width.saturating_sub(used + right.width()).max(1);
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(right);
-    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -695,12 +630,6 @@ mod tests {
         }
         press(&mut screen, KeyCode::Char(' '));
         assert_eq!(selected_size(&screen), 40);
-    }
-
-    #[test]
-    fn sizes_line_up_with_wide_characters() {
-        let line = right_aligned(vec![Span::raw("~/.cache/日本")], "1 B".into(), 20);
-        assert_eq!(line.width(), 20);
     }
 
     fn is_confirming(screen: &Screen, step: bool) -> bool {

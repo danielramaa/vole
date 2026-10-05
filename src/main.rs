@@ -7,6 +7,7 @@ mod size;
 mod term;
 #[cfg(test)]
 mod testdir;
+mod ui;
 
 use anyhow::{Result, bail};
 use clap::Parser;

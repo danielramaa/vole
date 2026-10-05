@@ -2,6 +2,7 @@
 
 mod configs;
 mod detect;
+mod known;
 mod owners;
 mod pacman;
 pub mod plan;
@@ -68,6 +69,9 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
     let wanted = owners::wanted(names.iter().map(String::as_str));
     let mut owners = Owners::from_pacman(&installed, &files, &wanted);
     owners.add_outside_pacman(&outside);
+    if let Some(path) = known::path() {
+        owners.add_known(known::load(&path, home)?);
+    }
     plan.configs = configs::find(home, &candidates, &owners, &mounts, SystemTime::now());
     configs::mark_in_use(&mut plan.configs, &rules, &open);
     if refused > 0 {

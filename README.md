@@ -7,7 +7,7 @@ vole brings the pacman cache, AUR helper cache, systemd journal, user caches, or
 It's inspired by [Mole](https://github.com/tw93/Mole) on macOS, but built for Arch: it knows about pacman, the AUR and systemd instead of treating Linux as generic.
 
 > [!WARNING]
-> **vole is in early development.** `vole clean` works; the other modules are placeholders. See [Status](#status) for what works today and [ROADMAP.md](ROADMAP.md) for what's next.
+> **vole is in early development.** `vole clean` and the orphaned packages in `vole orphans` work; the rest is still to come. See [Status](#status) for what works today and [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -35,6 +35,10 @@ The alternatives are separate tools (gdu, btop, paccache), scripts without a rea
 | **`orphans`** | Finds **orphaned packages** (including packages that only become orphans once others are removed) and **orphaned configs**: folders in `~/.config`, `~/.local/share`, `~/.local/state`, `~/.cache` and dotfiles in `~` that no installed program owns. |
 | **`analyze`** | An interactive disk explorer, like ncdu or gdu. Covers the whole filesystem on the current disk. You can delete files in your home folder; outside it, vole shows the safe way to free the space. |
 | **`status`** | A real-time dashboard read from `/proc` and `/sys`: CPU per core, memory, disk, network, temperatures, top processes, battery, and a system-health panel (cache sizes, orphans, journal size, pending updates). |
+
+### How orphaned packages are found
+
+vole starts from `pacman -Qdtq`: packages installed as dependencies that nothing installed needs. It adds what removing them with `pacman -Rns` takes along (dependencies nothing else needs), then the packages that only become orphans after that, and shows each under the package that frees it. Selecting a package selects what goes with it, so what you select is exactly what `pacman -Rns` removes; vole checks that with pacman right before removing. Each package also lists its config files, which `-n` deletes even when you changed them.
 
 ### How orphaned configs are detected
 
@@ -90,8 +94,8 @@ Only validated numbers from your config reach those commands, never free text, s
 | **M0**: project setup, TUI skeleton, config, CI | ✅ Done ([#1](https://github.com/danielramaa/vole/issues/1)) |
 | **M1**: `clean` shows the Plan | ✅ Done ([#2](https://github.com/danielramaa/vole/issues/2)) |
 | **M2**: `clean` removes selected items | ✅ Done ([#3](https://github.com/danielramaa/vole/issues/3)) |
-| **M3**: `orphans`, packages | ⏳ Next ([#4](https://github.com/danielramaa/vole/issues/4)) |
-| **M4**: `orphans`, configs and backups | [#5](https://github.com/danielramaa/vole/issues/5) |
+| **M3**: `orphans`, packages | ✅ Done ([#4](https://github.com/danielramaa/vole/issues/4)) |
+| **M4**: `orphans`, configs and backups | ⏳ Next ([#5](https://github.com/danielramaa/vole/issues/5)) |
 | **M5**: `analyze` | [#6](https://github.com/danielramaa/vole/issues/6) |
 | **M6**: `status` | [#7](https://github.com/danielramaa/vole/issues/7) |
 | **M7**: AUR release | [#8](https://github.com/danielramaa/vole/issues/8) |
@@ -136,6 +140,14 @@ In `clean`:
 | `Space` | Select or deselect the Item (on a Category, the whole Category) |
 | `a` | Select or deselect every Item in the current Category |
 | `Enter` | Review the selection, then `y` to remove it or `n` to go back. If an Item is in use by a running program, removing it takes `Y` (shift+y) on a second screen. While removing, `Esc` stops after the current Item. |
+
+In `orphans`:
+
+| Key | Action |
+|---|---|
+| `Space` | Select or deselect the package (on the heading, all of them), together with the packages that go or stay with it |
+| `a` | Select or deselect every package |
+| `Enter` | Review the selection, then `y` to remove it with `sudo pacman -Rns` (pacman lists the packages again and asks once more) or `n` to go back |
 
 ## Configuration
 

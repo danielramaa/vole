@@ -8,9 +8,10 @@ use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::build_plan;
+use super::pacman::{Backup, BackupState};
 use super::plan::Plan;
 use crate::{size, ui};
 
@@ -153,9 +154,9 @@ impl PlanView {
 
         // Room for the highlight symbol.
         let width = usize::from(list_area.width).saturating_sub(2);
-        let mut lines = vec![self.heading(width)];
-        lines.extend((0..self.plan.packages.len()).map(|i| self.line(i, width)));
-        let list = List::new(lines)
+        let mut items = vec![ListItem::new(self.heading(width))];
+        items.extend((0..self.plan.packages.len()).map(|i| self.item(i, width)));
+        let list = List::new(items)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
             .highlight_symbol("> ");
         frame.render_stateful_widget(list, list_area, &mut self.list);
@@ -186,7 +187,8 @@ impl PlanView {
         ui::right_aligned(spans, size::format(self.plan.size()), width)
     }
 
-    fn line(&self, index: usize, width: usize) -> Line<'static> {
+    /// A package's row, with its config files below.
+    fn item(&self, index: usize, width: usize) -> ListItem<'static> {
         let dim = Style::new().add_modifier(Modifier::DIM);
         let package = &self.plan.packages[index];
         let check = if package.selected { "[x]" } else { "[ ]" };
@@ -212,8 +214,34 @@ impl PlanView {
                 dim,
             ));
         }
-        ui::right_aligned(spans, size::format(package.size), width)
+        let mut lines = vec![ui::right_aligned(spans, size::format(package.size), width)];
+        // Under the name.
+        lines.extend(backup_lines(&package.backup, indent.len() + 6));
+        ListItem::new(lines)
     }
+}
+
+/// A package's config files, one per line, `indent` columns in, marking the changed ones.
+fn backup_lines(backup: &[Backup], indent: usize) -> Vec<Line<'static>> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    backup
+        .iter()
+        .map(|file| {
+            let mut spans = vec![Span::styled(
+                format!("{}{}", " ".repeat(indent), file.path),
+                dim,
+            )];
+            match file.state {
+                BackupState::Modified => spans.push(Span::styled(
+                    "  modified",
+                    Style::new().add_modifier(Modifier::BOLD),
+                )),
+                BackupState::Unreadable => spans.push(Span::styled("  unreadable", dim)),
+                BackupState::Unmodified => {}
+            }
+            Line::from(spans)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -262,6 +290,35 @@ mod tests {
         }
         press(&mut screen, KeyCode::Char(' '));
         assert_eq!(selected_size(&screen), 20);
+    }
+
+    /// The screen's rows as text.
+    fn render(screen: &mut Screen, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    #[test]
+    fn shows_config_files_under_their_package() {
+        let mut cups = Package::new("cups", 10);
+        cups.backup = vec![Backup {
+            path: "/etc/cups/cupsd.conf".into(),
+            state: BackupState::Modified,
+        }];
+        let mut screen = Screen::with_plan(Plan {
+            packages: vec![cups, Package::new("zstd", 1)],
+        });
+        let rows = render(&mut screen, 60, 8);
+        assert!(rows[2].contains("  [ ] cups"), "{rows:#?}");
+        assert!(rows[3].contains("        /etc/cups/cupsd.conf  modified"));
+        assert!(rows[4].contains("  [ ] zstd"));
     }
 
     #[test]

@@ -205,12 +205,140 @@ fn record(log: &mut Log, package: &Package, target: &str, result: Result<(), Str
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orphans::configs::Confidence;
     use crate::term::Ran;
     use crate::testdir::TestDir;
-    use std::fs;
     use std::os::unix::process::ExitStatusExt;
-    use std::path::PathBuf;
     use std::process::{Command, ExitStatus};
+
+    struct Home {
+        dir: TestDir,
+        rules: Rules,
+        log: PathBuf,
+    }
+
+    fn home() -> Home {
+        let dir = TestDir::new();
+        let rules = Rules::new(dir.path(), configs::ROOTS, &[])
+            .unwrap()
+            .with_loose_dotfiles();
+        Home {
+            log: dir.path().join("log.jsonl"),
+            dir,
+            rules,
+        }
+    }
+
+    /// Selects each of `paths` as an Orphaned Config and moves them.
+    fn move_all(home: &Home, paths: Vec<PathBuf>, mounts: &Mounts) -> Vec<Outcome> {
+        let configs = paths
+            .into_iter()
+            .map(|path| OrphanedConfig {
+                label: path.display().to_string(),
+                size: 10,
+                confidence: Confidence::High,
+                reason: String::new(),
+                in_use: false,
+                selected: true,
+                path,
+            })
+            .collect();
+        let plan = Plan {
+            configs,
+            ..Plan::default()
+        };
+        let mut log = Log::open(&home.log, "orphans").unwrap();
+        move_configs(
+            &plan,
+            home.dir.path(),
+            &home.rules,
+            mounts,
+            &mut log,
+            SystemTime::now(),
+        )
+    }
+
+    fn backups(home: &Home) -> Vec<PathBuf> {
+        let mut found: Vec<PathBuf> = fs::read_dir(home.dir.path().join(BACKUPS))
+            .into_iter()
+            .flatten()
+            .map(|entry| entry.unwrap().path())
+            .collect();
+        found.sort();
+        found
+    }
+
+    fn log_lines(path: &Path) -> Vec<serde_json::Value> {
+        fs::read_to_string(path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect()
+    }
+
+    #[test]
+    fn moves_configs_into_one_backup_and_logs_where() {
+        let home = home();
+        let gone = home.dir.dir(".config/gone");
+        home.dir.file(".config/gone/settings", 10);
+        let rc = home.dir.file(".gonerc", 10);
+        let outcomes = move_all(&home, vec![gone.clone(), rc.clone()], &Mounts::default());
+        assert!(
+            outcomes.iter().all(|o| o.error.is_none() && o.moved),
+            "{outcomes:?}"
+        );
+        assert!(!gone.exists() && !rc.exists());
+        let backups = backups(&home);
+        assert_eq!(backups.len(), 1);
+        assert!(backups[0].join(".config/gone/settings").exists());
+        assert!(backups[0].join(".gonerc").exists());
+        let log = log_lines(&home.log);
+        assert_eq!(log.len(), 2);
+        assert_eq!(log[0]["kind"], "orphaned config");
+        assert_eq!(log[0]["target"], gone.display().to_string());
+        assert_eq!(
+            log[0]["moved_to"],
+            backups[0].join(".config/gone").display().to_string()
+        );
+    }
+
+    #[test]
+    fn refuses_what_is_not_a_config_to_move() {
+        let home = home();
+        let old_backup = home.dir.dir(".local/share/vole/backups/old");
+        let mounted = home.dir.dir(".config/mounted");
+        let refused = vec![
+            // Not directly in a root.
+            home.dir.dir(".config/app/deep"),
+            // Outside the roots.
+            home.dir.dir("Documents"),
+            // Sealed.
+            home.dir.dir(".ssh"),
+            // Holds the Backups.
+            home.dir.path().join(".local/share/vole"),
+            home.dir
+                .symlink(".config/linked", &home.dir.dir("elsewhere")),
+            mounted.clone(),
+        ];
+        let outcomes = move_all(&home, refused.clone(), &Mounts::from_paths([mounted]));
+        for (outcome, path) in outcomes.iter().zip(&refused) {
+            let error = outcome.error.as_deref().unwrap_or_default();
+            assert!(error.starts_with("refused"), "{}: {error}", path.display());
+            assert!(fs::symlink_metadata(path).is_ok());
+        }
+        // No Backup was made for nothing.
+        assert_eq!(backups(&home), [old_backup]);
+    }
+
+    #[test]
+    fn a_config_already_gone_counts_as_removed() {
+        let home = home();
+        home.dir.dir(".config");
+        let gone = home.dir.path().join(".config/gone");
+        let outcomes = move_all(&home, vec![gone], &Mounts::default());
+        assert!(outcomes[0].error.is_none() && !outcomes[0].moved);
+        assert!(backups(&home).is_empty());
+    }
 
     struct Fake {
         would_remove: Result<BTreeSet<String>, String>,
@@ -259,11 +387,7 @@ mod tests {
         }
 
         fn log(&self) -> Vec<serde_json::Value> {
-            fs::read_to_string(Self::log_path(&self.dir))
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str(line).unwrap())
-                .collect()
+            log_lines(&Self::log_path(&self.dir))
         }
 
         fn errors(&self) -> Vec<Option<&str>> {

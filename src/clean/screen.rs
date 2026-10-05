@@ -17,6 +17,7 @@ use super::plan::{Item, Plan};
 use super::remove;
 use super::scan::{ALLOWED_ROOTS, Mounts};
 use super::{build_plan, refresh_in_use};
+use crate::app::ModuleScreen;
 use crate::config::Config;
 use crate::log::{Log, Outcome};
 use crate::safety::Rules;
@@ -102,8 +103,55 @@ impl Screen {
         matches!(self.state, State::Ready(_))
     }
 
+    /// Removes the home Items on a worker thread, so the screen keeps drawing.
+    fn start_removal(plan: Plan, rules: Rules, mounts: Mounts, mut log: Log) -> State {
+        let (sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_plan = plan.clone();
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut progress = |done: usize, total: usize, label: &str| {
+                let _ = sender.send(Progress::Item(format!("{label} ({} of {total})", done + 1)));
+            };
+            let outcomes = remove::remove_home(
+                &worker_plan,
+                &rules,
+                &mounts,
+                &mut log,
+                &mut progress,
+                &worker_stop,
+            );
+            let _ = sender.send(Progress::Finished(outcomes, log));
+        });
+        State::RemovingHome {
+            plan,
+            receiver,
+            stop,
+            now: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_removing(&self) -> bool {
+        matches!(self.state, State::Removing(_))
+    }
+
+    /// Fresh path rules and mount points, and the Operation Log. Nothing is removed without all
+    /// three: bind mounts can only be told apart through the mount points.
+    fn prepare(&self) -> Result<(Rules, Mounts, Log), String> {
+        let home = dirs::home_dir().ok_or("the home directory could not be found")?;
+        let rules = Rules::new(&home, ALLOWED_ROOTS, &self.config.protected_paths(&home))
+            .map_err(|err| format!("resolving {}: {err}", home.display()))?;
+        let mounts = Mounts::load()
+            .map_err(|err| format!("reading the mount points from /proc/self/mountinfo: {err}"))?;
+        let log = Log::open_default("clean")?;
+        Ok((rules, mounts, log))
+    }
+}
+
+impl ModuleScreen for Screen {
     /// Moves background work along: starts the scan or the removal, and picks up their results.
-    pub fn tick(&mut self) {
+    fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
             State::NotStarted => State::Scanning(Self::start(self.config.clone())),
@@ -170,36 +218,8 @@ impl Screen {
         };
     }
 
-    /// Removes the home Items on a worker thread, so the screen keeps drawing.
-    fn start_removal(plan: Plan, rules: Rules, mounts: Mounts, mut log: Log) -> State {
-        let (sender, receiver) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_plan = plan.clone();
-        let worker_stop = Arc::clone(&stop);
-        thread::spawn(move || {
-            let mut progress = |done: usize, total: usize, label: &str| {
-                let _ = sender.send(Progress::Item(format!("{label} ({} of {total})", done + 1)));
-            };
-            let outcomes = remove::remove_home(
-                &worker_plan,
-                &rules,
-                &mounts,
-                &mut log,
-                &mut progress,
-                &worker_stop,
-            );
-            let _ = sender.send(Progress::Finished(outcomes, log));
-        });
-        State::RemovingHome {
-            plan,
-            receiver,
-            stop,
-            now: String::new(),
-        }
-    }
-
     /// Returns whether the key was used.
-    pub fn on_key(&mut self, key: KeyEvent) -> bool {
+    fn on_key(&mut self, key: KeyEvent) -> bool {
         let back = matches!(
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
@@ -286,7 +306,7 @@ impl Screen {
         used
     }
 
-    pub fn hint(&self) -> &'static str {
+    fn hint(&self) -> &'static str {
         match &self.state {
             State::Ready(_) => "↑↓/jk move · space select · a select category · enter remove…",
             State::Confirm { in_use: false, .. } => "↑↓ scroll · y remove · n back",
@@ -302,7 +322,7 @@ impl Screen {
     }
 
     /// Whether q leaves `clean` here; while confirming or removing, it doesn't.
-    pub fn can_leave(&self) -> bool {
+    fn can_leave(&self) -> bool {
         match self.state {
             State::NotStarted
             | State::Scanning(_)
@@ -316,19 +336,14 @@ impl Screen {
         }
     }
 
-    #[cfg(test)]
-    pub fn is_removing(&self) -> bool {
-        matches!(self.state, State::Removing(_))
-    }
-
     /// Whether the root commands are waiting for [`Screen::run_root`].
-    pub fn needs_terminal(&self) -> bool {
+    fn needs_terminal(&self) -> bool {
         matches!(self.state, State::RootPending { .. })
     }
 
     /// Runs the confirmed root commands; `run_root` runs them with the TUI paused. Fails when
     /// the TUI couldn't be brought back afterwards; the result is logged either way.
-    pub fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
+    fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let State::RootPending {
             plan,
@@ -348,19 +363,7 @@ impl Screen {
         terminal
     }
 
-    /// Fresh path rules and mount points, and the Operation Log. Nothing is removed without all
-    /// three: bind mounts can only be told apart through the mount points.
-    fn prepare(&self) -> Result<(Rules, Mounts, Log), String> {
-        let home = dirs::home_dir().ok_or("the home directory could not be found")?;
-        let rules = Rules::new(&home, ALLOWED_ROOTS, &self.config.protected_paths(&home))
-            .map_err(|err| format!("resolving {}: {err}", home.display()))?;
-        let mounts = Mounts::load()
-            .map_err(|err| format!("reading the mount points from /proc/self/mountinfo: {err}"))?;
-        let log = Log::open_default("clean")?;
-        Ok((rules, mounts, log))
-    }
-
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered().title(" clean ");
         match &mut self.state {
             State::NotStarted | State::Scanning(_) => frame.render_widget(

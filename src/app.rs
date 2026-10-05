@@ -1,3 +1,4 @@
+use std::io;
 use std::time::Duration;
 
 use anyhow::Result;
@@ -5,13 +6,14 @@ use clap::ValueEnum;
 use ratatui::DefaultTerminal;
 use ratatui::Frame;
 use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
 use crate::config::Config;
-use crate::{clean, orphans, term};
+use crate::term::{self, RunRoot};
+use crate::{clean, orphans};
 
 /// The modules of vole. The doc comments are used both for `--help` and for the menu.
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
@@ -42,6 +44,23 @@ impl Module {
             .and_then(|v| v.get_help().map(ToString::to_string))
             .unwrap_or_default()
     }
+}
+
+/// What the App needs from the screen of a module.
+pub trait ModuleScreen {
+    /// Moves background work along; called before each frame.
+    fn tick(&mut self);
+    /// Handles a key, returning whether it was used.
+    fn on_key(&mut self, key: KeyEvent) -> bool;
+    fn draw(&mut self, frame: &mut Frame, area: Rect);
+    /// The module's keys, for the footer.
+    fn hint(&self) -> &'static str;
+    /// Whether the keys that leave a module (q, Esc, h, ←) leave it now.
+    fn can_leave(&self) -> bool;
+    /// Whether root commands wait for [`ModuleScreen::run_root`].
+    fn needs_terminal(&self) -> bool;
+    /// Runs the waiting root commands; `run_root` runs them with the TUI paused.
+    fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()>;
 }
 
 pub struct App {
@@ -78,36 +97,41 @@ impl App {
     fn open(&mut self, module: Option<Module>) {
         self.module = module;
         match module {
-            Some(Module::Clean) if self.clean.is_none() => {
-                self.clean = Some(clean::Screen::new(&self.config));
+            Some(Module::Clean) => {
+                self.clean
+                    .get_or_insert_with(|| clean::Screen::new(&self.config));
             }
-            Some(Module::Orphans) if self.orphans.is_none() => {
-                self.orphans = Some(orphans::Screen::new());
+            Some(Module::Orphans) => {
+                self.orphans.get_or_insert_with(orphans::Screen::new);
             }
-            _ => {}
+            Some(Module::Analyze | Module::Status) | None => {}
+        }
+    }
+
+    /// The screen of `module`, once it has been opened.
+    fn screen(&mut self, module: Module) -> Option<&mut dyn ModuleScreen> {
+        match module {
+            Module::Clean => self.clean.as_mut().map(|s| s as &mut dyn ModuleScreen),
+            Module::Orphans => self.orphans.as_mut().map(|s| s as &mut dyn ModuleScreen),
+            Module::Analyze | Module::Status => None,
         }
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
-            if let Some(clean) = &mut self.clean {
-                clean.tick();
-            }
-            if let Some(orphans) = &mut self.orphans {
-                orphans.tick();
+            for &module in Module::all() {
+                if let Some(screen) = self.screen(module) {
+                    screen.tick();
+                }
             }
             terminal.draw(|frame| self.draw(frame))?;
-            // Root commands need the terminal, which only the App has.
-            if let Some(clean) = &mut self.clean
-                && clean.needs_terminal()
+            // Root commands need the terminal, which only the App has. Only the module on
+            // screen can be waiting for it: no module lets you leave while it confirms or
+            // removes.
+            if let Some(screen) = self.module.and_then(|module| self.screen(module))
+                && screen.needs_terminal()
             {
-                clean.run_root(&mut |commands| term::run_external(terminal, commands))?;
-                continue;
-            }
-            if let Some(orphans) = &mut self.orphans
-                && orphans.needs_terminal()
-            {
-                orphans.run_root(&mut |commands| term::run_external(terminal, commands))?;
+                screen.run_root(&mut |commands| term::run_external(terminal, commands))?;
                 continue;
             }
             // Wake up now and then, so background work (the scans) shows up.
@@ -130,8 +154,12 @@ impl App {
             None => self.on_menu_key(key),
             Some(module) => {
                 // The module gets the key first, so it can use h/l, Esc, etc. for its own
-                // navigation; only unhandled keys leave the module.
-                if !self.on_module_key(module, key) {
+                // navigation; only keys it doesn't use leave it, and only where it allows.
+                let (used, can_leave) = match self.screen(module) {
+                    Some(screen) => (screen.on_key(key), screen.can_leave()),
+                    None => (false, true),
+                };
+                if !used && can_leave {
                     self.on_leave_key(key);
                 }
             }
@@ -149,18 +177,6 @@ impl App {
                 self.open(Some(modules[index]));
             }
             _ => {}
-        }
-    }
-
-    /// Keys handled inside a module. Returns whether the key was used.
-    fn on_module_key(&mut self, module: Module, key: KeyEvent) -> bool {
-        match module {
-            Module::Clean => self.clean.as_mut().is_some_and(|clean| clean.on_key(key)),
-            Module::Orphans => self
-                .orphans
-                .as_mut()
-                .is_some_and(|orphans| orphans.on_key(key)),
-            Module::Analyze | Module::Status => false,
         }
     }
 
@@ -197,18 +213,13 @@ impl App {
                 let mut hints = Vec::new();
                 // Whether q leaves the module here, or the module uses it (e.g. to go back).
                 let mut can_leave = true;
-                match (module, &mut self.clean, &mut self.orphans) {
-                    (Module::Clean, Some(clean), _) => {
-                        clean.draw(frame, body);
-                        hints.push(clean.hint());
-                        can_leave = clean.can_leave();
+                match self.screen(module) {
+                    Some(screen) => {
+                        screen.draw(frame, body);
+                        hints.push(screen.hint());
+                        can_leave = screen.can_leave();
                     }
-                    (Module::Orphans, _, Some(orphans)) => {
-                        orphans.draw(frame, body);
-                        hints.push(orphans.hint());
-                        can_leave = orphans.can_leave();
-                    }
-                    _ => frame.render_widget(
+                    None => frame.render_widget(
                         Paragraph::new(format!("{}\n\nComing soon.", module.description()))
                             .block(Block::bordered().title(format!(" {} ", module.name()))),
                         body,
@@ -310,6 +321,23 @@ mod tests {
         press(&mut app, KeyCode::Char('q'));
         assert!(!app.quit);
         assert!(app.orphans.as_ref().is_some_and(orphans::Screen::has_plan));
+    }
+
+    #[test]
+    fn nothing_leaves_orphans_while_removing() {
+        let mut package = orphans::plan::Package::new("a", 1);
+        package.selected = true;
+        let mut app = App::new(Some(Module::Orphans), Config::default());
+        app.orphans = Some(orphans::Screen::with_plan(orphans::plan::Plan {
+            packages: vec![package],
+        }));
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('y'));
+        for code in [KeyCode::Char('q'), KeyCode::Esc, KeyCode::Left] {
+            press(&mut app, code);
+            assert!(!app.quit, "{code:?}");
+        }
+        assert!(!footer(&mut app).contains("q quit"));
     }
 
     #[test]

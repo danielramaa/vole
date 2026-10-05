@@ -16,6 +16,7 @@ use super::build_plan;
 use super::pacman::{Backup, BackupState};
 use super::plan::{Package, Plan};
 use super::remove;
+use crate::app::ModuleScreen;
 use crate::log::{Log, Outcome};
 use crate::term::RunRoot;
 use crate::{size, ui};
@@ -72,9 +73,11 @@ impl Screen {
     pub fn has_plan(&self) -> bool {
         matches!(self.state, State::Ready(_))
     }
+}
 
+impl ModuleScreen for Screen {
     /// Moves background work along: starts the scan and picks up its result.
-    pub fn tick(&mut self) {
+    fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
             State::NotStarted => State::Scanning(Self::start()),
@@ -93,7 +96,7 @@ impl Screen {
     }
 
     /// Returns whether the key was used.
-    pub fn on_key(&mut self, key: KeyEvent) -> bool {
+    fn on_key(&mut self, key: KeyEvent) -> bool {
         let back = matches!(
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
@@ -142,7 +145,7 @@ impl Screen {
         used
     }
 
-    pub fn hint(&self) -> &'static str {
+    fn hint(&self) -> &'static str {
         match self.state {
             State::Ready(_) => "↑↓/jk move · space select · a select all · enter remove…",
             State::Confirm { .. } => "↑↓ scroll · y remove · n back",
@@ -153,7 +156,7 @@ impl Screen {
     }
 
     /// Whether q leaves `orphans` here; while confirming or removing, it doesn't.
-    pub fn can_leave(&self) -> bool {
+    fn can_leave(&self) -> bool {
         match self.state {
             State::NotStarted
             | State::Scanning(_)
@@ -165,13 +168,13 @@ impl Screen {
     }
 
     /// Whether `sudo pacman -Rns` is waiting for [`Screen::run_root`].
-    pub fn needs_terminal(&self) -> bool {
+    fn needs_terminal(&self) -> bool {
         matches!(self.state, State::RootPending(_))
     }
 
     /// Removes the confirmed packages; `run_root` runs `sudo pacman -Rns` with the TUI paused.
     /// Fails when the TUI couldn't be brought back afterwards; the result is logged either way.
-    pub fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
+    fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let State::RootPending(plan) = state else {
             self.state = state;
@@ -193,7 +196,7 @@ impl Screen {
         terminal
     }
 
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered().title(" orphans ");
         match &mut self.state {
             State::NotStarted | State::Scanning(_) => frame.render_widget(

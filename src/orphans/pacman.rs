@@ -51,9 +51,13 @@ pub fn orphans() -> Result<Vec<String>> {
 }
 
 fn orphan_names(output: &Output) -> Result<Vec<String>> {
-    // pacman exits with 1, saying nothing, when no package matches.
-    let none =
-        output.status.code() == Some(1) && output.stdout.is_empty() && output.stderr.is_empty();
+    // pacman exits with 1 and lists nothing when no package matches. It may still print
+    // warnings, e.g. about an option in pacman.conf it doesn't know.
+    let none = output.status.code() == Some(1)
+        && output.stdout.is_empty()
+        && errors(&String::from_utf8_lossy(&output.stderr))
+            .next()
+            .is_none();
     if none {
         return Ok(Vec::new());
     }
@@ -135,7 +139,8 @@ fn check(output: &Output) -> Result<()> {
 }
 
 /// pacman's error message on one row. When pacman explains the error in `::` lines (printed to
-/// stdout, e.g. which package depends on one being removed), those, since they say more.
+/// stdout, e.g. which package depends on one being removed), those, since they say more; else
+/// its errors, without the warnings printed alongside.
 fn message(output: &Output) -> String {
     let stdout = String::from_utf8_lossy(&output.stdout);
     let explained: Vec<&str> = stdout
@@ -143,13 +148,13 @@ fn message(output: &Output) -> String {
         .filter_map(|line| line.strip_prefix("::"))
         .collect();
     let stderr = String::from_utf8_lossy(&output.stderr);
-    let lines: Vec<&str> = if explained.is_empty() {
-        stderr
-            .lines()
-            .map(|line| line.trim_start_matches("error: "))
-            .collect()
-    } else {
+    let errors: Vec<&str> = errors(&stderr).collect();
+    let lines = if !explained.is_empty() {
         explained
+    } else if !errors.is_empty() {
+        errors
+    } else {
+        stderr.lines().collect()
     };
     lines
         .iter()
@@ -157,6 +162,13 @@ fn message(output: &Output) -> String {
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
         .join("; ")
+}
+
+/// pacman's errors, one per line, without the `error: ` in front.
+fn errors(stderr: &str) -> impl Iterator<Item = &str> {
+    stderr
+        .lines()
+        .filter_map(|line| line.strip_prefix("error: "))
 }
 
 /// Reads `pacman -Qi` output: a block of `Field : value` lines per package. A value pacman
@@ -315,6 +327,15 @@ Backup Files    : None
         assert!(orphan_names(&output(1, "", "")).unwrap().is_empty());
         assert_eq!(orphan_names(&output(0, "a\nb\n", "")).unwrap(), ["a", "b"]);
         assert!(orphan_names(&output(1, "", "error: could not open database")).is_err());
+        // An option pacman doesn't know in pacman.conf only gets a warning.
+        let warning = "warning: config file /etc/pacman.conf, line 107: \
+                       directive 'Foo' in section 'options' not recognized.\n";
+        assert!(orphan_names(&output(1, "", warning)).unwrap().is_empty());
+        let failed = output(1, "", &format!("{warning}error: could not open database\n"));
+        assert_eq!(
+            orphan_names(&failed).unwrap_err().to_string(),
+            "pacman: could not open database"
+        );
     }
 
     #[test]

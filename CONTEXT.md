@@ -55,7 +55,7 @@ _Avoid_: History, audit trail
 ### Ownership
 
 **Owner**:
-Something installed that accounts for a config or data folder: a pacman package, a Flatpak, a user-installed binary, or an entry in the Known Owners map.
+Something installed that accounts for a config or data folder: a pacman package, a Flatpak, an AppImage, a user-installed binary or desktop entry, or an entry in the Known Owners map.
 _Avoid_: Parent, source app
 
 **Known Owners**:

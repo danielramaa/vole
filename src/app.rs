@@ -10,9 +10,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
-use crate::clean;
 use crate::config::Config;
-use crate::term;
+use crate::{clean, orphans, term};
 
 /// The modules of vole. The doc comments are used both for `--help` and for the menu.
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
@@ -55,6 +54,8 @@ pub struct App {
     /// The `clean` screen once `clean` has been opened. It is kept when leaving, so opening
     /// `clean` again shows the same Plan instead of starting another scan.
     clean: Option<clean::Screen>,
+    /// The `orphans` screen once `orphans` has been opened, kept like `clean`'s.
+    orphans: Option<orphans::Screen>,
     quit: bool,
 }
 
@@ -66,6 +67,7 @@ impl App {
             menu: ListState::default().with_selected(Some(0)),
             config,
             clean: None,
+            orphans: None,
             quit: false,
         };
         app.open(module);
@@ -75,8 +77,14 @@ impl App {
     /// Opens `module`, or the menu for `None`.
     fn open(&mut self, module: Option<Module>) {
         self.module = module;
-        if module == Some(Module::Clean) && self.clean.is_none() {
-            self.clean = Some(clean::Screen::new(&self.config));
+        match module {
+            Some(Module::Clean) if self.clean.is_none() => {
+                self.clean = Some(clean::Screen::new(&self.config));
+            }
+            Some(Module::Orphans) if self.orphans.is_none() => {
+                self.orphans = Some(orphans::Screen::new());
+            }
+            _ => {}
         }
     }
 
@@ -84,6 +92,9 @@ impl App {
         while !self.quit {
             if let Some(clean) = &mut self.clean {
                 clean.tick();
+            }
+            if let Some(orphans) = &mut self.orphans {
+                orphans.tick();
             }
             terminal.draw(|frame| self.draw(frame))?;
             // Root commands need the terminal, which only the App has.
@@ -93,7 +104,7 @@ impl App {
                 clean.run_root(&mut |commands| term::run_external(terminal, commands))?;
                 continue;
             }
-            // Wake up now and then, so background work (the clean scan) shows up.
+            // Wake up now and then, so background work (the scans) shows up.
             if event::poll(Duration::from_millis(100))?
                 && let Event::Key(key) = event::read()?
                 && key.kind == KeyEventKind::Press
@@ -139,7 +150,11 @@ impl App {
     fn on_module_key(&mut self, module: Module, key: KeyEvent) -> bool {
         match module {
             Module::Clean => self.clean.as_mut().is_some_and(|clean| clean.on_key(key)),
-            Module::Orphans | Module::Analyze | Module::Status => false,
+            Module::Orphans => self
+                .orphans
+                .as_mut()
+                .is_some_and(|orphans| orphans.on_key(key)),
+            Module::Analyze | Module::Status => false,
         }
     }
 
@@ -176,11 +191,16 @@ impl App {
                 let mut hints = Vec::new();
                 // Whether q leaves the module here, or the module uses it (e.g. to go back).
                 let mut can_leave = true;
-                match (module, &mut self.clean) {
-                    (Module::Clean, Some(clean)) => {
+                match (module, &mut self.clean, &mut self.orphans) {
+                    (Module::Clean, Some(clean), _) => {
                         clean.draw(frame, body);
                         hints.push(clean.hint());
                         can_leave = clean.can_leave();
+                    }
+                    (Module::Orphans, _, Some(orphans)) => {
+                        orphans.draw(frame, body);
+                        hints.push(orphans.hint());
+                        can_leave = orphans.can_leave();
                     }
                     _ => frame.render_widget(
                         Paragraph::new(format!("{}\n\nComing soon.", module.description()))

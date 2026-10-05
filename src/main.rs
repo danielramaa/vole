@@ -2,6 +2,7 @@ mod app;
 mod clean;
 mod config;
 mod log;
+mod orphans;
 mod safety;
 mod size;
 mod term;

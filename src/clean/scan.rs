@@ -1,14 +1,10 @@
 //! The Categories inside the home directory, measured by walking the disk.
 
-use std::collections::{HashMap, HashSet};
-use std::ffi::OsString;
-use std::fs::{self, Metadata};
-use std::io;
-use std::os::unix::ffi::OsStringExt;
-use std::os::unix::fs::MetadataExt;
+use std::fs;
 use std::path::{Path, PathBuf};
 
 use super::plan::{Category, Item, Kind};
+use crate::disk::{Mounts, disk_usage, disk_usage_all, is_real_dir};
 use crate::safety::Rules;
 
 /// Where `clean` may propose Items on its own (relative to the home directory).
@@ -208,125 +204,11 @@ pub fn trash_parts(trash: &Path, rules: &Rules) -> Vec<PathBuf> {
         .collect()
 }
 
-pub(super) fn is_real_dir(path: &Path) -> bool {
-    fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
-}
-
-/// Every mount point, bind mounts included, from `/proc/self/mountinfo`.
-#[derive(Default)]
-pub struct Mounts(HashSet<PathBuf>);
-
-impl Mounts {
-    pub fn load() -> io::Result<Self> {
-        fs::read_to_string("/proc/self/mountinfo").map(|text| Self::parse(&text))
-    }
-
-    fn parse(mountinfo: &str) -> Self {
-        Self(
-            mountinfo
-                .lines()
-                .filter_map(|line| line.split(' ').nth(4))
-                .map(unescape_octal)
-                .collect(),
-        )
-    }
-
-    pub fn contains(&self, path: &Path) -> bool {
-        self.0.contains(path)
-    }
-
-    #[cfg(test)]
-    pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        Self(paths.into_iter().collect())
-    }
-}
-
-/// Decodes the `\040`-style escapes mountinfo uses for spaces and other special bytes.
-fn unescape_octal(field: &str) -> PathBuf {
-    let bytes = field.as_bytes();
-    let mut out = Vec::with_capacity(bytes.len());
-    let mut i = 0;
-    while i < bytes.len() {
-        let code = bytes.get(i + 1..i + 4).and_then(|digits| {
-            let digits = std::str::from_utf8(digits).ok()?;
-            u8::from_str_radix(digits, 8).ok()
-        });
-        match code {
-            Some(code) if bytes[i] == b'\\' => {
-                out.push(code);
-                i += 4;
-            }
-            _ => {
-                out.push(bytes[i]);
-                i += 1;
-            }
-        }
-    }
-    PathBuf::from(OsString::from_vec(out))
-}
-
-/// Space freed by removing `path`: allocated blocks, not following symlinks, not crossing into
-/// other filesystems or mount points. A hard-linked file only counts when all of its links are
-/// inside `path`, since otherwise removing `path` doesn't free it.
-pub fn disk_usage(path: &Path, mounts: &Mounts) -> u64 {
-    disk_usage_all(std::slice::from_ref(&path.to_path_buf()), mounts)
-}
-
-/// [`disk_usage`] of several paths removed together, measured in one walk.
-pub fn disk_usage_all(paths: &[PathBuf], mounts: &Mounts) -> u64 {
-    // (path, metadata, device of the path it was reached from)
-    let mut stack: Vec<(PathBuf, Metadata, u64)> = Vec::new();
-    for path in paths {
-        let Ok(meta) = fs::symlink_metadata(path) else {
-            continue;
-        };
-        // Walk the real path, so it can be compared with the mount points.
-        let path = if meta.is_symlink() {
-            path.clone()
-        } else {
-            fs::canonicalize(path).unwrap_or_else(|_| path.clone())
-        };
-        let device = meta.dev();
-        stack.push((path, meta, device));
-    }
-    // (device, inode) → (links seen, links in total, bytes).
-    let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
-    let mut total = 0;
-    while let Some((path, meta, device)) = stack.pop() {
-        if meta.dev() != device || (meta.is_dir() && mounts.contains(&path)) {
-            continue;
-        }
-        if !meta.is_dir() && meta.nlink() > 1 {
-            let entry = linked.entry((meta.dev(), meta.ino())).or_insert((
-                0,
-                meta.nlink(),
-                meta.blocks() * 512,
-            ));
-            entry.0 += 1;
-            continue;
-        }
-        total += meta.blocks() * 512;
-        if meta.is_dir() {
-            for entry in fs::read_dir(&path).into_iter().flatten().flatten() {
-                // `DirEntry::metadata` doesn't follow symlinks.
-                if let Ok(meta) = entry.metadata() {
-                    stack.push((entry.path(), meta, device));
-                }
-            }
-        }
-    }
-    let freed_links: u64 = linked
-        .values()
-        .filter(|(seen, links, _)| seen >= links)
-        .map(|(_, _, bytes)| bytes)
-        .sum();
-    total + freed_links
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testdir::TestDir;
+    use std::os::unix::fs::MetadataExt;
 
     fn rules(home: &TestDir) -> Rules {
         Rules::new(home.path(), ALLOWED_ROOTS, &[]).unwrap()
@@ -465,22 +347,6 @@ mod tests {
     }
 
     #[test]
-    fn reads_mount_points() {
-        let mounts = Mounts::parse(
-            "36 35 98:0 / /home/me/.cache/my\\040disk rw,noatime master:1 - ext3 /dev/root rw\n\
-             37 35 98:0 /mnt /home/me/.cache/bind rw - ext4 /dev/sda1 rw\n",
-        );
-        assert!(mounts.contains(Path::new("/home/me/.cache/my disk")));
-        assert!(mounts.contains(Path::new("/home/me/.cache/bind")));
-        assert!(!mounts.contains(Path::new("/home/me/.cache")));
-    }
-
-    #[test]
-    fn loads_the_mount_points_of_this_system() {
-        assert!(Mounts::load().unwrap().contains(Path::new("/")));
-    }
-
-    #[test]
     fn mount_points_are_not_walked_or_proposed() {
         let home = TestDir::new();
         home.file(".cache/app/a", 1000);
@@ -488,33 +354,11 @@ mod tests {
         home.file(".cache/app/bind/projects", 100_000);
         let mounted = home.dir(".cache/mounted");
         home.file(".cache/mounted/a", 100_000);
-        let mounts = Mounts([bind, mounted].into_iter().collect());
+        let mounts = Mounts::from_paths([bind, mounted]);
         let found = home_categories(home.path(), &rules(&home), &mounts);
         assert_eq!(paths(&found.user_cache), [home.path().join(".cache/app")]);
         assert!(found.user_cache.items[0].size < 100_000);
         assert!(found.user_cache.note.is_some());
-    }
-
-    #[test]
-    fn disk_usage_leaves_out_files_linked_from_elsewhere() {
-        let home = TestDir::new();
-        let file = home.file(".cache/uv/a", 100_000);
-        home.dir("project");
-        fs::hard_link(&file, home.path().join("project/a")).unwrap();
-        assert!(disk_usage(&home.path().join(".cache/uv"), &Mounts::default()) < 100_000);
-    }
-
-    #[test]
-    fn disk_usage_counts_blocks_and_hard_links_once() {
-        let home = TestDir::new();
-        let file = home.file("dir/a", 10_000);
-        fs::hard_link(&file, home.path().join("dir/b")).unwrap();
-        let one = fs::metadata(&file).unwrap().blocks() * 512;
-        let dir = fs::metadata(home.path().join("dir")).unwrap().blocks() * 512;
-        assert_eq!(
-            disk_usage(&home.path().join("dir"), &Mounts::default()),
-            dir + one
-        );
     }
 
     #[test]
@@ -525,13 +369,5 @@ mod tests {
         let found = home_categories(home.path(), &rules(&home), &Mounts::default());
         let one = fs::metadata(&file).unwrap().blocks() * 512;
         assert_eq!(found.trash.items[0].size, one);
-    }
-
-    #[test]
-    fn disk_usage_does_not_follow_symlinks() {
-        let home = TestDir::new();
-        home.file("big/a", 100_000);
-        let link = home.symlink("link", &home.path().join("big"));
-        assert!(disk_usage(&link, &Mounts::default()) < 100_000);
     }
 }

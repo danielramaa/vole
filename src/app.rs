@@ -22,6 +22,8 @@ pub enum Module {
     Clean,
     /// Orphaned packages and configs
     Orphans,
+    /// Put removed configs back from a Backup
+    Restore,
     /// Interactive disk explorer
     Analyze,
     /// Real-time system dashboard
@@ -75,6 +77,7 @@ pub struct App {
     clean: Option<clean::Screen>,
     /// The `orphans` screen once `orphans` has been opened, kept like `clean`'s.
     orphans: Option<orphans::Screen>,
+    restore: Option<orphans::RestoreScreen>,
     quit: bool,
 }
 
@@ -87,6 +90,7 @@ impl App {
             config,
             clean: None,
             orphans: None,
+            restore: None,
             quit: false,
         };
         app.open(module);
@@ -105,6 +109,10 @@ impl App {
                 self.orphans
                     .get_or_insert_with(|| orphans::Screen::new(&self.config));
             }
+            Some(Module::Restore) => {
+                self.restore
+                    .get_or_insert_with(|| orphans::RestoreScreen::new(&self.config));
+            }
             Some(Module::Analyze | Module::Status) | None => {}
         }
     }
@@ -114,6 +122,7 @@ impl App {
         match module {
             Module::Clean => self.clean.as_mut().map(|s| s as &mut dyn ModuleScreen),
             Module::Orphans => self.orphans.as_mut().map(|s| s as &mut dyn ModuleScreen),
+            Module::Restore => self.restore.as_mut().map(|s| s as &mut dyn ModuleScreen),
             Module::Analyze | Module::Status => None,
         }
     }

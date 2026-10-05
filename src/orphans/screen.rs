@@ -450,7 +450,7 @@ fn draw_confirm(
         }
         if !configs.is_empty() {
             lines.push(Line::from(format!(
-                "Configs aren't deleted: they move into a dated Backup in ~/{BACKUPS}/."
+                "Configs aren't deleted: they move into a dated Backup in ~/{BACKUPS}/, and vole restore puts them back."
             )));
         }
         if !backups.is_empty() {

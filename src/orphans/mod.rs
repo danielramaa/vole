@@ -8,6 +8,7 @@ mod owners;
 mod pacman;
 pub mod plan;
 mod remove;
+mod restore;
 mod screen;
 
 use std::collections::HashMap;
@@ -24,6 +25,7 @@ use crate::in_use;
 use crate::safety::Rules;
 use owners::Owners;
 use plan::Plan;
+pub use restore::Screen as RestoreScreen;
 pub use screen::Screen;
 
 /// The path rules for Orphaned Configs: the roots, and the dotfiles directly in `home`.

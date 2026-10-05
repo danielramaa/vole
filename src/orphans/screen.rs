@@ -311,8 +311,9 @@ impl PlanView {
 
         // Room for the highlight symbol.
         let width = usize::from(list_area.width).saturating_sub(2);
+        let height = usize::from(list_area.height).max(1);
         let mut items = vec![ListItem::new(self.heading(width))];
-        items.extend((0..self.plan.packages.len()).map(|i| self.item(i, width)));
+        items.extend((0..self.plan.packages.len()).map(|i| self.item(i, width, height)));
         let list = List::new(items)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
             .highlight_symbol("> ");
@@ -344,8 +345,9 @@ impl PlanView {
         ui::right_aligned(spans, size::format(self.plan.size()), width)
     }
 
-    /// A package's row, with its config files below.
-    fn item(&self, index: usize, width: usize) -> ListItem<'static> {
+    /// A package's row, with its config files below, in at most `height` lines: ratatui draws
+    /// nothing at all when the highlighted item doesn't fit. The confirmation lists every file.
+    fn item(&self, index: usize, width: usize, height: usize) -> ListItem<'static> {
         let dim = Style::new().add_modifier(Modifier::DIM);
         let package = &self.plan.packages[index];
         let check = if package.selected { "[x]" } else { "[ ]" };
@@ -373,7 +375,24 @@ impl PlanView {
         }
         let mut lines = vec![ui::right_aligned(spans, size::format(package.size), width)];
         // Under the name.
-        lines.extend(backup_lines(&package.backup, indent.len() + 6));
+        let pad = indent.len() + 6;
+        let mut backup = backup_lines(&package.backup, pad);
+        if 1 + backup.len() > height {
+            // Room for the name and the line saying how many more.
+            let shown = height.saturating_sub(2);
+            let more = backup.len() - shown;
+            backup.truncate(shown);
+            if height >= 2 {
+                backup.push(Line::styled(
+                    format!(
+                        "{}… and {more} more, listed when confirming",
+                        " ".repeat(pad)
+                    ),
+                    dim,
+                ));
+            }
+        }
+        lines.extend(backup);
         ListItem::new(lines)
     }
 }
@@ -476,6 +495,30 @@ mod tests {
         assert!(rows[2].contains("  [ ] cups"), "{rows:#?}");
         assert!(rows[3].contains("        /etc/cups/cupsd.conf  modified"));
         assert!(rows[4].contains("  [ ] zstd"));
+    }
+
+    #[test]
+    fn a_package_with_more_config_files_than_rows_still_shows() {
+        let mut cups = Package::new("cups", 10);
+        cups.backup = (0..30)
+            .map(|i| Backup {
+                path: format!("/etc/cups/{i}.conf"),
+                state: BackupState::Unmodified,
+            })
+            .collect();
+        let mut screen = Screen::with_plan(Plan {
+            packages: vec![Package::new("a", 1), cups],
+        });
+        press(&mut screen, KeyCode::Char('j'));
+        press(&mut screen, KeyCode::Char('j'));
+        // Borders and the total leave 9 rows for the list: the name, 7 files and the rest.
+        let rows = render(&mut screen, 60, 12).join("\n");
+        assert!(rows.contains("[ ] cups"), "{rows}");
+        assert!(rows.contains("/etc/cups/6.conf"), "{rows}");
+        assert!(
+            rows.contains("… and 23 more, listed when confirming"),
+            "{rows}"
+        );
     }
 
     #[test]

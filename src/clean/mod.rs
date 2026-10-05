@@ -1,6 +1,5 @@
 //! `clean`: caches, pacman cache, journal and trash.
 
-mod in_use;
 pub mod plan;
 mod remove;
 mod root;
@@ -13,6 +12,7 @@ use std::thread;
 use anyhow::{Context, Result};
 
 use crate::config::Config;
+use crate::in_use;
 use crate::safety::Rules;
 use plan::{Item, Plan};
 pub use screen::Screen;

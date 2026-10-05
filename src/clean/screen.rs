@@ -14,12 +14,13 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
 use super::plan::{Item, Plan};
-use super::remove::{self, RunRoot};
+use super::remove;
 use super::scan::{ALLOWED_ROOTS, Mounts};
 use super::{build_plan, refresh_in_use};
 use crate::config::Config;
 use crate::log::{Log, Outcome};
 use crate::safety::Rules;
+use crate::term::RunRoot;
 use crate::{size, ui};
 
 pub struct Screen {

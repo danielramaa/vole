@@ -104,6 +104,12 @@ impl App {
                 clean.run_root(&mut |commands| term::run_external(terminal, commands))?;
                 continue;
             }
+            if let Some(orphans) = &mut self.orphans
+                && orphans.needs_terminal()
+            {
+                orphans.run_root(&mut |commands| term::run_external(terminal, commands))?;
+                continue;
+            }
             // Wake up now and then, so background work (the scans) shows up.
             if event::poll(Duration::from_millis(100))?
                 && let Event::Key(key) = event::read()?
@@ -287,6 +293,23 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let confirming = footer(&mut app);
         assert!(confirming.contains("n back") && !confirming.contains("q quit"));
+    }
+
+    #[test]
+    fn orphans_confirmation_goes_back_on_q() {
+        let mut package = orphans::plan::Package::new("a", 1);
+        package.selected = true;
+        let mut app = App::new(Some(Module::Orphans), Config::default());
+        app.orphans = Some(orphans::Screen::with_plan(orphans::plan::Plan {
+            packages: vec![package],
+        }));
+        assert!(footer(&mut app).contains("q quit"));
+        press(&mut app, KeyCode::Enter);
+        let confirming = footer(&mut app);
+        assert!(confirming.contains("n back") && !confirming.contains("q quit"));
+        press(&mut app, KeyCode::Char('q'));
+        assert!(!app.quit);
+        assert!(app.orphans.as_ref().is_some_and(orphans::Screen::has_plan));
     }
 
     #[test]

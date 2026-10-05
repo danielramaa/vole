@@ -1,5 +1,7 @@
-//! The `orphans` screens: looking for Orphaned Packages, and the Plan with selection.
+//! The `orphans` screens: looking for Orphaned Packages, the Plan with selection, confirmation,
+//! and the result.
 
+use std::io;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
@@ -12,7 +14,10 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::build_plan;
 use super::pacman::{Backup, BackupState};
-use super::plan::Plan;
+use super::plan::{Package, Plan};
+use super::remove;
+use crate::log::{Log, Outcome};
+use crate::term::RunRoot;
 use crate::{size, ui};
 
 pub struct Screen {
@@ -24,6 +29,22 @@ enum State {
     NotStarted,
     Scanning(Receiver<Result<Plan, String>>),
     Ready(PlanView),
+    /// Asking before anything is removed.
+    Confirm {
+        view: PlanView,
+        scroll: u16,
+    },
+    /// Confirmed: the Operation Log is opened on the next tick.
+    Removing(PlanView),
+    /// Waiting for the App to lend the terminal to `sudo pacman -Rns`.
+    RootPending {
+        plan: Plan,
+        log: Log,
+    },
+    Done {
+        outcomes: Vec<Outcome>,
+        scroll: u16,
+    },
     Failed(String),
 }
 
@@ -52,7 +73,13 @@ impl Screen {
         }
     }
 
-    /// Moves background work along: starts the scan and picks up its result.
+    #[cfg(test)]
+    pub fn has_plan(&self) -> bool {
+        matches!(self.state, State::Ready(_))
+    }
+
+    /// Moves background work along: starts the scan and picks up its result, and opens the
+    /// Operation Log once removing is confirmed.
     pub fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
@@ -67,33 +94,117 @@ impl Screen {
                     State::Failed("the scan stopped unexpectedly".into())
                 }
             },
+            // Nothing is removed without the log to write it to.
+            State::Removing(view) => match open_log() {
+                Ok(log) => State::RootPending {
+                    plan: view.plan,
+                    log,
+                },
+                Err(err) => State::Failed(format!("Nothing was removed: {err}")),
+            },
             state => state,
         };
     }
 
     /// Returns whether the key was used.
     pub fn on_key(&mut self, key: KeyEvent) -> bool {
-        match &mut self.state {
-            State::Ready(view) => view.on_key(key),
-            State::Failed(_) if key.code == KeyCode::Enter => {
-                self.state = State::NotStarted;
-                true
+        let back = matches!(
+            key.code,
+            KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
+        );
+        let state = std::mem::replace(&mut self.state, State::NotStarted);
+        let (state, used) = match state {
+            State::Ready(view) if key.code == KeyCode::Enter => {
+                if view.plan.selected().next().is_some() {
+                    (State::Confirm { view, scroll: 0 }, true)
+                } else {
+                    (State::Ready(view), true)
+                }
             }
-            State::NotStarted | State::Scanning(_) | State::Failed(_) => false,
-        }
+            State::Ready(mut view) => {
+                let used = view.on_key(key);
+                (State::Ready(view), used)
+            }
+            State::Confirm { view, .. } if key.code == KeyCode::Char('y') => {
+                (State::Removing(view), true)
+            }
+            State::Confirm { view, .. } if back => (State::Ready(view), true),
+            State::Confirm { view, scroll } => (
+                State::Confirm {
+                    view,
+                    scroll: ui::scrolled(scroll, key),
+                },
+                true,
+            ),
+            state @ (State::Removing(_) | State::RootPending { .. }) => (state, true),
+            State::Done { .. } | State::Failed(_) if key.code == KeyCode::Enter => {
+                (State::NotStarted, true)
+            }
+            State::Done { outcomes, scroll } => {
+                let next = ui::scrolled(scroll, key);
+                (
+                    State::Done {
+                        outcomes,
+                        scroll: next,
+                    },
+                    next != scroll,
+                )
+            }
+            state => (state, false),
+        };
+        self.state = state;
+        used
     }
 
     pub fn hint(&self) -> &'static str {
         match self.state {
-            State::Ready(_) => "↑↓/jk move · space select · a select all",
+            State::Ready(_) => "↑↓/jk move · space select · a select all · enter remove…",
+            State::Confirm { .. } => "↑↓ scroll · y remove · n back",
+            State::Done { .. } => "↑↓ scroll · enter scan again",
             State::Failed(_) => "enter scan again",
-            State::NotStarted | State::Scanning(_) => "",
+            State::NotStarted
+            | State::Scanning(_)
+            | State::Removing(_)
+            | State::RootPending { .. } => "",
         }
     }
 
-    /// Whether q leaves `orphans` here.
+    /// Whether q leaves `orphans` here; while confirming or removing, it doesn't.
     pub fn can_leave(&self) -> bool {
-        true
+        match self.state {
+            State::NotStarted
+            | State::Scanning(_)
+            | State::Ready(_)
+            | State::Done { .. }
+            | State::Failed(_) => true,
+            State::Confirm { .. } | State::Removing(_) | State::RootPending { .. } => false,
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_removing(&self) -> bool {
+        matches!(self.state, State::Removing(_))
+    }
+
+    /// Whether `sudo pacman -Rns` is waiting for [`Screen::run_root`].
+    pub fn needs_terminal(&self) -> bool {
+        matches!(self.state, State::RootPending { .. })
+    }
+
+    /// Removes the confirmed packages; `run_root` runs `sudo pacman -Rns` with the TUI paused.
+    /// Fails when the TUI couldn't be brought back afterwards; the result is logged either way.
+    pub fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
+        let state = std::mem::replace(&mut self.state, State::NotStarted);
+        let State::RootPending { plan, mut log } = state else {
+            self.state = state;
+            return Ok(());
+        };
+        let (outcomes, terminal) = remove::remove(&plan, &mut log, run_root, &remove::System);
+        self.state = State::Done {
+            outcomes,
+            scroll: 0,
+        };
+        terminal
     }
 
     pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
@@ -107,8 +218,54 @@ impl Screen {
                 frame.render_widget(Paragraph::new(err.as_str()).block(block), area)
             }
             State::Ready(view) => view.draw(frame, area, block),
+            State::Confirm { view, scroll } => draw_confirm(frame, area, block, &view.plan, scroll),
+            State::Removing(_) | State::RootPending { .. } => {
+                frame.render_widget(Paragraph::new("Removing…").block(block), area)
+            }
+            State::Done { outcomes, scroll } => {
+                ui::draw_outcomes(frame, area, block, outcomes, scroll)
+            }
         }
     }
+}
+
+fn open_log() -> Result<Log, String> {
+    let path = Log::path().ok_or("the operation log's folder could not be found")?;
+    Log::open(&path, "orphans")
+        .map_err(|err| format!("opening the operation log {}: {err}", path.display()))
+}
+
+fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, scroll: &mut u16) {
+    let selected: Vec<&Package> = plan.selected().collect();
+    let width = usize::from(block.inner(area).width);
+    let mut lines = vec![
+        Line::styled(
+            match selected.len() {
+                1 => format!(
+                    "Remove this package, freeing about {}?",
+                    size::format(plan.selected_size())
+                ),
+                count => format!(
+                    "Remove these {count} packages, freeing about {}?",
+                    size::format(plan.selected_size())
+                ),
+            },
+            Style::new().add_modifier(Modifier::BOLD),
+        ),
+        Line::from("vole pauses so sudo can ask for your password; pacman then asks once more."),
+    ];
+    if selected.iter().any(|package| !package.backup.is_empty()) {
+        lines.push(Line::from(
+            "Their config files go too, even changed ones: -n keeps no .pacsave copies.",
+        ));
+    }
+    lines.push(Line::default());
+    for package in &selected {
+        let name = vec![Span::raw(format!("  {}", package.name))];
+        lines.push(ui::right_aligned(name, size::format(package.size), width));
+        lines.extend(backup_lines(&package.backup, 4));
+    }
+    ui::draw_scrolled(frame, area, block, lines, scroll);
 }
 
 /// The Plan as a list: a heading row, then one row per package.
@@ -319,6 +476,57 @@ mod tests {
         assert!(rows[2].contains("  [ ] cups"), "{rows:#?}");
         assert!(rows[3].contains("        /etc/cups/cupsd.conf  modified"));
         assert!(rows[4].contains("  [ ] zstd"));
+    }
+
+    #[test]
+    fn enter_asks_for_confirmation_only_with_a_selection() {
+        let mut screen = screen();
+        assert!(press(&mut screen, KeyCode::Enter));
+        assert!(screen.has_plan());
+        press(&mut screen, KeyCode::Char('a'));
+        press(&mut screen, KeyCode::Enter);
+        assert!(!screen.has_plan() && !screen.can_leave());
+        // Backing out keeps the selection, and q goes back instead of leaving.
+        assert!(press(&mut screen, KeyCode::Char('q')));
+        assert!(screen.can_leave());
+        assert_eq!(selected_size(&screen), 30);
+        press(&mut screen, KeyCode::Enter);
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(screen.is_removing());
+    }
+
+    #[test]
+    fn keys_do_nothing_while_removing() {
+        let mut screen = screen();
+        press(&mut screen, KeyCode::Char('a'));
+        press(&mut screen, KeyCode::Enter);
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(press(&mut screen, KeyCode::Char('q')));
+        assert!(press(&mut screen, KeyCode::Esc));
+        assert!(screen.is_removing() && !screen.can_leave());
+    }
+
+    #[test]
+    fn confirmation_lists_the_packages_and_their_config_files() {
+        let mut cups = Package::new("cups", 10);
+        cups.backup = vec![Backup {
+            path: "/etc/cups/cupsd.conf".into(),
+            state: BackupState::Modified,
+        }];
+        cups.selected = true;
+        let mut screen = Screen::with_plan(Plan {
+            packages: vec![cups, Package::new("zstd", 1)],
+        });
+        press(&mut screen, KeyCode::Enter);
+        let rows = render(&mut screen, 90, 10).join("\n");
+        assert!(
+            rows.contains("Remove this package, freeing about 10 B?"),
+            "{rows}"
+        );
+        assert!(rows.contains("-n keeps no .pacsave copies"));
+        assert!(rows.contains("│  cups "));
+        assert!(rows.contains("│    /etc/cups/cupsd.conf  modified"));
+        assert!(!rows.contains("zstd"));
     }
 
     #[test]

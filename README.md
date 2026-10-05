@@ -85,7 +85,7 @@ vole deletes files, so safety comes first.
 
 vole **runs as your normal user and refuses to run as root.** It only removes files itself inside your home folder. System-level work (pacman cache, journal, packages) is done by the official tools, `/usr/bin/paccache`, `/usr/bin/journalctl` and `/usr/bin/pacman`, through `sudo`, after you confirm. The TUI pauses so `sudo` can ask for your password itself; vole never sees it.
 
-Only validated numbers from your config reach those commands, never free text, so a tampered config file can't be turned into root access. Details: [ADR 0001](docs/adr/0001-privilege-model.md).
+Only validated numbers from your config reach those commands, never free text, so a tampered config file can't be turned into root access. The only other arguments are the names of the packages you picked, which come from pacman itself and are checked to be valid package names. Details: [ADR 0001](docs/adr/0001-privilege-model.md).
 
 ## Status
 

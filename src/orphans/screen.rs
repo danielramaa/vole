@@ -13,7 +13,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::build_plan;
-use super::pacman::{Backup, BackupState};
+use super::pacman::{ConfigFile, FileState};
 use super::plan::{Package, Plan};
 use super::remove;
 use crate::app::ModuleScreen;
@@ -237,7 +237,10 @@ fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, scroll
         ),
         Line::from("vole pauses so sudo can ask for your password; pacman then asks once more."),
     ];
-    if selected.iter().any(|package| !package.backup.is_empty()) {
+    if selected
+        .iter()
+        .any(|package| !package.config_files.is_empty())
+    {
         lines.push(Line::from(
             "Their config files go too, even changed ones: -n keeps no .pacsave copies.",
         ));
@@ -246,7 +249,7 @@ fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, scroll
     for package in &selected {
         let name = vec![Span::raw(format!("  {}", package.name))];
         lines.push(ui::right_aligned(name, size::format(package.size), width));
-        lines.extend(backup_lines(&package.backup, 4));
+        lines.extend(config_file_lines(&package.config_files, 4));
     }
     ui::draw_scrolled(frame, area, block, lines, scroll);
 }
@@ -359,14 +362,14 @@ impl PlanView {
         let mut lines = vec![ui::right_aligned(spans, size::format(package.size), width)];
         // Under the name.
         let pad = indent.len() + 6;
-        let mut backup = backup_lines(&package.backup, pad);
-        if 1 + backup.len() > height {
+        let mut files = config_file_lines(&package.config_files, pad);
+        if 1 + files.len() > height {
             // Room for the name and the line saying how many more.
             let shown = height.saturating_sub(2);
-            let more = backup.len() - shown;
-            backup.truncate(shown);
+            let more = files.len() - shown;
+            files.truncate(shown);
             if height >= 2 {
-                backup.push(Line::styled(
+                files.push(Line::styled(
                     format!(
                         "{}… and {more} more, listed when confirming",
                         " ".repeat(pad)
@@ -375,15 +378,15 @@ impl PlanView {
                 ));
             }
         }
-        lines.extend(backup);
+        lines.extend(files);
         ListItem::new(lines)
     }
 }
 
 /// A package's config files, one per line, `indent` columns in, marking the changed ones.
-fn backup_lines(backup: &[Backup], indent: usize) -> Vec<Line<'static>> {
+fn config_file_lines(files: &[ConfigFile], indent: usize) -> Vec<Line<'static>> {
     let dim = Style::new().add_modifier(Modifier::DIM);
-    backup
+    files
         .iter()
         .map(|file| {
             let mut spans = vec![Span::styled(
@@ -391,12 +394,12 @@ fn backup_lines(backup: &[Backup], indent: usize) -> Vec<Line<'static>> {
                 dim,
             )];
             match file.state {
-                BackupState::Modified => spans.push(Span::styled(
+                FileState::Modified => spans.push(Span::styled(
                     "  modified",
                     Style::new().add_modifier(Modifier::BOLD),
                 )),
-                BackupState::Unreadable => spans.push(Span::styled("  unreadable", dim)),
-                BackupState::Unmodified => {}
+                FileState::Unreadable => spans.push(Span::styled("  unreadable", dim)),
+                FileState::Unmodified => {}
             }
             Line::from(spans)
         })
@@ -467,9 +470,9 @@ mod tests {
     #[test]
     fn shows_config_files_under_their_package() {
         let mut cups = Package::new("cups", 10);
-        cups.backup = vec![Backup {
+        cups.config_files = vec![ConfigFile {
             path: "/etc/cups/cupsd.conf".into(),
-            state: BackupState::Modified,
+            state: FileState::Modified,
         }];
         let mut screen = Screen::with_plan(Plan {
             packages: vec![cups, Package::new("zstd", 1)],
@@ -483,10 +486,10 @@ mod tests {
     #[test]
     fn a_package_with_more_config_files_than_rows_still_shows() {
         let mut cups = Package::new("cups", 10);
-        cups.backup = (0..30)
-            .map(|i| Backup {
+        cups.config_files = (0..30)
+            .map(|i| ConfigFile {
                 path: format!("/etc/cups/{i}.conf"),
-                state: BackupState::Unmodified,
+                state: FileState::Unmodified,
             })
             .collect();
         let mut screen = Screen::with_plan(Plan {
@@ -535,9 +538,9 @@ mod tests {
     #[test]
     fn confirmation_lists_the_packages_and_their_config_files() {
         let mut cups = Package::new("cups", 10);
-        cups.backup = vec![Backup {
+        cups.config_files = vec![ConfigFile {
             path: "/etc/cups/cupsd.conf".into(),
-            state: BackupState::Modified,
+            state: FileState::Modified,
         }];
         cups.selected = true;
         let mut screen = Screen::with_plan(Plan {

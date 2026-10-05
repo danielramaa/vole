@@ -75,21 +75,15 @@ pub fn remove_root(
     }
     let targets: Vec<String> = commands.iter().map(term::describe).collect();
     let ran = run_root(&mut commands);
-    let not_run = match &ran.terminal {
-        Err(err) if ran.statuses.is_empty() => format!("the terminal could not be paused: {err}"),
-        _ => "did not run".to_string(),
-    };
-    let mut statuses = ran.statuses.into_iter();
-    let mut outcomes = Vec::new();
-    for ((_, item), target) in root.iter().zip(&targets) {
-        let result = match statuses.next() {
-            Some(Ok(status)) if status.success() => Ok(()),
-            Some(Ok(status)) => Err(format!("{target} failed ({status})")),
-            Some(Err(err)) => Err(format!("{target} could not run: {err}")),
-            None => Err(format!("{target} {not_run}")),
-        };
-        outcomes.push(record(log, item, target, result));
-    }
+    let outcomes = root
+        .iter()
+        .zip(&targets)
+        .enumerate()
+        .map(|(i, ((_, item), target))| {
+            let result = ran.error(i, target).map_or(Ok(()), Err);
+            record(log, item, target, result)
+        })
+        .collect();
     (outcomes, ran.terminal)
 }
 

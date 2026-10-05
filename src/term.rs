@@ -1,7 +1,8 @@
-use std::io::{self, Write, stdout};
+use std::io::{self, Write, stdin, stdout};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
@@ -10,6 +11,7 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use rustix::termios::{QueueSelector, tcflush};
 use signal_hook::consts::{SIGINT, SIGQUIT};
 
 /// Root commands always go through sudo, called by absolute path (ADR 0001).
@@ -44,13 +46,16 @@ pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) ->
     // system(3), vole ignores it while it waits, so only the command stops.
     let paused = ignore_interrupts(true).and_then(|()| pause(terminal));
     let statuses: Vec<io::Result<ExitStatus>> = match &paused {
-        Ok(()) => commands
-            .iter_mut()
-            .map(|command| {
-                println!("vole: running {}", describe(command));
-                command.status()
-            })
-            .collect(),
+        Ok(()) => {
+            discard_typeahead();
+            commands
+                .iter_mut()
+                .map(|command| {
+                    println!("vole: running {}", describe(command));
+                    command.status()
+                })
+                .collect()
+        }
         Err(_) => Vec::new(),
     };
     // Coming back would hide why a command failed (a wrong password, not in sudoers, …).
@@ -73,6 +78,17 @@ pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) ->
         statuses,
         terminal: paused.and(resumed),
     }
+}
+
+/// How long after the TUI pauses a key can't yet be a reaction to it.
+const TYPEAHEAD: Duration = Duration::from_millis(200);
+
+/// Throws away the keys typed before the TUI paused, or too soon after to answer what comes
+/// next (a quick Enter after y). They were meant for vole, and would otherwise go into sudo's
+/// password or answer a command's question, such as pacman's [Y/n].
+fn discard_typeahead() {
+    thread::sleep(TYPEAHEAD);
+    let _ = tcflush(stdin(), QueueSelector::IFlush);
 }
 
 fn wait_for_enter() {

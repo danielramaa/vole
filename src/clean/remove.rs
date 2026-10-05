@@ -12,12 +12,7 @@ use super::plan::{Item, Kind, Plan, RootCommand};
 use super::scan::{Mounts, is_real_dir, trash_parts};
 use crate::log::{Log, Outcome};
 use crate::safety::Rules;
-use crate::term::Ran;
-
-const SUDO: &str = "/usr/bin/sudo";
-
-/// Runs root commands, all under one pause of the TUI.
-pub type RunRoot<'a> = dyn FnMut(&mut [Command]) -> Ran + 'a;
+use crate::term::{self, RunRoot};
 
 /// Removes the selected home Items, each after a last safety check, and writes each attempt
 /// to `log`. `progress` is told about each Item before it is removed. Once `stop` is set, the
@@ -70,15 +65,15 @@ pub fn remove_root(
     let mut commands: Vec<Command> = root
         .iter()
         .map(|(command, _)| {
-            let mut sudo = Command::new(SUDO);
-            sudo.arg(command.program()).args(command.args());
+            let mut sudo = term::as_root(command.program());
+            sudo.args(command.args());
             sudo
         })
         .collect();
     if commands.is_empty() {
         return (Vec::new(), Ok(()));
     }
-    let targets: Vec<String> = commands.iter().map(crate::term::describe).collect();
+    let targets: Vec<String> = commands.iter().map(term::describe).collect();
     let ran = run_root(&mut commands);
     let not_run = match &ran.terminal {
         Err(err) if ran.statuses.is_empty() => format!("the terminal could not be paused: {err}"),
@@ -288,6 +283,7 @@ mod tests {
     use super::*;
     use crate::clean::plan::{Category, RootCommand};
     use crate::clean::scan::ALLOWED_ROOTS;
+    use crate::term::Ran;
     use crate::testdir::TestDir;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
@@ -628,7 +624,7 @@ mod tests {
         let mut log = Log::open(&s.log_path, "clean").unwrap();
         let mut ran = Vec::new();
         let mut run = |commands: &mut [Command]| -> Ran {
-            ran = commands.iter().map(crate::term::describe).collect();
+            ran = commands.iter().map(term::describe).collect();
             // The journal vacuum fails.
             Ran {
                 statuses: vec![

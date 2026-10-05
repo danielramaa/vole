@@ -12,6 +12,19 @@ use ratatui::crossterm::terminal::{
 };
 use signal_hook::consts::{SIGINT, SIGQUIT};
 
+/// Root commands always go through sudo, called by absolute path (ADR 0001).
+const SUDO: &str = "/usr/bin/sudo";
+
+/// A command that runs `program` as root through sudo, which asks for the password itself.
+pub fn as_root(program: &str) -> Command {
+    let mut command = Command::new(SUDO);
+    command.arg(program);
+    command
+}
+
+/// Runs root commands, all under one pause of the TUI.
+pub type RunRoot<'a> = dyn FnMut(&mut [Command]) -> Ran + 'a;
+
 /// What happened while the TUI was paused.
 pub struct Ran {
     /// The exit status of each command that ran, in order. Empty when the TUI couldn't be

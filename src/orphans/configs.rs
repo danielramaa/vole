@@ -279,7 +279,7 @@ mod tests {
             (".config/gone/settings", 10, old),
             (".local/share/big-gone/data", 100_000, old),
             (".cache/recent-gone/data", 10, now - 3 * DAY),
-            (".local/share/systemmonitor/data", 10, old),
+            (".local/share/text-editor/data", 10, old),
             (".gonerc", 10, old),
         ] {
             let file = home.file(path, size);
@@ -289,7 +289,7 @@ mod tests {
         let (candidates, _) = candidates(home.path(), &rules(&home), &Mounts::default());
         let names: Vec<String> = candidates.iter().map(Candidate::name).collect();
         let owners = Owners::from_pacman(
-            &installed(&["htop", "plasma-systemmonitor"]),
+            &installed(&["htop", "gnome-text-editor"]),
             "",
             &owners::wanted(names.iter().map(String::as_str)),
         );
@@ -313,9 +313,9 @@ mod tests {
                     format!("unchanged since {month}")
                 ),
                 (
-                    "~/.local/share/systemmonitor".to_string(),
+                    "~/.local/share/text-editor".to_string(),
                     Confidence::Medium,
-                    "name like plasma-systemmonitor".to_string()
+                    "name like gnome-text-editor".to_string()
                 ),
                 (
                     "~/.cache/recent-gone".to_string(),

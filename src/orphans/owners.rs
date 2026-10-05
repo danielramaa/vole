@@ -26,6 +26,132 @@ pub enum Owner {
     /// A folder on `$PATH`, which the folder it is in holds: `~/.nvm` holds
     /// `~/.nvm/versions/node/v22/bin`.
     OnPath(PathBuf),
+    /// Part of the desktop, or of vole itself, whatever is installed: `~/.config/mimeapps.list`.
+    Shared,
+    /// The user's Known Owners file says so, naming the owner.
+    Known(String),
+}
+
+/// Folders not named (only) after their owner, and what owns them: whichever of the listed names
+/// is installed, as a package, program, Flatpak, AppImage or desktop entry. A pattern matches a
+/// name the folder goes by as a whole, by its start (`p10k*` for `p10k-dump-me.zsh`), or by its
+/// end (`*-nodejs`). Folders of the user's own things belong in their Known Owners file.
+const KNOWN_NAMES: &[(&str, &[&str])] = &[
+    // KDE Plasma and Frameworks.
+    ("kdeglobals", &["kconfig", "plasma-workspace"]),
+    ("kdedefaults", &["kconfig", "plasma-workspace"]),
+    ("kglobalshortcuts", &["kglobalacceld", "plasma-workspace"]),
+    ("kcminput", &["plasma-desktop"]),
+    ("kxkb", &["plasma-desktop"]),
+    ("ktimezoned", &["plasma-workspace"]),
+    ("powermanagementprofiles", &["powerdevil"]),
+    ("systemmonitor", &["plasma-systemmonitor", "ksystemstats"]),
+    ("ksplash", &["plasma-workspace"]),
+    ("session", &["plasma-workspace"]),
+    ("plasma*", &["plasma-workspace"]),
+    ("ksycoca*", &["kservice"]),
+    ("user-places*", &["kio"]),
+    // Qt and GTK.
+    ("qtproject", &["qt6-base", "qt5-base"]),
+    ("trolltech", &["qt6-base", "qt5-base"]),
+    ("qtshadercache*", &["qt6-base", "qt5-base"]),
+    ("gtkrc*", &["gtk2", "gtk3", "gtk4", "kde-gtk-config"]),
+    ("event-sound-cache*", &["libcanberra"]),
+    ("pulse*", &["libpulse", "pulseaudio", "pipewire-pulse"]),
+    // Shells.
+    ("histfile", &["zsh"]),
+    ("zcompdump*", &["zsh"]),
+    ("p10k*", &["zsh"]),
+    ("oh-my-zsh", &["zsh"]),
+    ("inputrc", &["readline", "bash"]),
+    // Editors, and the plugins that keep their own folders.
+    ("vscode*", &["code", "codium"]),
+    (
+        "github-copilot",
+        &["code", "codium", "jetbrains-toolbox", "nvim", "vim"],
+    ),
+    ("ghcp-appmod*", &["code", "codium", "jetbrains-toolbox"]),
+    (
+        "wakatime*",
+        &[
+            "code",
+            "codium",
+            "jetbrains-toolbox",
+            "nvim",
+            "vim",
+            "emacs",
+        ],
+    ),
+    // JetBrains IDEs, and the JDKs and debugging symbols they download.
+    ("jdks", &["jetbrains-toolbox", "idea", "android-studio"]),
+    ("jdk", &["java", "jetbrains-toolbox", "android-studio"]),
+    ("junie", &["jetbrains-toolbox"]),
+    ("refsrcsymbols", &["rider", "jetbrains-toolbox"]),
+    ("symbolsourcesymbols", &["rider", "jetbrains-toolbox"]),
+    // Toolchains.
+    ("java", &["java"]),
+    ("gradle", &["gradle", "java"]),
+    ("m2", &["mvn", "java"]),
+    ("net", &["dotnet", "mono"]),
+    ("nuget", &["dotnet", "mono", "nuget"]),
+    ("isolatedstorage", &["dotnet", "mono"]),
+    ("android", &["android-studio", "adb", "android-tools"]),
+    ("emulator*", &["android-studio", "emulator"]),
+    ("kube", &["kubectl", "k9s", "minikube", "helm"]),
+    ("configstore", &["node", "npm"]),
+    ("storybook", &["node", "npm"]),
+    ("*-nodejs", &["node", "npm"]),
+    ("kitware", &["cmake"]),
+    // Apps whose folders go by their maker's name.
+    (
+        "google",
+        &[
+            "google-chrome",
+            "chromium",
+            "android-studio",
+            "google-earth-pro",
+        ],
+    ),
+    ("microsoft", &["microsoft-edge", "code", "teams-for-linux"]),
+    ("mozilla", &["firefox", "thunderbird", "librewolf"]),
+    ("meltytech", &["shotcut"]),
+    (
+        "raspberry pi",
+        &["rpi-imager", "com.raspberrypi.rpi-imager"],
+    ),
+];
+
+/// Folders that are part of the desktop, or of vole itself: owned whatever is installed. Matched
+/// like [`KNOWN_NAMES`].
+const SHARED: &[&str] = &[
+    "applications",
+    "autostart",
+    "dbus-1",
+    "desktop-directories",
+    "environment.d",
+    "fonts",
+    "icons",
+    "menus",
+    "mime",
+    "mimeapps",
+    "recently-used",
+    "sounds",
+    "systemd",
+    "themes",
+    "trash",
+    "user-dirs",
+    "vole",
+];
+
+/// Whether `pattern` (see [`KNOWN_NAMES`]) matches one of `keys`.
+fn matches(pattern: &str, keys: &[String]) -> bool {
+    if let Some(end) = pattern.strip_prefix('*') {
+        keys.iter().any(|key| key.ends_with(end))
+    } else if let Some(start) = pattern.strip_suffix('*') {
+        keys.iter().any(|key| key.starts_with(start))
+    } else {
+        keys.iter().any(|key| key == pattern)
+    }
 }
 
 /// A folder's name may start with its owner's name (`katemetainfos`, `kwinsession`), but only
@@ -248,6 +374,8 @@ pub struct Owners {
     pacman_programs: HashSet<PathBuf>,
     /// The desktop entries pacman installed, and their packages.
     pacman_desktop: HashMap<PathBuf, Owner>,
+    /// The Known Owners file's entries, by resolved path.
+    known: HashMap<PathBuf, String>,
 }
 
 impl Owners {
@@ -389,6 +517,11 @@ impl Owners {
         }
     }
 
+    /// The Known Owners file's entries: resolved paths, and what owns each.
+    pub fn add_known(&mut self, known: impl IntoIterator<Item = (PathBuf, String)>) {
+        self.known.extend(known);
+    }
+
     fn add(&mut self, key: String, owner: &Owner) {
         add_owner(self.exact.entry(key).or_default(), owner);
     }
@@ -419,11 +552,28 @@ impl Owners {
         for key in primary_keys(name) {
             add(self.first_words.get(&key));
         }
+        // The whole name too, even when too common to go by alone: ~/.net.
+        let mut keys = name_keys(name);
+        let lower = name.to_lowercase();
+        keys.push(lower.strip_prefix('.').unwrap_or(&lower).to_string());
+        for (pattern, owners) in KNOWN_NAMES {
+            if matches(pattern, &keys) {
+                for owner in owners.iter().copied() {
+                    add(self.exact.get(owner));
+                }
+            }
+        }
+        if SHARED.iter().any(|pattern| matches(pattern, &keys)) {
+            add_owner(&mut found, &Owner::Shared);
+        }
+        if let Some(owner) = self.known.get(real) {
+            add_owner(&mut found, &Owner::Known(owner.clone()));
+        }
         found
     }
 
     /// A program or package whose name contains a name `name` goes by, or is contained in it,
-    /// which makes `name` less surely an orphan: `systemmonitor` and `plasma-systemmonitor`.
+    /// which makes `name` less surely an orphan: `text-editor` and `gnome-text-editor`.
     pub fn close_to(&self, name: &str) -> Option<String> {
         let keys = name_keys(name);
         let close = |owner_key: &str| {
@@ -549,12 +699,12 @@ htop /usr/bin/htop
 
     #[test]
     fn names_close_to_a_package() {
-        let installed = [info("plasma-systemmonitor")];
+        let installed = [info("gnome-text-editor")];
         let owners = Owners::from_pacman(&installed, "", &HashSet::new());
-        assert!(of(&owners, "systemmonitorrc").is_empty());
+        assert!(of(&owners, "text-editor").is_empty());
         assert_eq!(
-            owners.close_to("systemmonitorrc").as_deref(),
-            Some("plasma-systemmonitor")
+            owners.close_to("text-editor").as_deref(),
+            Some("gnome-text-editor")
         );
         assert_eq!(owners.close_to("gimp"), None);
     }
@@ -670,5 +820,60 @@ htop /usr/bin/htop
         assert_eq!(of(&owners, "obsidian"), [Owner::AppImage(obsidian)]);
         // A generic part of an id isn't a name to own folders by.
         assert!(of(&owners, "com").is_empty());
+    }
+
+    #[test]
+    fn some_folders_go_by_other_names() {
+        let installed = [info("kconfig"), info("zsh"), info("cmake")];
+        let mut owners = Owners::from_pacman(&installed, "", &HashSet::new());
+        let node = PathBuf::from("/home/me/.nvm/versions/node/v22/bin/node");
+        owners.add_outside_pacman(&OutsidePacman {
+            programs: vec![node.clone()],
+            ..outside()
+        });
+        assert_eq!(of(&owners, "kdeglobals"), [package("kconfig")]);
+        assert_eq!(of(&owners, "Kitware"), [package("cmake")]);
+        for name in [
+            ".zcompdump-host-5.9.zwc",
+            "p10k-dump-me.zsh.tmp.131579",
+            ".histfile",
+        ] {
+            assert_eq!(of(&owners, name), [package("zsh")], "{name}");
+        }
+        assert_eq!(of(&owners, "nextjs-nodejs"), [Owner::Program(node)]);
+        // Only while what owns them is installed.
+        assert!(of(&owners, "qtshadercache-x86_64-little_endian-lp64").is_empty());
+        // A name too common to go by alone still counts as a whole: ~/.net.
+        let owners = Owners::from_pacman(&[info("dotnet")], "", &HashSet::new());
+        assert_eq!(
+            owners.of(Path::new("/home/me/.net"), ".net"),
+            [package("dotnet")]
+        );
+    }
+
+    #[test]
+    fn desktop_folders_and_vole_are_shared() {
+        let owners = Owners::default();
+        for name in [
+            "mimeapps.list",
+            "user-dirs.dirs",
+            "Trash",
+            "vole",
+            "recently-used.xbel",
+        ] {
+            assert_eq!(of(&owners, name), [Owner::Shared], "{name}");
+        }
+    }
+
+    #[test]
+    fn known_owners_own_their_folders() {
+        let mut owners = Owners::default();
+        let tool = PathBuf::from("/home/me/.config/my-tool");
+        owners.add_known([(tool.clone(), "my script".to_string())]);
+        assert_eq!(
+            owners.of(&tool, "my-tool"),
+            [Owner::Known("my script".into())]
+        );
+        assert!(of(&owners, "other-tool").is_empty());
     }
 }

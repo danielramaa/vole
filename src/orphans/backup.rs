@@ -6,13 +6,15 @@
 
 use std::fs::{self, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
 use serde::{Deserialize, Serialize};
 
+use super::configs;
 use crate::date;
 use crate::disk::{self, Mounts};
+use crate::safety::Rules;
 
 /// Where the Backups are, relative to the home directory.
 pub const BACKUPS: &str = ".local/share/vole/backups";
@@ -59,11 +61,7 @@ pub fn list(home: &Path) -> Vec<Backup> {
             continue;
         };
         let dir = entry.path();
-        let entries = fs::read_to_string(dir.join(MANIFEST))
-            .unwrap_or_default()
-            .lines()
-            .filter_map(|line| serde_json::from_str(line).ok())
-            .collect();
+        let entries = read_entries(&dir);
         found.push(Backup {
             dir,
             created,
@@ -72,6 +70,91 @@ pub fn list(home: &Path) -> Vec<Backup> {
     }
     found.sort_by(|a, b| (a.created, &a.dir).cmp(&(b.created, &b.dir)));
     found
+}
+
+/// What the Backup at `dir` lists; lines that can't be read are left out.
+fn read_entries(dir: &Path) -> Vec<Entry> {
+    fs::read_to_string(dir.join(MANIFEST))
+        .unwrap_or_default()
+        .lines()
+        .filter_map(|line| serde_json::from_str(line).ok())
+        .collect()
+}
+
+/// Puts the config `entry` lists in the Backup at `dir` back where it was in `home`, and
+/// returns where. It never overwrites: when something is there now, the config stays in the
+/// Backup. Only places configs are looked for are written to, by the path rules.
+pub fn put_back(home: &Path, rules: &Rules, dir: &Path, entry: &Entry) -> Result<PathBuf, String> {
+    let relative = &entry.path;
+    let shown = format!("~/{}", relative.display());
+    let plain = relative
+        .components()
+        .all(|component| matches!(component, Component::Normal(_)));
+    if relative.as_os_str().is_empty() || !plain {
+        return Err(format!("refused: {shown} is not a path in the home folder"));
+    }
+    let target = home.join(relative);
+    if !configs::is_candidate_path(home, &target) {
+        return Err(format!("refused: {shown} is not where configs are kept"));
+    }
+    let source = dir.join(relative);
+    match fs::symlink_metadata(&source) {
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => {
+            return Err(format!("{shown} isn't in the Backup anymore"));
+        }
+        Err(err) => return Err(format!("{}: {err}", source.display())),
+    }
+    match fs::symlink_metadata(&target) {
+        Ok(_) => return Err(format!("{shown} exists now; move it away to put this back")),
+        Err(err) if err.kind() == ErrorKind::NotFound => {}
+        Err(err) => return Err(format!("{shown}: {err}")),
+    }
+    // The folder it was in may be gone, like ~/.local/state.
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+    }
+    let real = rules
+        .check(&target)
+        .map_err(|refusal| format!("refused: {shown} is {refusal}"))?;
+    fs::rename(&source, &real).map_err(|err| format!("{shown}: {err}"))?;
+    Ok(real)
+}
+
+/// Takes `restored` off the list of the Backup at `dir`. A Backup left listing nothing goes,
+/// with the folders that held what was put back, as long as they are empty.
+pub fn forget(dir: &Path, restored: &[Entry]) -> io::Result<()> {
+    let remaining: Vec<Entry> = read_entries(dir)
+        .into_iter()
+        .filter(|entry| !restored.contains(entry))
+        .collect();
+    if remaining.is_empty() {
+        fs::remove_file(dir.join(MANIFEST))?;
+        return remove_empty_dirs(dir);
+    }
+    let mut text = String::new();
+    for entry in &remaining {
+        text.push_str(&serde_json::to_string(entry)?);
+        text.push('\n');
+    }
+    let rewritten = dir.join(format!("{MANIFEST}.new"));
+    fs::write(&rewritten, text)?;
+    fs::rename(rewritten, dir.join(MANIFEST))
+}
+
+/// Removes `dir` and the folders in it, deepest first, as long as each is empty; anything else
+/// stays, and so do the folders holding it.
+fn remove_empty_dirs(dir: &Path) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_dir() {
+            remove_empty_dirs(&entry.path())?;
+        }
+    }
+    match fs::remove_dir(dir) {
+        Err(err) if err.kind() == ErrorKind::DirectoryNotEmpty => Ok(()),
+        result => result,
+    }
 }
 
 /// When the Backup called `name` was made: its stamp, maybe with `-2` and so on after it.
@@ -272,6 +355,85 @@ mod tests {
 
     fn old_backups(home: &Path, now: SystemTime) -> Vec<OldBackup> {
         old(home, &Mounts::default(), now)
+    }
+
+    fn rules(home: &TestDir) -> Rules {
+        Rules::new(home.path(), configs::ROOTS, &[])
+            .unwrap()
+            .with_loose_dotfiles()
+    }
+
+    #[test]
+    fn puts_configs_back_and_forgets_them() {
+        let home = TestDir::new();
+        home.file(".config/gone/settings", 10);
+        let rc = home.file(".gonerc", 10);
+        let now = UNIX_EPOCH + Duration::from_secs(1_791_207_000);
+        let mut backup = NewBackup::create(home.path(), now).unwrap();
+        let dir = backup.dir().to_path_buf();
+        backup
+            .take(
+                &home.path().join(".config/gone"),
+                Path::new(".config/gone"),
+                4096,
+            )
+            .unwrap();
+        backup.take(&rc, Path::new(".gonerc"), 10).unwrap();
+        let entries = list(home.path())[0].entries.clone();
+
+        let rules = rules(&home);
+        let back = put_back(home.path(), &rules, &dir, &entries[0]).unwrap();
+        assert_eq!(back, home.path().join(".config/gone"));
+        assert!(home.path().join(".config/gone/settings").exists());
+        forget(&dir, &entries[..1]).unwrap();
+        assert_eq!(list(home.path())[0].entries, entries[1..]);
+
+        put_back(home.path(), &rules, &dir, &entries[1]).unwrap();
+        assert!(rc.exists());
+        forget(&dir, &entries[1..]).unwrap();
+        // Nothing left: the Backup goes.
+        assert!(!dir.exists());
+        assert!(list(home.path()).is_empty());
+    }
+
+    #[test]
+    fn never_overwrites_and_refuses_odd_paths() {
+        let home = TestDir::new();
+        home.file(".config/app/settings", 10);
+        let now = UNIX_EPOCH + Duration::from_secs(1_791_207_000);
+        let mut backup = NewBackup::create(home.path(), now).unwrap();
+        let dir = backup.dir().to_path_buf();
+        backup
+            .take(
+                &home.path().join(".config/app"),
+                Path::new(".config/app"),
+                1,
+            )
+            .unwrap();
+        // The program made a new one meanwhile.
+        home.file(".config/app/new", 10);
+        let rules = rules(&home);
+        let entry = |path: &str| Entry {
+            path: path.into(),
+            size: 1,
+        };
+        let err = put_back(home.path(), &rules, &dir, &entry(".config/app")).unwrap_err();
+        assert!(err.contains("exists now"), "{err}");
+        assert!(dir.join(".config/app/settings").exists());
+        for odd in [
+            "../outside",
+            "/etc/passwd",
+            ".config/app/deep",
+            "Documents",
+            ".ssh",
+            "",
+        ] {
+            let err = put_back(home.path(), &rules, &dir, &entry(odd)).unwrap_err();
+            assert!(
+                err.contains("refused") || err.contains("isn't in"),
+                "{odd}: {err}"
+            );
+        }
     }
 
     #[test]

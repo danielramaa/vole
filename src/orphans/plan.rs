@@ -7,6 +7,7 @@
 
 use std::collections::{HashMap, HashSet};
 
+use super::backup::OldBackup;
 use super::configs::OrphanedConfig;
 use super::pacman::{ConfigFile, Info};
 
@@ -61,6 +62,8 @@ pub struct Plan {
     pub configs: Vec<OrphanedConfig>,
     /// Shown next to the configs, e.g. how many paths the safety rules left out.
     pub configs_note: Option<String>,
+    /// The Backups old enough to delete, oldest first.
+    pub backups: Vec<OldBackup>,
 }
 
 impl Plan {
@@ -75,7 +78,9 @@ impl Plan {
     }
 
     pub fn size(&self) -> u64 {
-        self.packages_size() + self.configs.iter().map(|config| config.size).sum::<u64>()
+        let configs: u64 = self.configs.iter().map(|config| config.size).sum();
+        let backups: u64 = self.backups.iter().map(|backup| backup.size).sum();
+        self.packages_size() + configs + backups
     }
 
     pub fn packages_size(&self) -> u64 {
@@ -83,13 +88,10 @@ impl Plan {
     }
 
     pub fn selected_size(&self) -> u64 {
-        self.selected_packages()
-            .map(|package| package.size)
-            .sum::<u64>()
-            + self
-                .selected_configs()
-                .map(|config| config.size)
-                .sum::<u64>()
+        let packages: u64 = self.selected_packages().map(|package| package.size).sum();
+        let configs: u64 = self.selected_configs().map(|config| config.size).sum();
+        let backups: u64 = self.selected_backups().map(|backup| backup.size).sum();
+        packages + configs + backups
     }
 
     pub fn selected_packages(&self) -> impl Iterator<Item = &Package> {
@@ -100,9 +102,27 @@ impl Plan {
         self.configs.iter().filter(|config| config.selected)
     }
 
+    pub fn selected_backups(&self) -> impl Iterator<Item = &OldBackup> {
+        self.backups.iter().filter(|backup| backup.selected)
+    }
+
     /// Whether anything is selected.
     pub fn any_selected(&self) -> bool {
-        self.selected_packages().next().is_some() || self.selected_configs().next().is_some()
+        self.selected_packages().next().is_some()
+            || self.selected_configs().next().is_some()
+            || self.selected_backups().next().is_some()
+    }
+
+    pub fn toggle_backup(&mut self, index: usize) {
+        self.backups[index].selected = !self.backups[index].selected;
+    }
+
+    /// Selects every old Backup, or deselects them all when they already are.
+    pub fn toggle_all_backups(&mut self) {
+        let select = !self.backups.iter().all(|backup| backup.selected);
+        for backup in &mut self.backups {
+            backup.selected = select;
+        }
     }
 
     pub fn toggle_config(&mut self, index: usize) {

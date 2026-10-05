@@ -2,6 +2,9 @@
 //! confirmation, and the result.
 
 use std::io;
+use std::path::PathBuf;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 use std::time::SystemTime;
@@ -13,7 +16,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
-use super::backup::BACKUPS;
+use super::backup::{BACKUPS, OLD_DAYS, OldBackup};
 use super::configs::{Confidence, OrphanedConfig};
 use super::pacman::{ConfigFile, FileState};
 use super::plan::{Package, Plan};
@@ -22,6 +25,7 @@ use crate::app::ModuleScreen;
 use crate::config::Config;
 use crate::disk::Mounts;
 use crate::log::{Log, Outcome};
+use crate::safety::Rules;
 use crate::term::RunRoot;
 use crate::{size, ui};
 
@@ -41,9 +45,17 @@ enum State {
         in_use: bool,
         scroll: u16,
     },
-    /// Confirmed: the configs are moved into a Backup on the next tick.
+    /// Confirmed: the removal starts on the next tick.
     Removing(Plan),
-    /// The configs are moved; `sudo pacman -Rns` waits for the App to lend the terminal.
+    /// The configs and old Backups are being removed on a worker thread.
+    RemovingHome {
+        plan: Plan,
+        receiver: Receiver<Progress>,
+        stop: Arc<AtomicBool>,
+        now: String,
+    },
+    /// The configs and old Backups are done; `sudo pacman -Rns` waits for the App to lend the
+    /// terminal.
     RootPending {
         plan: Plan,
         outcomes: Vec<Outcome>,
@@ -54,6 +66,12 @@ enum State {
         scroll: u16,
     },
     Failed(String),
+}
+
+/// Messages from the removal thread.
+enum Progress {
+    Item(String),
+    Finished(Vec<Outcome>, Log),
 }
 
 impl Screen {
@@ -96,10 +114,10 @@ impl Screen {
         matches!(self.state, State::Removing(_))
     }
 
-    /// Moves the confirmed configs into a Backup. Nothing moves without fresh path rules, the
-    /// mount points and the Operation Log; packages wait for the terminal.
+    /// Starts removing what was confirmed. Nothing is removed without fresh path rules, the mount
+    /// points and the Operation Log; packages wait for the terminal.
     fn remove(&self, plan: Plan) -> State {
-        let prepared = (|| -> Result<_, String> {
+        let prepared = (|| -> Result<(PathBuf, Rules, Mounts, Log), String> {
             let home = dirs::home_dir().ok_or("the home directory could not be found")?;
             let rules = rules(&home, &self.config)
                 .map_err(|err| format!("resolving {}: {err}", home.display()))?;
@@ -108,23 +126,45 @@ impl Screen {
             })?;
             Ok((home, rules, mounts, Log::open_default("orphans")?))
         })();
-        let (home, rules, mounts, mut log) = match prepared {
-            Ok(prepared) => prepared,
-            Err(err) => return State::Failed(format!("Nothing was removed: {err}")),
-        };
-        let now = SystemTime::now();
-        let outcomes = remove::move_configs(&plan, &home, &rules, &mounts, &mut log, now);
-        if plan.selected_packages().next().is_some() {
-            State::RootPending {
-                plan,
-                outcomes,
-                log,
-            }
-        } else {
-            State::Done {
-                outcomes,
-                scroll: 0,
-            }
+        match prepared {
+            Ok((home, rules, mounts, log)) => Self::start_removal(plan, home, rules, mounts, log),
+            Err(err) => State::Failed(format!("Nothing was removed: {err}")),
+        }
+    }
+
+    /// Removes the configs and old Backups on a worker thread, so the screen keeps drawing.
+    fn start_removal(
+        plan: Plan,
+        home: PathBuf,
+        rules: Rules,
+        mounts: Mounts,
+        mut log: Log,
+    ) -> State {
+        let (sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_plan = plan.clone();
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut progress = |done: usize, total: usize, label: &str| {
+                let _ = sender.send(Progress::Item(format!("{label} ({} of {total})", done + 1)));
+            };
+            let outcomes = remove::remove_home(
+                &worker_plan,
+                &home,
+                &rules,
+                &mounts,
+                &mut log,
+                SystemTime::now(),
+                &mut progress,
+                &worker_stop,
+            );
+            let _ = sender.send(Progress::Finished(outcomes, log));
+        });
+        State::RemovingHome {
+            plan,
+            receiver,
+            stop,
+            now: String::new(),
         }
     }
 }
@@ -145,6 +185,50 @@ impl ModuleScreen for Screen {
                 }
             },
             State::Removing(plan) => self.remove(plan),
+            State::RemovingHome {
+                plan,
+                receiver,
+                stop,
+                mut now,
+            } => {
+                loop {
+                    match receiver.try_recv() {
+                        Ok(Progress::Item(label)) => now = label,
+                        Ok(Progress::Finished(mut outcomes, log)) => {
+                            let packages = plan.selected_packages();
+                            if stop.load(Ordering::Relaxed) {
+                                outcomes.extend(packages.map(|package| {
+                                    remove::not_attempted(&package.name, package.size)
+                                }));
+                            } else if packages.count() > 0 {
+                                break State::RootPending {
+                                    plan,
+                                    outcomes,
+                                    log,
+                                };
+                            }
+                            break State::Done {
+                                outcomes,
+                                scroll: 0,
+                            };
+                        }
+                        Err(TryRecvError::Empty) => {
+                            break State::RemovingHome {
+                                plan,
+                                receiver,
+                                stop,
+                                now,
+                            };
+                        }
+                        Err(TryRecvError::Disconnected) => {
+                            break State::Failed(
+                            "The removal stopped unexpectedly; the operation log has what was removed."
+                                .into(),
+                        );
+                        }
+                    }
+                }
+            }
             state => state,
         };
     }
@@ -155,6 +239,12 @@ impl ModuleScreen for Screen {
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
         );
+        if let State::RemovingHome { stop, .. } = &self.state
+            && key.code == KeyCode::Esc
+        {
+            stop.store(true, Ordering::Relaxed);
+            return true;
+        }
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
             State::Ready(mut view) if key.code == KeyCode::Enter => {
@@ -206,7 +296,9 @@ impl ModuleScreen for Screen {
                 };
                 (confirm, true)
             }
-            state @ (State::Removing(_) | State::RootPending { .. }) => (state, true),
+            state @ (State::Removing(_)
+            | State::RemovingHome { .. }
+            | State::RootPending { .. }) => (state, true),
             State::Done { .. } | State::Failed(_) if key.code == KeyCode::Enter => {
                 (State::NotStarted, true)
             }
@@ -231,6 +323,7 @@ impl ModuleScreen for Screen {
             State::Ready(_) => "↑↓/jk move · space select · a select all · enter remove…",
             State::Confirm { in_use: false, .. } => "↑↓ scroll · y remove · n back",
             State::Confirm { in_use: true, .. } => "↑↓ scroll · Y remove anyway · n back",
+            State::RemovingHome { .. } => "esc stop after this Item",
             State::Done { .. } => "↑↓ scroll · enter scan again",
             State::Failed(_) => "enter scan again",
             State::NotStarted
@@ -248,7 +341,10 @@ impl ModuleScreen for Screen {
             | State::Ready(_)
             | State::Done { .. }
             | State::Failed(_) => true,
-            State::Confirm { .. } | State::Removing(_) | State::RootPending { .. } => false,
+            State::Confirm { .. }
+            | State::Removing(_)
+            | State::RemovingHome { .. }
+            | State::RootPending { .. } => false,
         }
     }
 
@@ -299,6 +395,14 @@ impl ModuleScreen for Screen {
             State::Removing(_) | State::RootPending { .. } => {
                 frame.render_widget(Paragraph::new("Removing…").block(block), area)
             }
+            State::RemovingHome { now, stop, .. } => {
+                let text = if stop.load(Ordering::Relaxed) {
+                    format!("Stopping after {now}…")
+                } else {
+                    format!("Removing {now}…")
+                };
+                frame.render_widget(Paragraph::new(text).block(block), area)
+            }
             State::Done { outcomes, scroll } => {
                 ui::draw_outcomes(frame, area, block, outcomes, scroll)
             }
@@ -317,6 +421,7 @@ fn draw_confirm(
     let bold = Style::new().add_modifier(Modifier::BOLD);
     let packages: Vec<&Package> = plan.selected_packages().collect();
     let configs: Vec<&OrphanedConfig> = plan.selected_configs().collect();
+    let backups: Vec<&OldBackup> = plan.selected_backups().collect();
     let width = usize::from(block.inner(area).width);
     let mut lines = Vec::new();
     if in_use {
@@ -329,7 +434,7 @@ fn draw_confirm(
             "Moving them can make those programs misbehave. Press Y (shift+y) to move them anyway.",
         ));
     } else {
-        lines.push(Line::styled(question(&packages, &configs), bold));
+        lines.push(Line::styled(question(&packages, &configs, &backups), bold));
         if !packages.is_empty() {
             lines.push(Line::from(
                 "vole pauses so sudo can ask for your password; pacman then asks once more.",
@@ -347,6 +452,9 @@ fn draw_confirm(
             lines.push(Line::from(format!(
                 "Configs aren't deleted: they move into a dated Backup in ~/{BACKUPS}/."
             )));
+        }
+        if !backups.is_empty() {
+            lines.push(Line::from("Old Backups are deleted for good."));
         }
     }
     lines.push(Line::default());
@@ -368,39 +476,53 @@ fn draw_confirm(
         }
         lines.push(ui::right_aligned(spans, size::format(config.size), width));
     }
+    for backup in &backups {
+        let label = vec![Span::raw(format!("  {}", backup.label))];
+        lines.push(ui::right_aligned(label, size::format(backup.size), width));
+    }
     ui::draw_scrolled(frame, area, block, lines, scroll);
 }
 
 /// What the confirmation asks: `Remove these 2 packages, freeing about 3 MiB, and move this
 /// config into a Backup?`
-fn question(packages: &[&Package], configs: &[&OrphanedConfig]) -> String {
-    let freed: u64 = packages.iter().map(|package| package.size).sum();
-    let packages = match packages.len() {
-        0 => None,
-        1 => Some(format!(
-            "Remove this package, freeing about {}",
-            size::format(freed)
+fn question(packages: &[&Package], configs: &[&OrphanedConfig], backups: &[&OldBackup]) -> String {
+    let freed = |sizes: &mut dyn Iterator<Item = u64>| size::format(sizes.sum());
+    let mut parts = Vec::new();
+    match packages.len() {
+        0 => {}
+        1 => parts.push(format!(
+            "remove this package, freeing about {}",
+            freed(&mut packages.iter().map(|p| p.size))
         )),
-        count => Some(format!(
-            "Remove these {count} packages, freeing about {}",
-            size::format(freed)
+        count => parts.push(format!(
+            "remove these {count} packages, freeing about {}",
+            freed(&mut packages.iter().map(|p| p.size))
         )),
-    };
-    let configs = match configs.len() {
-        0 => None,
-        1 => Some("move this config into a Backup".to_string()),
-        count => Some(format!("move these {count} configs into a Backup")),
-    };
-    match (packages, configs) {
-        (Some(packages), Some(configs)) => format!("{packages}, and {configs}?"),
-        (Some(packages), None) => format!("{packages}?"),
-        (None, Some(configs)) => {
-            let mut configs = configs;
-            configs[..1].make_ascii_uppercase();
-            format!("{configs}?")
-        }
-        (None, None) => String::new(),
     }
+    match configs.len() {
+        0 => {}
+        1 => parts.push("move this config into a Backup".into()),
+        count => parts.push(format!("move these {count} configs into a Backup")),
+    }
+    match backups.len() {
+        0 => {}
+        1 => parts.push(format!(
+            "delete this old Backup, freeing about {}",
+            freed(&mut backups.iter().map(|b| b.size))
+        )),
+        count => parts.push(format!(
+            "delete these {count} old Backups, freeing about {}",
+            freed(&mut backups.iter().map(|b| b.size))
+        )),
+    }
+    let mut text = match parts.split_last() {
+        None => return String::new(),
+        Some((last, [])) => last.clone(),
+        Some((last, rest)) => format!("{}, and {last}", rest.join(", ")),
+    };
+    text[..1].make_ascii_uppercase();
+    text.push('?');
+    text
 }
 
 /// A row of the Plan list.
@@ -412,9 +534,13 @@ enum Row {
     /// The heading of the Orphaned Configs.
     Configs,
     Config(usize),
+    /// The heading of the old Backups, shown only when there are some.
+    Backups,
+    Backup(usize),
 }
 
-/// The Plan as a list: the Orphaned Packages under their heading, then the Orphaned Configs.
+/// The Plan as a list: the Orphaned Packages under their heading, then the Orphaned Configs, then
+/// any old Backups.
 struct PlanView {
     plan: Plan,
     rows: Vec<Row>,
@@ -427,6 +553,10 @@ impl PlanView {
         rows.extend((0..plan.packages.len()).map(Row::Package));
         rows.push(Row::Configs);
         rows.extend((0..plan.configs.len()).map(Row::Config));
+        if !plan.backups.is_empty() {
+            rows.push(Row::Backups);
+            rows.extend((0..plan.backups.len()).map(Row::Backup));
+        }
         Self {
             plan,
             rows,
@@ -449,11 +579,14 @@ impl PlanView {
                 Some(Row::Packages) => self.plan.toggle_all_packages(),
                 Some(Row::Config(config)) => self.plan.toggle_config(config),
                 Some(Row::Configs) => self.plan.toggle_all_configs(),
+                Some(Row::Backup(backup)) => self.plan.toggle_backup(backup),
+                Some(Row::Backups) => self.plan.toggle_all_backups(),
                 None => {}
             },
             KeyCode::Char('a') => match self.current() {
                 Some(Row::Packages | Row::Package(_)) => self.plan.toggle_all_packages(),
                 Some(Row::Configs | Row::Config(_)) => self.plan.toggle_all_configs(),
+                Some(Row::Backups | Row::Backup(_)) => self.plan.toggle_all_backups(),
                 None => {}
             },
             _ => return false,
@@ -478,6 +611,8 @@ impl PlanView {
                 Row::Package(i) => self.item(i, width, height),
                 Row::Configs => ListItem::new(self.configs_heading(width)),
                 Row::Config(i) => ListItem::new(self.config_line(i, width)),
+                Row::Backups => ListItem::new(self.backups_heading(width)),
+                Row::Backup(i) => ListItem::new(self.backup_line(i, width)),
             })
             .collect();
         let list = List::new(items)
@@ -523,6 +658,35 @@ impl PlanView {
         }
         let total = self.plan.configs.iter().map(|config| config.size).sum();
         ui::right_aligned(spans, size::format(total), width)
+    }
+
+    fn backups_heading(&self, width: usize) -> Line<'static> {
+        let spans = vec![
+            Span::styled("Old Backups", Style::new().add_modifier(Modifier::BOLD)),
+            Span::styled(
+                format!("  {OLD_DAYS} days old or more"),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ];
+        let total = self.plan.backups.iter().map(|backup| backup.size).sum();
+        ui::right_aligned(spans, size::format(total), width)
+    }
+
+    fn backup_line(&self, index: usize, width: usize) -> Line<'static> {
+        let backup = &self.plan.backups[index];
+        let check = if backup.selected { "[x]" } else { "[ ]" };
+        let configs = match backup.configs {
+            1 => "1 config".to_string(),
+            count => format!("{count} configs"),
+        };
+        let spans = vec![
+            Span::raw(format!("  {check} {}", backup.label)),
+            Span::styled(
+                format!(" · {configs}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ];
+        ui::right_aligned(spans, size::format(backup.size), width)
     }
 
     fn config_line(&self, index: usize, width: usize) -> Line<'static> {
@@ -901,15 +1065,63 @@ mod tests {
             panic!("no plan");
         };
         let one: Vec<&OrphanedConfig> = view.plan.configs.iter().take(1).collect();
+        let old = OldBackup {
+            path: "/home/me/.local/share/vole/backups/2026-08-01T00-00-00Z".into(),
+            label: "Backup from 1 Aug 2026, 00:00 UTC".into(),
+            configs: 2,
+            size: 4096,
+            selected: true,
+        };
         assert_eq!(
-            question(&[&a], &[]),
+            question(&[&a], &[], &[]),
             "Remove this package, freeing about 1.0 KiB?"
         );
-        assert_eq!(question(&[], &one), "Move this config into a Backup?");
+        assert_eq!(question(&[], &one, &[]), "Move this config into a Backup?");
         assert_eq!(
-            question(&[&a, &b], &one),
+            question(&[&a, &b], &one, &[]),
             "Remove these 2 packages, freeing about 2.0 KiB, and move this config into a Backup?"
         );
+        assert_eq!(
+            question(&[&a], &one, &[&old]),
+            "Remove this package, freeing about 1.0 KiB, move this config into a Backup, \
+             and delete this old Backup, freeing about 4.0 KiB?"
+        );
+    }
+
+    #[test]
+    fn old_backups_are_listed_and_selected_on_their_own() {
+        let old = |day: u32, size| OldBackup {
+            path: format!("/home/me/.local/share/vole/backups/2026-08-0{day}T00-00-00Z").into(),
+            label: format!("Backup from {day} Aug 2026, 00:00 UTC"),
+            configs: 2,
+            size,
+            selected: false,
+        };
+        let mut screen = Screen::with_plan(Plan {
+            backups: vec![old(1, 4096), old(2, 1024)],
+            ..Plan::default()
+        });
+        let rows = render(&mut screen, 90, 9);
+        assert!(
+            rows[3].contains("Old Backups  30 days old or more"),
+            "{rows:#?}"
+        );
+        assert!(rows[4].contains("[ ] Backup from 1 Aug 2026, 00:00 UTC · 2 configs"));
+        // Packages, configs, the backups' heading, then the first backup.
+        for _ in 0..3 {
+            press(&mut screen, KeyCode::Char('j'));
+        }
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(selected_size(&screen), 4096);
+        press(&mut screen, KeyCode::Char('a'));
+        assert_eq!(selected_size(&screen), 5120);
+        press(&mut screen, KeyCode::Enter);
+        let rows = render(&mut screen, 90, 9).join("\n");
+        assert!(
+            rows.contains("Delete these 2 old Backups, freeing about 5.0 KiB?"),
+            "{rows}"
+        );
+        assert!(rows.contains("Old Backups are deleted for good."));
     }
 
     #[test]

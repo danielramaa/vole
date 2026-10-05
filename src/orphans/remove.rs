@@ -1,13 +1,102 @@
-//! Applying the Plan: removing the selected packages with `sudo pacman -Rns`, and writing each
-//! one to the Operation Log.
+//! Applying the Plan: moving the selected configs into a Backup, removing the selected packages
+//! with `sudo pacman -Rns`, and writing each one to the Operation Log.
 
 use std::collections::{BTreeSet, HashSet};
-use std::io;
+use std::fs;
+use std::io::{self, ErrorKind};
+use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
+use super::backup::{BACKUPS, NewBackup};
+use super::configs::{self, OrphanedConfig};
 use super::pacman::{self, PACMAN};
 use super::plan::{Package, Plan};
+use crate::disk::Mounts;
 use crate::log::{Log, Outcome};
+use crate::safety::Rules;
 use crate::term::{self, RunRoot};
+
+/// What the Operation Log calls a config moved into a Backup.
+const CONFIG: &str = "orphaned config";
+
+/// Moves the selected configs into a new Backup in `home`, each after a last safety check, and
+/// writes each to `log`. The Backup is made with the first config that moves, so when none
+/// does, there is none.
+pub fn move_configs(
+    plan: &Plan,
+    home: &Path,
+    rules: &Rules,
+    mounts: &Mounts,
+    log: &mut Log,
+    now: SystemTime,
+) -> Vec<Outcome> {
+    let mut backup = None;
+    let mut outcomes = Vec::new();
+    for config in plan.selected_configs() {
+        let target = config.path.display().to_string();
+        let (label, size) = (&config.label, config.size);
+        outcomes.push(
+            match move_config(config, home, rules, mounts, &mut backup, now) {
+                Ok(Some(to)) => {
+                    let to = to.display().to_string();
+                    log.record_moved(label, CONFIG, size, &target, &to, Ok(()))
+                }
+                // Already gone: nothing left to keep.
+                Ok(None) => log.record(label, CONFIG, size, &target, Ok(())),
+                Err(err) => log.record(label, CONFIG, size, &target, Err(err)),
+            },
+        );
+    }
+    outcomes
+}
+
+/// Moves one config into `backup`, creating the Backup first when there is none yet. Returns
+/// where it went, or `None` when it was already gone.
+fn move_config(
+    config: &OrphanedConfig,
+    home: &Path,
+    rules: &Rules,
+    mounts: &Mounts,
+    backup: &mut Option<NewBackup>,
+    now: SystemTime,
+) -> Result<Option<PathBuf>, String> {
+    let path = &config.path;
+    let refused = |why: &str| Err(format!("refused: {} {why}", path.display()));
+    if !configs::is_candidate_path(home, path) {
+        return refused("is not where configs are looked for");
+    }
+    if home.join(BACKUPS).starts_with(path) {
+        return refused("holds vole's Backups");
+    }
+    let real = rules
+        .check(path)
+        .map_err(|refusal| format!("refused: {} is {refusal}", path.display()))?;
+    if mounts.contains(&real) {
+        return refused("is a mount point");
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_symlink() => return refused("is a symlink now"),
+        Ok(_) => {}
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(None),
+        Err(err) => return Err(format!("{}: {err}", path.display())),
+    }
+    let Ok(relative) = path.strip_prefix(home) else {
+        return refused("is outside the home folder");
+    };
+    let backup = match backup {
+        Some(backup) => backup,
+        None => backup.insert(
+            NewBackup::create(home, now).map_err(|err| format!("creating a Backup: {err}"))?,
+        ),
+    };
+    match backup.take(&real, relative, config.size) {
+        Ok(to) => Ok(Some(to)),
+        Err(err) if err.kind() == ErrorKind::CrossesDevices => {
+            refused("is on another filesystem than the Backups, so it stays")
+        }
+        Err(err) => Err(format!("{}: {err}", path.display())),
+    }
+}
 
 /// What removing asks pacman, as the user, so tests can stand in for it.
 pub trait Pacman {
@@ -33,13 +122,13 @@ impl Pacman for System {
 /// Removes the selected packages with one `sudo pacman -Rns`, once pacman says it would remove
 /// exactly those, and writes each package to `log`. Also returns whether the TUI could be
 /// paused and brought back for it.
-pub fn remove(
+pub fn remove_packages(
     plan: &Plan,
     log: &mut Log,
     run_root: &mut RunRoot,
     pacman: &dyn Pacman,
 ) -> (Vec<Outcome>, io::Result<()>) {
-    let packages: Vec<&Package> = plan.selected().collect();
+    let packages: Vec<&Package> = plan.selected_packages().collect();
     if packages.is_empty() {
         return (Vec::new(), Ok(()));
     }
@@ -193,7 +282,7 @@ mod tests {
             commands.extend(run.iter().map(term::describe));
             ran.take().unwrap()()
         };
-        let (outcomes, terminal) = remove(plan, &mut log, &mut run_root, pacman);
+        let (outcomes, terminal) = remove_packages(plan, &mut log, &mut run_root, pacman);
         Run {
             dir,
             commands,

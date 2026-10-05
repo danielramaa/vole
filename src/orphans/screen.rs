@@ -187,9 +187,31 @@ impl PlanView {
     }
 
     fn line(&self, index: usize, width: usize) -> Line<'static> {
+        let dim = Style::new().add_modifier(Modifier::DIM);
         let package = &self.plan.packages[index];
         let check = if package.selected { "[x]" } else { "[ ]" };
-        let spans = vec![Span::raw(format!("  {check} {}", package.name))];
+        let indent = if package.nested { "      " } else { "  " };
+        let mut spans = vec![Span::raw(format!("{indent}{check} {}", package.name))];
+        if !package.also_needs.is_empty() {
+            let verb = if package.also_needs.len() == 1 {
+                "is"
+            } else {
+                "are"
+            };
+            spans.push(Span::styled(
+                format!(
+                    "  once {} {verb} removed too",
+                    package.also_needs.join(", ")
+                ),
+                dim,
+            ));
+        }
+        if !package.optional_for.is_empty() {
+            spans.push(Span::styled(
+                format!("  still optional for {}", package.optional_for.join(", ")),
+                dim,
+            ));
+        }
         ui::right_aligned(spans, size::format(package.size), width)
     }
 }
@@ -200,13 +222,8 @@ mod tests {
     use crate::orphans::plan::Package;
 
     fn screen() -> Screen {
-        let package = |name: &str, size| Package {
-            name: name.into(),
-            size,
-            selected: false,
-        };
         Screen::with_plan(Plan {
-            packages: vec![package("a", 10), package("b", 20)],
+            packages: vec![Package::new("a", 10), Package::new("b", 20)],
         })
     }
 

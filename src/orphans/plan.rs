@@ -27,6 +27,8 @@ pub struct Package {
     pub selected: bool,
     /// The packages of the Plan that depend on this one.
     required_by: Vec<usize>,
+    /// The packages of the Plan this one depends on.
+    depends: Vec<usize>,
     /// What must be removed before this package is an orphan: the packages that depend on it,
     /// or, when none do, the ones that list it as an optional dependency.
     needs: Vec<usize>,
@@ -43,6 +45,7 @@ impl Package {
             backup: Vec::new(),
             selected: false,
             required_by: Vec::new(),
+            depends: Vec::new(),
             needs: Vec::new(),
         }
     }
@@ -96,26 +99,20 @@ impl Plan {
     /// along with them.
     fn select(&mut self, index: usize) {
         let mut selected = self.selection();
-        selected[index] = true;
-        loop {
-            let before = selected.clone();
-            for (p, package) in self.packages.iter().enumerate() {
-                if before[p] {
-                    for &q in &package.needs {
-                        selected[q] = true;
-                    }
-                }
-            }
-            selected = self.removed_with(&selected);
-            if selected == before {
-                break;
+        let mut going = vec![index];
+        while let Some(p) = going.pop() {
+            if !std::mem::replace(&mut selected[p], true) {
+                going.extend(&self.packages[p].needs);
             }
         }
+        // What -s takes along needs nothing else: everything depending on it goes already.
+        let selected = self.removed_by_pacman(&selected);
         self.set_selection(&selected);
     }
 
-    /// Deselects a package, the packages that can't go while it stays, and enough of the
-    /// packages that depend on it that `pacman -Rns` doesn't take it along with them.
+    /// Deselects a package and the packages that can't go while it stays. When `pacman -Rns`
+    /// would still take one of them along, since everything depending on it goes, the selected
+    /// packages depending on it stay too.
     fn deselect(&mut self, index: usize) {
         let mut selected = self.selection();
         let mut staying = vec![index];
@@ -127,7 +124,7 @@ impl Plan {
                         .filter(|&t| selected[t] && self.packages[t].needs.contains(&p)),
                 );
             }
-            let removed = self.removed_with(&selected);
+            let removed = self.removed_by_pacman(&selected);
             let taken: Vec<usize> = (0..removed.len())
                 .filter(|&p| removed[p] && !selected[p])
                 .collect();
@@ -156,29 +153,28 @@ impl Plan {
     }
 
     /// What `pacman -Rns` removes when given `targets`. Nothing outside the Plan depends on a
-    /// package in it, so the Plan alone is enough to work it out.
-    fn removed_with(&self, targets: &[bool]) -> Vec<bool> {
-        let mut depends = vec![Vec::new(); self.packages.len()];
-        for (p, package) in self.packages.iter().enumerate() {
-            for &t in &package.required_by {
-                depends[t].push(p);
-            }
-        }
-        removed_with(&depends, &vec![true; depends.len()], targets)
+    /// package in it, and all of them were installed as dependencies, so the Plan alone is
+    /// enough to work it out.
+    fn removed_by_pacman(&self, targets: &[bool]) -> Vec<bool> {
+        removed_with(|p| self.packages[p].depends.as_slice(), |_| true, targets)
     }
 }
 
 /// What `pacman -Rns` removes when given `targets`, the way libalpm's `_alpm_recursedeps` works
 /// it out: the targets, and every package installed as a dependency (`removable`) that they
 /// lead to through dependencies, except what a package that stays still depends on, directly or
-/// through others. `depends[p]` are the packages `p` depends on.
-fn removed_with(depends: &[Vec<usize>], removable: &[bool], targets: &[bool]) -> Vec<bool> {
-    let n = depends.len();
+/// through others. `depends(p)` are the packages `p` depends on.
+fn removed_with<'a>(
+    depends: impl Fn(usize) -> &'a [usize],
+    removable: impl Fn(usize) -> bool,
+    targets: &[bool],
+) -> Vec<bool> {
+    let n = targets.len();
     let mut candidate = vec![false; n];
     let mut stack: Vec<usize> = (0..n).filter(|&p| targets[p]).collect();
     while let Some(p) = stack.pop() {
-        for &d in &depends[p] {
-            if removable[d] && !targets[d] && !candidate[d] {
+        for &d in depends(p) {
+            if removable(d) && !targets[d] && !candidate[d] {
                 candidate[d] = true;
                 stack.push(d);
             }
@@ -186,7 +182,7 @@ fn removed_with(depends: &[Vec<usize>], removable: &[bool], targets: &[bool]) ->
     }
     let mut stack: Vec<usize> = (0..n).filter(|&p| !targets[p] && !candidate[p]).collect();
     while let Some(p) = stack.pop() {
-        for &d in &depends[p] {
+        for &d in depends(p) {
             if candidate[d] {
                 candidate[d] = false;
                 stack.push(d);
@@ -262,7 +258,11 @@ impl<'a> System<'a> {
             }
         }
         loop {
-            chain = removed_with(&self.depends, &self.removable, &chain);
+            chain = removed_with(
+                |p| self.depends[p].as_slice(),
+                |p| self.removable[p],
+                &chain,
+            );
             let next: Vec<usize> = (0..n)
                 .filter(|&p| !chain[p] && self.is_orphan(p, &chain))
                 .collect();
@@ -370,6 +370,11 @@ impl<'a> System<'a> {
                     .map(|&q| name(q).to_string())
                     .collect(),
                 required_by: positions(&self.required_by[p]),
+                depends: self.depends[p]
+                    .iter()
+                    .filter(|&&q| chain[q])
+                    .map(|q| position[q])
+                    .collect(),
                 needs: positions(self.needs(p)),
                 ..Package::new(name(p), self.infos[p].size)
             })

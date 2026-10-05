@@ -7,7 +7,7 @@ vole brings the pacman cache, AUR helper cache, systemd journal, user caches, or
 It's inspired by [Mole](https://github.com/tw93/Mole) on macOS, but built for Arch: it knows about pacman, the AUR and systemd instead of treating Linux as generic.
 
 > [!WARNING]
-> **vole is in early development.** `vole clean` and the orphaned packages in `vole orphans` work; the rest is still to come. See [Status](#status) for what works today and [ROADMAP.md](ROADMAP.md) for what's next.
+> **vole is in early development.** `vole clean`, `vole orphans` and `vole restore` work; `analyze` and `status` are still to come. See [Status](#status) for what works today and [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -33,6 +33,7 @@ The alternatives are separate tools (gdu, btop, paccache), scripts without a rea
 |---|---|
 | **`clean`** | Frees space from the pacman cache (keeps the last 2 versions of each installed package), the AUR helper cache, the systemd journal (shrunk to 200 MB), developer caches (pip, npm, cargo, go), everything else in `~/.cache`, and the trash. |
 | **`orphans`** | Finds **orphaned packages** (including packages that only become orphans once others are removed) and **orphaned configs**: folders in `~/.config`, `~/.local/share`, `~/.local/state`, `~/.cache` and dotfiles in `~` that no installed program owns. |
+| **`restore`** | Puts orphaned configs you removed back where they were, from their dated backup. |
 | **`analyze`** | An interactive disk explorer, like ncdu or gdu. Covers the whole filesystem on the current disk. You can delete files in your home folder; outside it, vole shows the safe way to free the space. |
 | **`status`** | A real-time dashboard read from `/proc` and `/sys`: CPU per core, memory, disk, network, temperatures, top processes, battery, and a system-health panel (cache sizes, orphans, journal size, pending updates). |
 
@@ -42,20 +43,21 @@ vole starts from `pacman -Qdtq`: packages installed as dependencies that nothing
 
 ### How orphaned configs are detected
 
-A folder such as `~/.config/foo` is an **orphan** when no **owner** claims it. vole checks:
+vole looks at what is directly in `~/.config`, `~/.local/share`, `~/.local/state` and `~/.cache`, and at the dotfiles directly in `~` (symlinks are left alone). One such as `~/.config/foo` is an **orphan** when no **owner** claims it. A folder goes by more than its name (`dolphinstaterc` is `dolphin`'s, `org.kde.dolphin` too, `.python_history` is `python`'s), and vole checks:
 
-1. **pacman packages**: package names, their binaries, their `.desktop` files, and files that mention the folder
-2. **Flatpaks**, binaries in `~/.local/bin` and `~/.cargo/bin`, and **AppImages**
-3. a built-in list of known name mismatches (e.g. `~/.mozilla` → `firefox`, `~/.config/Code` → VS Code)
-4. your own **Known Owners** file, for anything vole can't work out
+1. **pacman packages**: package names, the programs they install, their `.desktop` files, and the files they install whose path names the folder (like `/usr/share/fish` for `~/.config/fish`)
+2. **programs outside pacman**: on your `$PATH` and in `~/.local/bin` and `~/.cargo/bin`; a folder holding a folder on your `$PATH` (like `~/.nvm`) is in use too
+3. **Flatpaks**, **AppImages** and your own **desktop entries** whose program exists
+4. a built-in list of folders not named after their owner (e.g. `~/.config/Kitware` → `cmake`, `kdeglobals` → KDE), and of folders that are part of the desktop (`mimeapps.list`, `user-dirs.dirs`, …)
+5. your own **Known Owners** file, for anything vole can't work out (see [Configuration](#configuration))
 
 Detection is a heuristic, so each orphan gets a **confidence** level:
 
-- **High**: no owner, unchanged for months
-- **Medium**: no owner, but changed recently or the name is close to an installed package
+- **High**: no owner, unchanged for 3 months
+- **Medium**: no owner, but changed in the last 3 months or the name is close to something installed
 - **Low**: loose dotfiles directly in `~`
 
-Removed orphaned configs aren't deleted. They go into a dated **backup** that you can restore. When you remove a package, vole also offers its leftover configs straight away.
+Removed orphaned configs aren't deleted. They move into a dated **backup** in `~/.local/share/vole/backups/`, which `vole restore` puts back where they were; it never overwrites anything there now. Backups 30 days old or more show up in later Plans, to delete for good. When you remove a package, vole also offers its leftover configs straight away.
 
 ## Safety
 
@@ -95,8 +97,8 @@ Only validated numbers from your config reach those commands, never free text, s
 | **M1**: `clean` shows the Plan | ✅ Done ([#2](https://github.com/danielramaa/vole/issues/2)) |
 | **M2**: `clean` removes selected items | ✅ Done ([#3](https://github.com/danielramaa/vole/issues/3)) |
 | **M3**: `orphans`, packages | ✅ Done ([#4](https://github.com/danielramaa/vole/issues/4)) |
-| **M4**: `orphans`, configs and backups | ⏳ Next ([#5](https://github.com/danielramaa/vole/issues/5)) |
-| **M5**: `analyze` | [#6](https://github.com/danielramaa/vole/issues/6) |
+| **M4**: `orphans`, configs and backups | ✅ Done ([#5](https://github.com/danielramaa/vole/issues/5)) |
+| **M5**: `analyze` | ⏳ Next ([#6](https://github.com/danielramaa/vole/issues/6)) |
 | **M6**: `status` | [#7](https://github.com/danielramaa/vole/issues/7) |
 | **M7**: AUR release | [#8](https://github.com/danielramaa/vole/issues/8) |
 
@@ -119,6 +121,7 @@ cargo build --release
 vole            # open the menu
 vole clean      # open a module directly
 vole orphans
+vole restore
 vole analyze
 vole status
 vole --help
@@ -145,9 +148,17 @@ In `orphans`:
 
 | Key | Action |
 |---|---|
-| `Space` | Select or deselect the package (on the heading, all of them), together with the packages that go or stay with it |
-| `a` | Select or deselect every package |
-| `Enter` | Review the selection, then `y` to remove it with `sudo pacman -Rns` (pacman lists the packages again and asks once more) or `n` to go back |
+| `Space` | Select or deselect the package, config or old backup (on a heading, all of them). A package goes or stays together with the packages it takes along. |
+| `a` | Select or deselect everything in the current section |
+| `Enter` | Review the selection, then `y` to remove it or `n` to go back. Configs move into a backup; packages go with `sudo pacman -Rns` (pacman lists them again and asks once more). If a config is in use by a running program, it takes `Y` (shift+y) on a second screen. While moving configs and deleting backups, `Esc` stops after the current one. |
+
+In `restore`:
+
+| Key | Action |
+|---|---|
+| `Space` | Select or deselect the config (on a backup, all its configs) |
+| `a` | Select or deselect every config of the current backup |
+| `Enter` | Review the selection, then `y` to put it back or `n` to go back |
 
 ## Configuration
 
@@ -165,6 +176,13 @@ status_refresh_ms = 1000
 
 # Extra paths for the Protected List, absolute or starting with ~/
 protected_paths = []
+```
+
+Your **Known Owners** go in `~/.config/vole/known-owners.toml`: which folder belongs to what, for folders vole can't work out itself. A folder listed there is never an orphan, so like `protected_paths` the file can only keep things from being proposed.
+
+```toml
+"~/.config/my-tool" = "my-tool, installed by hand in ~/apps"
+"~/.local/share/my-game" = "the game in ~/Games"
 ```
 
 ## Development

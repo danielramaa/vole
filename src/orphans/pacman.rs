@@ -72,6 +72,14 @@ pub fn installed() -> Result<Vec<Info>> {
     Ok(parse_info(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// Every file installed packages own, as `pacman -Ql` lists them: `<package> <path>` per line,
+/// folders ending with `/`.
+pub fn files() -> Result<String> {
+    let output = query(&["-Ql"])?;
+    check(&output)?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// The config files of the packages `names` (`pacman -Qii`).
 pub fn config_files(names: &[&str]) -> Result<Vec<Info>> {
     let mut args = vec!["-Qii", "--"];

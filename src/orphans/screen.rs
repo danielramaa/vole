@@ -13,15 +13,18 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::build_plan;
+use super::configs::Confidence;
 use super::pacman::{ConfigFile, FileState};
 use super::plan::{Package, Plan};
 use super::remove;
 use crate::app::ModuleScreen;
+use crate::config::Config;
 use crate::log::{Log, Outcome};
 use crate::term::RunRoot;
 use crate::{size, ui};
 
 pub struct Screen {
+    config: Config,
     state: State,
 }
 
@@ -45,17 +48,21 @@ enum State {
 }
 
 impl Screen {
-    pub fn new() -> Self {
+    pub fn new(config: &Config) -> Self {
         Self {
+            config: config.clone(),
             state: State::NotStarted,
         }
     }
 
     /// Starts building the Plan in the background.
-    fn start() -> Receiver<Result<Plan, String>> {
+    fn start(config: Config) -> Receiver<Result<Plan, String>> {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
-            let plan = build_plan().map_err(|err| format!("{err:#}"));
+            let plan = match dirs::home_dir() {
+                Some(home) => build_plan(&home, &config).map_err(|err| format!("{err:#}")),
+                None => Err("the home directory could not be found".into()),
+            };
             // The user may have left the screen already; then nobody is listening.
             let _ = sender.send(plan);
         });
@@ -65,6 +72,7 @@ impl Screen {
     #[cfg(test)]
     pub fn with_plan(plan: Plan) -> Self {
         Self {
+            config: Config::default(),
             state: State::Ready(PlanView::new(plan)),
         }
     }
@@ -80,7 +88,7 @@ impl ModuleScreen for Screen {
     fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
-            State::NotStarted => State::Scanning(Self::start()),
+            State::NotStarted => State::Scanning(Self::start(self.config.clone())),
             State::Scanning(receiver) => match receiver.try_recv() {
                 Ok(Ok(plan)) => State::Ready(PlanView::new(plan)),
                 Ok(Err(err)) => {
@@ -254,36 +262,56 @@ fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, scroll
     ui::draw_scrolled(frame, area, block, lines, scroll);
 }
 
-/// The Plan as a list: a heading row, then one row per package.
+/// A row of the Plan list.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Row {
+    /// The heading of the Orphaned Packages.
+    Packages,
+    Package(usize),
+    /// The heading of the Orphaned Configs.
+    Configs,
+    Config(usize),
+}
+
+/// The Plan as a list: the Orphaned Packages under their heading, then the Orphaned Configs.
 struct PlanView {
     plan: Plan,
+    rows: Vec<Row>,
     list: ListState,
 }
 
 impl PlanView {
     fn new(plan: Plan) -> Self {
+        let mut rows = vec![Row::Packages];
+        rows.extend((0..plan.packages.len()).map(Row::Package));
+        rows.push(Row::Configs);
+        rows.extend((0..plan.configs.len()).map(Row::Config));
         Self {
             plan,
+            rows,
             list: ListState::default().with_selected(Some(0)),
         }
     }
 
-    /// The package on the current row; `None` on the heading.
-    fn current(&self) -> Option<usize> {
-        self.list.selected()?.checked_sub(1)
+    fn current(&self) -> Option<Row> {
+        self.list.selected().and_then(|i| self.rows.get(i)).copied()
     }
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
-        let last = self.plan.packages.len();
+        let last = self.rows.len().saturating_sub(1);
         let index = self.list.selected().unwrap_or(0).min(last);
+        let on_packages = matches!(self.current(), Some(Row::Packages | Row::Package(_)));
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => self.list.select(Some((index + 1).min(last))),
             KeyCode::Up | KeyCode::Char('k') => self.list.select(Some(index.saturating_sub(1))),
             KeyCode::Char(' ') => match self.current() {
-                Some(package) => self.plan.toggle(package),
-                None => self.plan.toggle_all(),
+                Some(Row::Package(package)) => self.plan.toggle(package),
+                Some(Row::Packages) => self.plan.toggle_all(),
+                // The Orphaned Configs are only listed for now.
+                Some(Row::Configs | Row::Config(_)) | None => {}
             },
-            KeyCode::Char('a') => self.plan.toggle_all(),
+            KeyCode::Char('a') if on_packages => self.plan.toggle_all(),
+            KeyCode::Char('a') => {}
             _ => return false,
         }
         true
@@ -298,8 +326,16 @@ impl PlanView {
         // Room for the highlight symbol.
         let width = usize::from(list_area.width).saturating_sub(2);
         let height = usize::from(list_area.height).max(1);
-        let mut items = vec![ListItem::new(self.heading(width))];
-        items.extend((0..self.plan.packages.len()).map(|i| self.item(i, width, height)));
+        let items: Vec<ListItem> = self
+            .rows
+            .iter()
+            .map(|&row| match row {
+                Row::Packages => ListItem::new(self.packages_heading(width)),
+                Row::Package(i) => self.item(i, width, height),
+                Row::Configs => ListItem::new(self.configs_heading(width)),
+                Row::Config(i) => ListItem::new(self.config_line(i, width)),
+            })
+            .collect();
         let list = List::new(items)
             .highlight_style(Style::new().add_modifier(Modifier::REVERSED))
             .highlight_symbol("> ");
@@ -316,19 +352,56 @@ impl PlanView {
         );
     }
 
-    fn heading(&self, width: usize) -> Line<'static> {
-        let mut spans = vec![Span::styled(
+    fn packages_heading(&self, width: usize) -> Line<'static> {
+        let spans = vec![Span::styled(
             "Orphaned packages",
             Style::new().add_modifier(Modifier::BOLD),
         )];
         if self.plan.packages.is_empty() {
-            spans.push(Span::styled(
-                "  none found",
-                Style::new().add_modifier(Modifier::DIM),
-            ));
-            return Line::from(spans);
+            return heading_empty(spans);
         }
         ui::right_aligned(spans, size::format(self.plan.size()), width)
+    }
+
+    fn configs_heading(&self, width: usize) -> Line<'static> {
+        let mut spans = vec![Span::styled(
+            "Orphaned configs",
+            Style::new().add_modifier(Modifier::BOLD),
+        )];
+        if let Some(note) = &self.plan.configs_note {
+            spans.push(Span::styled(
+                format!("  {note}"),
+                Style::new().add_modifier(Modifier::DIM),
+            ));
+        }
+        if self.plan.configs.is_empty() {
+            return heading_empty(spans);
+        }
+        let total = self.plan.configs.iter().map(|config| config.size).sum();
+        ui::right_aligned(spans, size::format(total), width)
+    }
+
+    fn config_line(&self, index: usize, width: usize) -> Line<'static> {
+        let config = &self.plan.configs[index];
+        let mut confidence = Style::new();
+        if config.confidence == Confidence::High {
+            confidence = confidence.add_modifier(Modifier::BOLD);
+        }
+        let mut spans = vec![
+            Span::raw(format!("  {}", config.label)),
+            Span::styled(format!("  {}", config.confidence.name()), confidence),
+            Span::styled(
+                format!(" · {}", config.reason),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ];
+        if config.in_use {
+            spans.push(Span::styled(
+                "  in use",
+                Style::new().add_modifier(Modifier::BOLD),
+            ));
+        }
+        ui::right_aligned(spans, size::format(config.size), width)
     }
 
     /// A package's row, with its config files below, in at most `height` lines: ratatui draws
@@ -383,6 +456,15 @@ impl PlanView {
     }
 }
 
+/// A heading with nothing under it.
+fn heading_empty(mut spans: Vec<Span<'static>>) -> Line<'static> {
+    spans.push(Span::styled(
+        "  none found",
+        Style::new().add_modifier(Modifier::DIM),
+    ));
+    Line::from(spans)
+}
+
 /// A package's config files, one per line, `indent` columns in, marking the changed ones.
 fn config_file_lines(files: &[ConfigFile], indent: usize) -> Vec<Line<'static>> {
     let dim = Style::new().add_modifier(Modifier::DIM);
@@ -409,11 +491,13 @@ fn config_file_lines(files: &[ConfigFile], indent: usize) -> Vec<Line<'static>> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::orphans::configs::OrphanedConfig;
     use crate::orphans::plan::Package;
 
     fn screen() -> Screen {
         Screen::with_plan(Plan {
             packages: vec![Package::new("a", 10), Package::new("b", 20)],
+            ..Plan::default()
         })
     }
 
@@ -450,6 +534,10 @@ mod tests {
         for _ in 0..10 {
             press(&mut screen, KeyCode::Down);
         }
+        // The last row is the configs' heading, under the last package.
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(selected_size(&screen), 0);
+        press(&mut screen, KeyCode::Up);
         press(&mut screen, KeyCode::Char(' '));
         assert_eq!(selected_size(&screen), 20);
     }
@@ -476,6 +564,7 @@ mod tests {
         }];
         let mut screen = Screen::with_plan(Plan {
             packages: vec![cups, Package::new("zstd", 1)],
+            ..Plan::default()
         });
         let rows = render(&mut screen, 60, 8);
         assert!(rows[2].contains("  [ ] cups"), "{rows:#?}");
@@ -494,6 +583,7 @@ mod tests {
             .collect();
         let mut screen = Screen::with_plan(Plan {
             packages: vec![Package::new("a", 1), cups],
+            ..Plan::default()
         });
         press(&mut screen, KeyCode::Char('j'));
         press(&mut screen, KeyCode::Char('j'));
@@ -505,6 +595,52 @@ mod tests {
             rows.contains("… and 23 more, listed when confirming"),
             "{rows}"
         );
+    }
+
+    #[test]
+    fn lists_the_orphaned_configs_with_their_confidence() {
+        let config = |label: &str, confidence, reason: &str, size| OrphanedConfig {
+            path: label.replace('~', "/home/me").into(),
+            label: label.into(),
+            size,
+            confidence,
+            reason: reason.into(),
+            in_use: false,
+        };
+        let mut screen = Screen::with_plan(Plan {
+            configs: vec![
+                config(
+                    "~/.config/gone",
+                    Confidence::High,
+                    "unchanged since Mar 2025",
+                    2048,
+                ),
+                config("~/.gonerc", Confidence::Low, "dotfile directly in ~", 10),
+            ],
+            configs_note: Some("2 path(s) left out by the safety rules".into()),
+            ..Plan::default()
+        });
+        let rows = render(&mut screen, 90, 8);
+        assert!(
+            rows[1].contains("Orphaned packages  none found"),
+            "{rows:#?}"
+        );
+        assert!(rows[2].contains("Orphaned configs  2 path(s) left out by the safety rules"));
+        assert!(
+            rows[2]
+                .trim_end_matches('│')
+                .trim_end()
+                .ends_with("2.0 KiB")
+        );
+        assert!(rows[3].contains("~/.config/gone  High · unchanged since Mar 2025"));
+        assert!(rows[4].contains("~/.gonerc  Low · dotfile directly in ~"));
+        // Only listed for now: nothing to select.
+        for _ in 0..3 {
+            press(&mut screen, KeyCode::Char('j'));
+        }
+        press(&mut screen, KeyCode::Char(' '));
+        press(&mut screen, KeyCode::Char('a'));
+        assert_eq!(selected_size(&screen), 0);
     }
 
     #[test]
@@ -545,6 +681,7 @@ mod tests {
         cups.selected = true;
         let mut screen = Screen::with_plan(Plan {
             packages: vec![cups, Package::new("zstd", 1)],
+            ..Plan::default()
         });
         press(&mut screen, KeyCode::Enter);
         let rows = render(&mut screen, 90, 10).join("\n");

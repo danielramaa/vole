@@ -24,13 +24,13 @@ pub fn build_plan() -> Result<Plan> {
         return Ok(plan);
     }
     let names: Vec<&str> = plan.packages.iter().map(|p| p.name.as_str()).collect();
-    let details = pacman::backup_files(&names).context("reading the packages' config files")?;
-    let mut backups: HashMap<String, _> = details
+    let details = pacman::config_files(&names).context("reading the packages' config files")?;
+    let mut config_files: HashMap<String, _> = details
         .into_iter()
-        .map(|info| (info.name, info.backup))
+        .map(|info| (info.name, info.config_files))
         .collect();
     for package in &mut plan.packages {
-        package.backup = backups.remove(&package.name).unwrap_or_default();
+        package.config_files = config_files.remove(&package.name).unwrap_or_default();
     }
     Ok(plan)
 }

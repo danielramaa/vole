@@ -14,10 +14,11 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
 use super::plan::{Item, Plan};
-use super::remove::{self, Log, Outcome, RunRoot};
+use super::remove::{self, RunRoot};
 use super::scan::{ALLOWED_ROOTS, Mounts};
 use super::{build_plan, refresh_in_use};
 use crate::config::Config;
+use crate::log::{Log, Outcome};
 use crate::safety::Rules;
 use crate::size;
 
@@ -355,7 +356,7 @@ impl Screen {
         let mounts = Mounts::load()
             .map_err(|err| format!("reading the mount points from /proc/self/mountinfo: {err}"))?;
         let path = Log::path().ok_or("the operation log's folder could not be found")?;
-        let log = Log::open(&path)
+        let log = Log::open(&path, "clean")
             .map_err(|err| format!("opening the operation log {}: {err}", path.display()))?;
         Ok((rules, mounts, log))
     }

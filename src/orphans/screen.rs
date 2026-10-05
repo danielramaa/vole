@@ -34,13 +34,8 @@ enum State {
         view: PlanView,
         scroll: u16,
     },
-    /// Confirmed: the Operation Log is opened on the next tick.
-    Removing(PlanView),
-    /// Waiting for the App to lend the terminal to `sudo pacman -Rns`.
-    RootPending {
-        plan: Plan,
-        log: Log,
-    },
+    /// Confirmed: waiting for the App to lend the terminal to `sudo pacman -Rns`.
+    RootPending(Plan),
     Done {
         outcomes: Vec<Outcome>,
         scroll: u16,
@@ -78,8 +73,7 @@ impl Screen {
         matches!(self.state, State::Ready(_))
     }
 
-    /// Moves background work along: starts the scan and picks up its result, and opens the
-    /// Operation Log once removing is confirmed.
+    /// Moves background work along: starts the scan and picks up its result.
     pub fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
@@ -93,14 +87,6 @@ impl Screen {
                 Err(TryRecvError::Disconnected) => {
                     State::Failed("the scan stopped unexpectedly".into())
                 }
-            },
-            // Nothing is removed without the log to write it to.
-            State::Removing(view) => match Log::open_default("orphans") {
-                Ok(log) => State::RootPending {
-                    plan: view.plan,
-                    log,
-                },
-                Err(err) => State::Failed(format!("Nothing was removed: {err}")),
             },
             state => state,
         };
@@ -126,7 +112,7 @@ impl Screen {
                 (State::Ready(view), used)
             }
             State::Confirm { view, .. } if key.code == KeyCode::Char('y') => {
-                (State::Removing(view), true)
+                (State::RootPending(view.plan), true)
             }
             State::Confirm { view, .. } if back => (State::Ready(view), true),
             State::Confirm { view, scroll } => (
@@ -136,7 +122,7 @@ impl Screen {
                 },
                 true,
             ),
-            state @ (State::Removing(_) | State::RootPending { .. }) => (state, true),
+            state @ State::RootPending(_) => (state, true),
             State::Done { .. } | State::Failed(_) if key.code == KeyCode::Enter => {
                 (State::NotStarted, true)
             }
@@ -162,10 +148,7 @@ impl Screen {
             State::Confirm { .. } => "↑↓ scroll · y remove · n back",
             State::Done { .. } => "↑↓ scroll · enter scan again",
             State::Failed(_) => "enter scan again",
-            State::NotStarted
-            | State::Scanning(_)
-            | State::Removing(_)
-            | State::RootPending { .. } => "",
+            State::NotStarted | State::Scanning(_) | State::RootPending(_) => "",
         }
     }
 
@@ -177,27 +160,30 @@ impl Screen {
             | State::Ready(_)
             | State::Done { .. }
             | State::Failed(_) => true,
-            State::Confirm { .. } | State::Removing(_) | State::RootPending { .. } => false,
+            State::Confirm { .. } | State::RootPending(_) => false,
         }
-    }
-
-    #[cfg(test)]
-    pub fn is_removing(&self) -> bool {
-        matches!(self.state, State::Removing(_))
     }
 
     /// Whether `sudo pacman -Rns` is waiting for [`Screen::run_root`].
     pub fn needs_terminal(&self) -> bool {
-        matches!(self.state, State::RootPending { .. })
+        matches!(self.state, State::RootPending(_))
     }
 
     /// Removes the confirmed packages; `run_root` runs `sudo pacman -Rns` with the TUI paused.
     /// Fails when the TUI couldn't be brought back afterwards; the result is logged either way.
     pub fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
-        let State::RootPending { plan, mut log } = state else {
+        let State::RootPending(plan) = state else {
             self.state = state;
             return Ok(());
+        };
+        // Nothing is removed without the log to write it to.
+        let mut log = match Log::open_default("orphans") {
+            Ok(log) => log,
+            Err(err) => {
+                self.state = State::Failed(format!("Nothing was removed: {err}"));
+                return Ok(());
+            }
         };
         let (outcomes, terminal) = remove::remove(&plan, &mut log, run_root, &remove::System);
         self.state = State::Done {
@@ -219,7 +205,7 @@ impl Screen {
             }
             State::Ready(view) => view.draw(frame, area, block),
             State::Confirm { view, scroll } => draw_confirm(frame, area, block, &view.plan, scroll),
-            State::Removing(_) | State::RootPending { .. } => {
+            State::RootPending(_) => {
                 frame.render_widget(Paragraph::new("Removing…").block(block), area)
             }
             State::Done { outcomes, scroll } => {
@@ -529,7 +515,7 @@ mod tests {
         assert_eq!(selected_size(&screen), 30);
         press(&mut screen, KeyCode::Enter);
         press(&mut screen, KeyCode::Char('y'));
-        assert!(screen.is_removing());
+        assert!(screen.needs_terminal());
     }
 
     #[test]
@@ -540,7 +526,7 @@ mod tests {
         press(&mut screen, KeyCode::Char('y'));
         assert!(press(&mut screen, KeyCode::Char('q')));
         assert!(press(&mut screen, KeyCode::Esc));
-        assert!(screen.is_removing() && !screen.can_leave());
+        assert!(screen.needs_terminal() && !screen.can_leave());
     }
 
     #[test]

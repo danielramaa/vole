@@ -39,6 +39,8 @@ impl Confidence {
 #[derive(Debug, Clone)]
 pub struct Candidate {
     pub path: PathBuf,
+    /// Where it really is, the folders above it resolved.
+    pub real: PathBuf,
     /// A dotfile directly in the home directory, like `~/.foorc`.
     pub loose: bool,
 }
@@ -83,10 +85,9 @@ pub fn candidates(home: &Path, rules: &Rules, mounts: &Mounts) -> (Vec<Candidate
         entries.sort();
         for path in entries {
             // A mount point is not the config's to move, even when it holds the same filesystem.
-            if rules.check(&path).is_ok_and(|real| !mounts.contains(&real)) {
-                found.push(Candidate { path, loose });
-            } else {
-                refused += 1;
+            match rules.check(&path) {
+                Ok(real) if !mounts.contains(&real) => found.push(Candidate { path, real, loose }),
+                _ => refused += 1,
             }
         }
     };
@@ -120,7 +121,7 @@ pub fn find(
     let mut orphans = Vec::new();
     for candidate in candidates {
         let name = candidate.name();
-        if !owners.of(&name).is_empty() {
+        if !owners.of(&candidate.real, &name).is_empty() {
             continue;
         }
         let usage = disk::usage(&candidate.path, mounts);

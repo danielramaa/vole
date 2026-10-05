@@ -1,6 +1,7 @@
 //! `orphans`: Orphaned Packages and Orphaned Configs.
 
 mod configs;
+mod detect;
 mod owners;
 mod pacman;
 pub mod plan;
@@ -31,10 +32,11 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
     let mounts = Mounts::load().unwrap_or_default();
     let (candidates, refused) = configs::candidates(home, &rules, &mounts);
     // These don't depend on each other.
-    let (orphans, installed, files, open) = thread::scope(|scope| {
+    let (orphans, installed, files, open, outside) = thread::scope(|scope| {
         let orphans = scope.spawn(pacman::orphans);
         let installed = scope.spawn(pacman::installed);
         let open = scope.spawn(in_use::open_paths);
+        let outside = scope.spawn(|| detect::OutsidePacman::read(home));
         let files = pacman::files();
         let join = "a measuring thread panicked";
         (
@@ -42,6 +44,7 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
             installed.join().expect(join),
             files,
             open.join().expect(join),
+            outside.join().expect(join),
         )
     });
     let orphans = orphans.context("listing the orphaned packages")?;
@@ -63,7 +66,8 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
 
     let names: Vec<String> = candidates.iter().map(configs::Candidate::name).collect();
     let wanted = owners::wanted(names.iter().map(String::as_str));
-    let owners = Owners::from_pacman(&installed, &files, &wanted);
+    let mut owners = Owners::from_pacman(&installed, &files, &wanted);
+    owners.add_outside_pacman(&outside);
     plan.configs = configs::find(home, &candidates, &owners, &mounts, SystemTime::now());
     configs::mark_in_use(&mut plan.configs, &rules, &open);
     if refused > 0 {

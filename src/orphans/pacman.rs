@@ -15,6 +15,13 @@ pub struct Info {
     pub name: String,
     /// Installed size in bytes, as rounded by pacman.
     pub size: u64,
+    /// Installed as a dependency of another package, not explicitly.
+    pub dependency: bool,
+    /// The installed packages that depend on this one. pacman works this out with provides and
+    /// versions, so it is exact.
+    pub required_by: Vec<String>,
+    /// The installed packages that list this one as an optional dependency.
+    pub optional_for: Vec<String>,
 }
 
 /// The packages `pacman -Qdtq` lists: installed as dependencies, and neither required nor
@@ -95,12 +102,22 @@ pub fn parse_info(text: &str) -> Vec<Info> {
 }
 
 fn info(fields: &[(&str, Vec<&str>)]) -> Option<Info> {
-    let first = |name: &str| {
+    let values = |name: &str| {
         fields
             .iter()
             .find(|(field, _)| *field == name)
-            .and_then(|(_, values)| values.first().copied())
-            .unwrap_or("")
+            .map_or(&[][..], |(_, values)| values.as_slice())
+    };
+    let first = |name: &str| values(name).first().copied().unwrap_or("");
+    let names = |name: &str| -> Vec<String> {
+        match values(name) {
+            ["None"] => Vec::new(),
+            lines => lines
+                .iter()
+                .flat_map(|line| line.split_whitespace())
+                .map(String::from)
+                .collect(),
+        }
     };
     let name = first("Name");
     if name.is_empty() {
@@ -109,6 +126,10 @@ fn info(fields: &[(&str, Vec<&str>)]) -> Option<Info> {
     Some(Info {
         name: name.to_string(),
         size: size::parse(first("Installed Size")).unwrap_or(0),
+        // Anything else, even an unknown reason, counts as explicit: never an orphan.
+        dependency: first("Install Reason") == "Installed as a dependency for another package",
+        required_by: names("Required By"),
+        optional_for: names("Optional For"),
     })
 }
 
@@ -155,6 +176,10 @@ Install Reason  : Explicitly installed
         assert_eq!(names, ["python-paramiko", "python-invoke"]);
         assert_eq!(infos[0].size, size::parse("2.10 MiB").unwrap());
         assert_eq!(infos[1].size, size::parse("1073.91 KiB").unwrap());
+        assert!(infos[0].dependency && !infos[1].dependency);
+        assert!(infos[0].required_by.is_empty() && infos[0].optional_for.is_empty());
+        // Wrapped onto a second line.
+        assert_eq!(infos[1].required_by, ["python-lexicon", "python-paramiko"]);
     }
 
     #[test]

@@ -5,13 +5,14 @@ use std::collections::{BTreeSet, HashSet};
 use std::fs;
 use std::io::{self, ErrorKind};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::SystemTime;
 
-use super::backup::{BACKUPS, NewBackup};
+use super::backup::{BACKUPS, NewBackup, OldBackup};
 use super::configs::{self, OrphanedConfig};
 use super::pacman::{self, PACMAN};
 use super::plan::{Package, Plan};
-use crate::disk::Mounts;
+use crate::disk::{self, Mounts};
 use crate::log::{Log, Outcome};
 use crate::safety::Rules;
 use crate::term::{self, RunRoot};
@@ -19,20 +20,35 @@ use crate::term::{self, RunRoot};
 /// What the Operation Log calls a config moved into a Backup.
 const CONFIG: &str = "orphaned config";
 
-/// Moves the selected configs into a new Backup in `home`, each after a last safety check, and
-/// writes each to `log`. The Backup is made with the first config that moves, so when none
-/// does, there is none.
-pub fn move_configs(
+/// What the Operation Log calls an old Backup deleted.
+const BACKUP: &str = "backup";
+
+/// Moves the selected configs into a new Backup in `home`, then deletes the selected old
+/// Backups, each after a last safety check, and writes each to `log`. The new Backup is made
+/// with the first config that moves, so when none does, there is none. `progress` is told about
+/// each before it starts; once `stop` is set, the rest are left alone.
+#[allow(clippy::too_many_arguments)]
+pub fn remove_home(
     plan: &Plan,
     home: &Path,
     rules: &Rules,
     mounts: &Mounts,
     log: &mut Log,
     now: SystemTime,
+    progress: &mut dyn FnMut(usize, usize, &str),
+    stop: &AtomicBool,
 ) -> Vec<Outcome> {
+    let configs: Vec<&OrphanedConfig> = plan.selected_configs().collect();
+    let backups: Vec<&OldBackup> = plan.selected_backups().collect();
+    let total = configs.len() + backups.len();
     let mut backup = None;
     let mut outcomes = Vec::new();
-    for config in plan.selected_configs() {
+    for (done, config) in configs.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            outcomes.push(not_attempted(&config.label, config.size));
+            continue;
+        }
+        progress(done, total, &config.label);
         let target = config.path.display().to_string();
         let (label, size) = (&config.label, config.size);
         outcomes.push(
@@ -47,7 +63,50 @@ pub fn move_configs(
             },
         );
     }
+    for (done, old) in backups.iter().enumerate() {
+        if stop.load(Ordering::Relaxed) {
+            outcomes.push(not_attempted(&old.label, old.size));
+            continue;
+        }
+        progress(configs.len() + done, total, &old.label);
+        let target = old.path.display().to_string();
+        let result = delete_backup(&old.path, home, rules, mounts);
+        outcomes.push(log.record(&old.label, BACKUP, old.size, &target, result));
+    }
     outcomes
+}
+
+/// The Outcome of an Item vole didn't try to remove, so there is nothing to log.
+pub fn not_attempted(label: &str, size: u64) -> Outcome {
+    Outcome {
+        label: label.to_string(),
+        size,
+        error: Some("stopped before removing it".into()),
+        log_error: None,
+        moved: false,
+    }
+}
+
+/// Deletes an old Backup for good, once it is still one: a folder (not a symlink) directly in
+/// the backups folder, which the path rules allow and which isn't a mount point.
+fn delete_backup(path: &Path, home: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), String> {
+    let refused = |why: &str| Err(format!("refused: {} {why}", path.display()));
+    if path.parent() != Some(home.join(BACKUPS).as_path()) {
+        return refused("is not a Backup");
+    }
+    match fs::symlink_metadata(path) {
+        Ok(meta) if meta.is_dir() => {}
+        Ok(_) => return refused("is not a folder"),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(format!("{}: {err}", path.display())),
+    }
+    let real = rules
+        .check(path)
+        .map_err(|refusal| format!("refused: {} is {refusal}", path.display()))?;
+    if mounts.contains(&real) {
+        return refused("is a mount point");
+    }
+    disk::remove_all(&real, mounts).map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Moves one config into `backup`, creating the Backup first when there is none yet. Returns
@@ -247,14 +306,21 @@ mod tests {
             configs,
             ..Plan::default()
         };
+        remove(home, &plan, mounts)
+    }
+
+    fn remove(home: &Home, plan: &Plan, mounts: &Mounts) -> Vec<Outcome> {
         let mut log = Log::open(&home.log, "orphans").unwrap();
-        move_configs(
-            &plan,
+        let stop = AtomicBool::new(false);
+        remove_home(
+            plan,
             home.dir.path(),
             &home.rules,
             mounts,
             &mut log,
             SystemTime::now(),
+            &mut |_, _, _| {},
+            &stop,
         )
     }
 
@@ -328,6 +394,97 @@ mod tests {
         }
         // No Backup was made for nothing.
         assert_eq!(backups(&home), [old_backup]);
+    }
+
+    fn old_backup(path: PathBuf) -> OldBackup {
+        OldBackup {
+            label: path.display().to_string(),
+            configs: 1,
+            size: 10,
+            selected: true,
+            path,
+        }
+    }
+
+    #[test]
+    fn deletes_old_backups_but_nothing_else() {
+        let home = home();
+        let old = home
+            .dir
+            .dir(".local/share/vole/backups/2026-08-01T00-00-00Z");
+        home.dir.file(
+            ".local/share/vole/backups/2026-08-01T00-00-00Z/.config/gone/a",
+            10,
+        );
+        let not_a_backup = home.dir.dir(".config/app");
+        let linked = home
+            .dir
+            .symlink(".local/share/vole/backups/linked", &home.dir.dir("keep"));
+        let plan = Plan {
+            backups: vec![
+                old_backup(old.clone()),
+                old_backup(not_a_backup.clone()),
+                old_backup(linked.clone()),
+            ],
+            ..Plan::default()
+        };
+        let outcomes = remove(&home, &plan, &Mounts::default());
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0]);
+        assert!(!old.exists());
+        assert!(
+            outcomes[1..]
+                .iter()
+                .all(|o| o.error.as_deref().unwrap().starts_with("refused"))
+        );
+        assert!(not_a_backup.exists() && linked.exists() && home.dir.path().join("keep").exists());
+        assert_eq!(log_lines(&home.log)[0]["kind"], "backup");
+    }
+
+    #[test]
+    fn stopping_leaves_the_rest_alone() {
+        let home = home();
+        let first = home.dir.dir(".config/first");
+        let second = home.dir.dir(".config/second");
+        let old = home
+            .dir
+            .dir(".local/share/vole/backups/2026-08-01T00-00-00Z");
+        let mut plan = Plan {
+            backups: vec![old_backup(old.clone())],
+            ..Plan::default()
+        };
+        for path in [first.clone(), second.clone()] {
+            plan.configs.push(OrphanedConfig {
+                label: path.display().to_string(),
+                size: 10,
+                confidence: Confidence::High,
+                reason: String::new(),
+                in_use: false,
+                selected: true,
+                path,
+            });
+        }
+        let mut log = Log::open(&home.log, "orphans").unwrap();
+        let stop = AtomicBool::new(false);
+        let mut seen = Vec::new();
+        let mut progress = |done: usize, total: usize, _: &str| {
+            seen.push((done, total));
+            stop.store(true, Ordering::Relaxed);
+        };
+        let outcomes = remove_home(
+            &plan,
+            home.dir.path(),
+            &home.rules,
+            &Mounts::default(),
+            &mut log,
+            SystemTime::now(),
+            &mut progress,
+            &stop,
+        );
+        assert_eq!(seen, [(0, 3)]);
+        assert!(!first.exists() && second.exists() && old.exists());
+        let errors: Vec<bool> = outcomes.iter().map(|o| o.error.is_some()).collect();
+        assert_eq!(errors, [false, true, true]);
+        assert_eq!(log_lines(&home.log).len(), 1);
     }
 
     #[test]

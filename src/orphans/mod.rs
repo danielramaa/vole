@@ -77,8 +77,10 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
     if let Some(path) = known::path() {
         owners.add_known(known::load(&path, home)?);
     }
-    plan.configs = configs::find(home, &candidates, &owners, &mounts, SystemTime::now());
+    let now = SystemTime::now();
+    plan.configs = configs::find(home, &candidates, &owners, &mounts, now);
     configs::mark_in_use(&mut plan.configs, &rules, &open);
+    plan.backups = backup::old(home, &mounts, now);
     if refused > 0 {
         plan.configs_note = Some(format!("{refused} path(s) left out by the safety rules"));
     }

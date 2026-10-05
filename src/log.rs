@@ -41,8 +41,16 @@ struct Entry<'a> {
 }
 
 impl Log {
-    pub fn path() -> Option<PathBuf> {
+    fn path() -> Option<PathBuf> {
         dirs::state_dir().map(|dir| dir.join("vole").join("log.jsonl"))
+    }
+
+    /// Opens the log in its place, `~/.local/state/vole/log.jsonl`, for the attempts of
+    /// `module`, or says why it can't.
+    pub fn open_default(module: &'static str) -> Result<Self, String> {
+        let path = Self::path().ok_or("the operation log's folder could not be found")?;
+        Self::open(&path, module)
+            .map_err(|err| format!("opening the operation log {}: {err}", path.display()))
     }
 
     /// Opens the log for the attempts of `module`.

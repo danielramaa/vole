@@ -95,7 +95,7 @@ impl Screen {
                 }
             },
             // Nothing is removed without the log to write it to.
-            State::Removing(view) => match open_log() {
+            State::Removing(view) => match Log::open_default("orphans") {
                 Ok(log) => State::RootPending {
                     plan: view.plan,
                     log,
@@ -227,12 +227,6 @@ impl Screen {
             }
         }
     }
-}
-
-fn open_log() -> Result<Log, String> {
-    let path = Log::path().ok_or("the operation log's folder could not be found")?;
-    Log::open(&path, "orphans")
-        .map_err(|err| format!("opening the operation log {}: {err}", path.display()))
 }
 
 fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, scroll: &mut u16) {

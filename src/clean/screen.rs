@@ -356,9 +356,7 @@ impl Screen {
             .map_err(|err| format!("resolving {}: {err}", home.display()))?;
         let mounts = Mounts::load()
             .map_err(|err| format!("reading the mount points from /proc/self/mountinfo: {err}"))?;
-        let path = Log::path().ok_or("the operation log's folder could not be found")?;
-        let log = Log::open(&path, "clean")
-            .map_err(|err| format!("opening the operation log {}: {err}", path.display()))?;
+        let log = Log::open_default("clean")?;
         Ok((rules, mounts, log))
     }
 

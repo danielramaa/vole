@@ -1,7 +1,8 @@
-use std::io::{self, Write, stdout};
+use std::io::{self, Write, stdin, stdout};
 use std::process::{Command, ExitStatus};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, OnceLock};
+use std::thread;
 use std::time::Duration;
 
 use ratatui::DefaultTerminal;
@@ -10,7 +11,21 @@ use ratatui::crossterm::execute;
 use ratatui::crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
 };
+use rustix::termios::{QueueSelector, tcflush};
 use signal_hook::consts::{SIGINT, SIGQUIT};
+
+/// Root commands always go through sudo, called by absolute path (ADR 0001).
+const SUDO: &str = "/usr/bin/sudo";
+
+/// A command that runs `program` as root through sudo, which asks for the password itself.
+pub fn as_root(program: &str) -> Command {
+    let mut command = Command::new(SUDO);
+    command.arg(program);
+    command
+}
+
+/// Runs root commands, all under one pause of the TUI.
+pub type RunRoot<'a> = dyn FnMut(&mut [Command]) -> Ran + 'a;
 
 /// What happened while the TUI was paused.
 pub struct Ran {
@@ -19,6 +34,23 @@ pub struct Ran {
     pub statuses: Vec<io::Result<ExitStatus>>,
     /// The first error pausing the TUI or bringing it back.
     pub terminal: io::Result<()>,
+}
+
+impl Ran {
+    /// Why the command at `index`, called `what` here, didn't succeed; `None` when it did.
+    pub fn error(&self, index: usize, what: &str) -> Option<String> {
+        match self.statuses.get(index) {
+            Some(Ok(status)) if status.success() => None,
+            Some(Ok(status)) => Some(format!("{what} failed ({status})")),
+            Some(Err(err)) => Some(format!("{what} could not run: {err}")),
+            None => Some(match &self.terminal {
+                Err(err) if self.statuses.is_empty() => {
+                    format!("{what} did not run: the terminal could not be paused: {err}")
+                }
+                _ => format!("{what} did not run"),
+            }),
+        }
+    }
 }
 
 /// Pauses the TUI, runs `commands` one after another in the normal terminal (so `sudo` can ask
@@ -31,13 +63,16 @@ pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) ->
     // system(3), vole ignores it while it waits, so only the command stops.
     let paused = ignore_interrupts(true).and_then(|()| pause(terminal));
     let statuses: Vec<io::Result<ExitStatus>> = match &paused {
-        Ok(()) => commands
-            .iter_mut()
-            .map(|command| {
-                println!("vole: running {}", describe(command));
-                command.status()
-            })
-            .collect(),
+        Ok(()) => {
+            discard_typeahead();
+            commands
+                .iter_mut()
+                .map(|command| {
+                    println!("vole: running {}", describe(command));
+                    command.status()
+                })
+                .collect()
+        }
         Err(_) => Vec::new(),
     };
     // Coming back would hide why a command failed (a wrong password, not in sudoers, …).
@@ -60,6 +95,17 @@ pub fn run_external(terminal: &mut DefaultTerminal, commands: &mut [Command]) ->
         statuses,
         terminal: paused.and(resumed),
     }
+}
+
+/// How long after the TUI pauses a key can't yet be a reaction to it.
+const TYPEAHEAD: Duration = Duration::from_millis(200);
+
+/// Throws away the keys typed before the TUI paused, or too soon after to answer what comes
+/// next (a quick Enter after y). They were meant for vole, and would otherwise go into sudo's
+/// password or answer a command's question, such as pacman's [Y/n].
+fn discard_typeahead() {
+    thread::sleep(TYPEAHEAD);
+    let _ = tcflush(stdin(), QueueSelector::IFlush);
 }
 
 fn wait_for_enter() {
@@ -116,6 +162,31 @@ fn resume(terminal: &mut DefaultTerminal) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    #[test]
+    fn says_why_a_command_did_not_succeed() {
+        let ran = Ran {
+            statuses: vec![
+                Ok(ExitStatus::from_raw(0)),
+                Ok(ExitStatus::from_raw(1 << 8)),
+                Err(io::Error::other("no such file")),
+            ],
+            terminal: Ok(()),
+        };
+        assert_eq!(ran.error(0, "a"), None);
+        assert_eq!(ran.error(1, "b").unwrap(), "b failed (exit status: 1)");
+        assert_eq!(ran.error(2, "c").unwrap(), "c could not run: no such file");
+        assert_eq!(ran.error(3, "d").unwrap(), "d did not run");
+        let not_paused = Ran {
+            statuses: Vec::new(),
+            terminal: Err(io::Error::other("no tty")),
+        };
+        assert_eq!(
+            not_paused.error(0, "a").unwrap(),
+            "a did not run: the terminal could not be paused: no tty"
+        );
+    }
 
     #[test]
     fn interrupts_can_be_ignored_while_a_command_runs() {

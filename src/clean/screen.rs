@@ -14,12 +14,15 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
 use super::plan::{Item, Plan};
-use super::remove::{self, Log, Outcome, RunRoot};
+use super::remove;
 use super::scan::{ALLOWED_ROOTS, Mounts};
 use super::{build_plan, refresh_in_use};
+use crate::app::ModuleScreen;
 use crate::config::Config;
+use crate::log::{Log, Outcome};
 use crate::safety::Rules;
-use crate::size;
+use crate::term::RunRoot;
+use crate::{size, ui};
 
 pub struct Screen {
     config: Config,
@@ -100,8 +103,55 @@ impl Screen {
         matches!(self.state, State::Ready(_))
     }
 
+    /// Removes the home Items on a worker thread, so the screen keeps drawing.
+    fn start_removal(plan: Plan, rules: Rules, mounts: Mounts, mut log: Log) -> State {
+        let (sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_plan = plan.clone();
+        let worker_stop = Arc::clone(&stop);
+        thread::spawn(move || {
+            let mut progress = |done: usize, total: usize, label: &str| {
+                let _ = sender.send(Progress::Item(format!("{label} ({} of {total})", done + 1)));
+            };
+            let outcomes = remove::remove_home(
+                &worker_plan,
+                &rules,
+                &mounts,
+                &mut log,
+                &mut progress,
+                &worker_stop,
+            );
+            let _ = sender.send(Progress::Finished(outcomes, log));
+        });
+        State::RemovingHome {
+            plan,
+            receiver,
+            stop,
+            now: String::new(),
+        }
+    }
+
+    #[cfg(test)]
+    pub fn is_removing(&self) -> bool {
+        matches!(self.state, State::Removing(_))
+    }
+
+    /// Fresh path rules and mount points, and the Operation Log. Nothing is removed without all
+    /// three: bind mounts can only be told apart through the mount points.
+    fn prepare(&self) -> Result<(Rules, Mounts, Log), String> {
+        let home = dirs::home_dir().ok_or("the home directory could not be found")?;
+        let rules = Rules::new(&home, ALLOWED_ROOTS, &self.config.protected_paths(&home))
+            .map_err(|err| format!("resolving {}: {err}", home.display()))?;
+        let mounts = Mounts::load()
+            .map_err(|err| format!("reading the mount points from /proc/self/mountinfo: {err}"))?;
+        let log = Log::open_default("clean")?;
+        Ok((rules, mounts, log))
+    }
+}
+
+impl ModuleScreen for Screen {
     /// Moves background work along: starts the scan or the removal, and picks up their results.
-    pub fn tick(&mut self) {
+    fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
             State::NotStarted => State::Scanning(Self::start(self.config.clone())),
@@ -168,36 +218,8 @@ impl Screen {
         };
     }
 
-    /// Removes the home Items on a worker thread, so the screen keeps drawing.
-    fn start_removal(plan: Plan, rules: Rules, mounts: Mounts, mut log: Log) -> State {
-        let (sender, receiver) = mpsc::channel();
-        let stop = Arc::new(AtomicBool::new(false));
-        let worker_plan = plan.clone();
-        let worker_stop = Arc::clone(&stop);
-        thread::spawn(move || {
-            let mut progress = |done: usize, total: usize, label: &str| {
-                let _ = sender.send(Progress::Item(format!("{label} ({} of {total})", done + 1)));
-            };
-            let outcomes = remove::remove_home(
-                &worker_plan,
-                &rules,
-                &mounts,
-                &mut log,
-                &mut progress,
-                &worker_stop,
-            );
-            let _ = sender.send(Progress::Finished(outcomes, log));
-        });
-        State::RemovingHome {
-            plan,
-            receiver,
-            stop,
-            now: String::new(),
-        }
-    }
-
     /// Returns whether the key was used.
-    pub fn on_key(&mut self, key: KeyEvent) -> bool {
+    fn on_key(&mut self, key: KeyEvent) -> bool {
         let back = matches!(
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
@@ -258,7 +280,7 @@ impl Screen {
                 State::Confirm {
                     view,
                     in_use,
-                    scroll: scrolled(scroll, key),
+                    scroll: ui::scrolled(scroll, key),
                 },
                 true,
             ),
@@ -269,7 +291,7 @@ impl Screen {
                 (State::NotStarted, true)
             }
             State::Done { outcomes, scroll } => {
-                let next = scrolled(scroll, key);
+                let next = ui::scrolled(scroll, key);
                 (
                     State::Done {
                         outcomes,
@@ -284,7 +306,7 @@ impl Screen {
         used
     }
 
-    pub fn hint(&self) -> &'static str {
+    fn hint(&self) -> &'static str {
         match &self.state {
             State::Ready(_) => "↑↓/jk move · space select · a select category · enter remove…",
             State::Confirm { in_use: false, .. } => "↑↓ scroll · y remove · n back",
@@ -300,7 +322,7 @@ impl Screen {
     }
 
     /// Whether q leaves `clean` here; while confirming or removing, it doesn't.
-    pub fn can_leave(&self) -> bool {
+    fn can_leave(&self) -> bool {
         match self.state {
             State::NotStarted
             | State::Scanning(_)
@@ -314,19 +336,14 @@ impl Screen {
         }
     }
 
-    #[cfg(test)]
-    pub fn is_removing(&self) -> bool {
-        matches!(self.state, State::Removing(_))
-    }
-
     /// Whether the root commands are waiting for [`Screen::run_root`].
-    pub fn needs_terminal(&self) -> bool {
+    fn needs_terminal(&self) -> bool {
         matches!(self.state, State::RootPending { .. })
     }
 
     /// Runs the confirmed root commands; `run_root` runs them with the TUI paused. Fails when
     /// the TUI couldn't be brought back afterwards; the result is logged either way.
-    pub fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
+    fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let State::RootPending {
             plan,
@@ -346,21 +363,7 @@ impl Screen {
         terminal
     }
 
-    /// Fresh path rules and mount points, and the Operation Log. Nothing is removed without all
-    /// three: bind mounts can only be told apart through the mount points.
-    fn prepare(&self) -> Result<(Rules, Mounts, Log), String> {
-        let home = dirs::home_dir().ok_or("the home directory could not be found")?;
-        let rules = Rules::new(&home, ALLOWED_ROOTS, &self.config.protected_paths(&home))
-            .map_err(|err| format!("resolving {}: {err}", home.display()))?;
-        let mounts = Mounts::load()
-            .map_err(|err| format!("reading the mount points from /proc/self/mountinfo: {err}"))?;
-        let path = Log::path().ok_or("the operation log's folder could not be found")?;
-        let log = Log::open(&path)
-            .map_err(|err| format!("opening the operation log {}: {err}", path.display()))?;
-        Ok((rules, mounts, log))
-    }
-
-    pub fn draw(&mut self, frame: &mut Frame, area: Rect) {
+    fn draw(&mut self, frame: &mut Frame, area: Rect) {
         let block = Block::bordered().title(" clean ");
         match &mut self.state {
             State::NotStarted | State::Scanning(_) => frame.render_widget(
@@ -387,29 +390,11 @@ impl Screen {
                 };
                 frame.render_widget(Paragraph::new(text).block(block), area)
             }
-            State::Done { outcomes, scroll } => draw_done(frame, area, block, outcomes, scroll),
+            State::Done { outcomes, scroll } => {
+                ui::draw_outcomes(frame, area, block, outcomes, scroll)
+            }
         }
     }
-}
-
-/// The scroll offset after `key`: j/k and the arrows move one line.
-fn scrolled(scroll: u16, key: KeyEvent) -> u16 {
-    match key.code {
-        KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
-        KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
-        _ => scroll,
-    }
-}
-
-/// Draws `lines` scrolled by `scroll`, which is first kept within the lines that don't fit.
-fn draw_scrolled(frame: &mut Frame, area: Rect, block: Block, lines: Vec<Line>, scroll: &mut u16) {
-    let height = usize::from(block.inner(area).height);
-    let most = u16::try_from(lines.len().saturating_sub(height)).unwrap_or(u16::MAX);
-    *scroll = (*scroll).min(most);
-    frame.render_widget(
-        Paragraph::new(lines).block(block).scroll((*scroll, 0)),
-        area,
-    );
 }
 
 fn draw_confirm(
@@ -455,45 +440,9 @@ fn draw_confirm(
         if item.in_use {
             spans.push(Span::styled("  in use", bold));
         }
-        lines.push(right_aligned(spans, size::format(item.size), width));
+        lines.push(ui::right_aligned(spans, size::format(item.size), width));
     }
-    draw_scrolled(frame, area, block, lines, scroll);
-}
-
-fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome], scroll: &mut u16) {
-    let width = usize::from(block.inner(area).width);
-    let freed: u64 = outcomes
-        .iter()
-        .filter(|o| o.error.is_none())
-        .map(|o| o.size)
-        .sum();
-    let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
-    let mut summary = format!("Freed about {}", size::format(freed));
-    if failed > 0 {
-        summary.push_str(&format!(" · {failed} failed"));
-    }
-    let mut lines = vec![
-        Line::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
-        Line::default(),
-    ];
-    let dim = Style::new().add_modifier(Modifier::DIM);
-    for outcome in outcomes {
-        match &outcome.error {
-            None => lines.push(right_aligned(
-                vec![Span::raw(format!("  ✓ {}", outcome.label))],
-                size::format(outcome.size),
-                width,
-            )),
-            Some(err) => {
-                lines.push(Line::from(format!("  ✗ {}", outcome.label)));
-                lines.push(Line::styled(format!("      {err}"), dim));
-            }
-        }
-        if let Some(err) = &outcome.log_error {
-            lines.push(Line::styled(format!("      ! {err}"), dim));
-        }
-    }
-    draw_scrolled(frame, area, block, lines, scroll);
+    ui::draw_scrolled(frame, area, block, lines, scroll);
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -599,7 +548,7 @@ impl PlanView {
                 } else {
                     size::format(category.size())
                 };
-                right_aligned(spans, size, width)
+                ui::right_aligned(spans, size, width)
             }
             Row::Item(c, i) => {
                 let item = &self.plan.categories[c].items[i];
@@ -614,21 +563,10 @@ impl PlanView {
                         Style::new().add_modifier(Modifier::BOLD),
                     ));
                 }
-                right_aligned(spans, size::format(item.size), width)
+                ui::right_aligned(spans, size::format(item.size), width)
             }
         }
     }
-}
-
-/// `spans` on the left, `right` at the right edge of `width`.
-fn right_aligned(mut spans: Vec<Span<'static>>, right: String, width: usize) -> Line<'static> {
-    // Terminal columns, not chars: wide characters take two.
-    let right = Span::raw(right);
-    let used: usize = spans.iter().map(Span::width).sum();
-    let gap = width.saturating_sub(used + right.width()).max(1);
-    spans.push(Span::raw(" ".repeat(gap)));
-    spans.push(right);
-    Line::from(spans)
 }
 
 #[cfg(test)]
@@ -694,12 +632,6 @@ mod tests {
         }
         press(&mut screen, KeyCode::Char(' '));
         assert_eq!(selected_size(&screen), 40);
-    }
-
-    #[test]
-    fn sizes_line_up_with_wide_characters() {
-        let line = right_aligned(vec![Span::raw("~/.cache/日本")], "1 B".into(), 20);
-        assert_eq!(line.width(), 20);
     }
 
     fn is_confirming(screen: &Screen, step: bool) -> bool {

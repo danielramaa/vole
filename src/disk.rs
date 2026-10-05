@@ -8,6 +8,7 @@ use std::io;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
+use std::time::SystemTime;
 
 /// Whether `path` is a folder itself, not a symlink to one.
 pub fn is_real_dir(path: &Path) -> bool {
@@ -71,11 +72,30 @@ fn unescape_octal(field: &str) -> PathBuf {
 /// other filesystems or mount points. A hard-linked file only counts when all of its links are
 /// inside `path`, since otherwise removing `path` doesn't free it.
 pub fn disk_usage(path: &Path, mounts: &Mounts) -> u64 {
-    disk_usage_all(std::slice::from_ref(&path.to_path_buf()), mounts)
+    usage(path, mounts).bytes
 }
 
 /// [`disk_usage`] of several paths removed together, measured in one walk.
 pub fn disk_usage_all(paths: &[PathBuf], mounts: &Mounts) -> u64 {
+    usage_all(paths, mounts).bytes
+}
+
+/// The space under some paths, and when anything there last changed.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct Usage {
+    /// Bytes freed by removing the paths (see [`disk_usage`]).
+    pub bytes: u64,
+    /// The newest modification time of what was walked; `None` when nothing could be read.
+    pub newest: Option<SystemTime>,
+}
+
+/// The [`Usage`] of `path`.
+pub fn usage(path: &Path, mounts: &Mounts) -> Usage {
+    usage_all(std::slice::from_ref(&path.to_path_buf()), mounts)
+}
+
+/// The [`Usage`] of several paths removed together, measured in one walk.
+pub fn usage_all(paths: &[PathBuf], mounts: &Mounts) -> Usage {
     // (path, metadata, device of the path it was reached from)
     let mut stack: Vec<(PathBuf, Metadata, u64)> = Vec::new();
     for path in paths {
@@ -94,10 +114,12 @@ pub fn disk_usage_all(paths: &[PathBuf], mounts: &Mounts) -> u64 {
     // (device, inode) → (links seen, links in total, bytes).
     let mut linked: HashMap<(u64, u64), (u64, u64, u64)> = HashMap::new();
     let mut total = 0;
+    let mut newest = None;
     while let Some((path, meta, device)) = stack.pop() {
         if meta.dev() != device || (meta.is_dir() && mounts.contains(&path)) {
             continue;
         }
+        newest = newest.max(meta.modified().ok());
         if !meta.is_dir() && meta.nlink() > 1 {
             let entry = linked.entry((meta.dev(), meta.ino())).or_insert((
                 0,
@@ -122,7 +144,10 @@ pub fn disk_usage_all(paths: &[PathBuf], mounts: &Mounts) -> u64 {
         .filter(|(seen, links, _)| seen >= links)
         .map(|(_, _, bytes)| bytes)
         .sum();
-    total + freed_links
+    Usage {
+        bytes: total + freed_links,
+        newest,
+    }
 }
 
 /// Removes `path` (a real path) without following symlinks and without entering other
@@ -188,6 +213,28 @@ fn remove_tree(path: &Path, meta: &fs::Metadata, device: u64, mounts: &Mounts) -
 mod tests {
     use super::*;
     use crate::testdir::TestDir;
+    use std::time::Duration;
+
+    #[test]
+    fn usage_says_when_anything_inside_last_changed() {
+        let home = TestDir::new();
+        let old = SystemTime::UNIX_EPOCH + Duration::from_secs(1_000_000_000);
+        let new = old + Duration::from_secs(86_400);
+        let set = |path: &Path, time| fs::File::open(path).unwrap().set_modified(time).unwrap();
+        let file = home.file("app/deep/data", 10);
+        set(&file, new);
+        for dir in ["app/deep", "app"] {
+            set(&home.path().join(dir), old);
+        }
+        assert_eq!(
+            usage(&home.path().join("app"), &Mounts::default()).newest,
+            Some(new)
+        );
+        assert_eq!(
+            usage(&home.path().join("missing"), &Mounts::default()).newest,
+            None
+        );
+    }
 
     #[test]
     fn reads_mount_points() {

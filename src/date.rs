@@ -1,4 +1,4 @@
-//! Dates without a calendar library, all in UTC.
+//! Dates without a calendar library, all in UTC: Backup folder names, and when things changed.
 
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -7,6 +7,20 @@ const DAY: i64 = 86_400;
 const MONTHS: [&str; 12] = [
     "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
 ];
+
+/// A moment as a Backup folder name, e.g. `2026-10-05T13-30-00Z`: sorts by date, and has no
+/// colons.
+pub fn stamp(time: SystemTime) -> String {
+    let secs = secs(time);
+    let (year, month, day) = civil_from_days(secs.div_euclid(DAY));
+    let s = secs.rem_euclid(DAY);
+    format!(
+        "{year:04}-{month:02}-{day:02}T{:02}-{:02}-{:02}Z",
+        s / 3600,
+        s / 60 % 60,
+        s % 60
+    )
+}
 
 /// E.g. `Mar 2025`.
 pub fn month(time: SystemTime) -> String {
@@ -57,6 +71,14 @@ mod tests {
 
     fn at(secs: u64) -> SystemTime {
         UNIX_EPOCH + Duration::from_secs(secs)
+    }
+
+    #[test]
+    fn stamps_name_the_moment() {
+        assert_eq!(stamp(at(0)), "1970-01-01T00-00-00Z");
+        assert_eq!(stamp(at(1_791_207_000)), "2026-10-05T13-30-00Z");
+        assert_eq!(stamp(at(1_709_251_199)), "2024-02-29T23-59-59Z");
+        assert_eq!(stamp(at(951_868_800)), "2000-03-01T00-00-00Z");
     }
 
     #[test]

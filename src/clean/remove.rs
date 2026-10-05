@@ -105,6 +105,7 @@ pub fn not_attempted(item: &Item, why: &str) -> Outcome {
         size: item.size,
         error: Some(why.to_string()),
         log_error: None,
+        moved: false,
     }
 }
 

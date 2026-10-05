@@ -1,9 +1,10 @@
-//! The `orphans` screens: looking for Orphaned Packages, the Plan with selection, confirmation,
-//! and the result.
+//! The `orphans` screens: looking for Orphaned Packages and Configs, the Plan with selection,
+//! confirmation, and the result.
 
 use std::io;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
+use std::time::SystemTime;
 
 use ratatui::Frame;
 use ratatui::crossterm::event::{KeyCode, KeyEvent};
@@ -12,13 +13,14 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
-use super::build_plan;
-use super::configs::Confidence;
+use super::backup::BACKUPS;
+use super::configs::{Confidence, OrphanedConfig};
 use super::pacman::{ConfigFile, FileState};
 use super::plan::{Package, Plan};
-use super::remove;
+use super::{build_plan, refresh_in_use, remove, rules};
 use crate::app::ModuleScreen;
 use crate::config::Config;
+use crate::disk::Mounts;
 use crate::log::{Log, Outcome};
 use crate::term::RunRoot;
 use crate::{size, ui};
@@ -33,13 +35,20 @@ enum State {
     NotStarted,
     Scanning(Receiver<Result<Plan, String>>),
     Ready(PlanView),
-    /// Asking before anything is removed.
+    /// Asking before anything is removed; `in_use` is the extra step for In Use configs.
     Confirm {
         view: PlanView,
+        in_use: bool,
         scroll: u16,
     },
-    /// Confirmed: waiting for the App to lend the terminal to `sudo pacman -Rns`.
-    RootPending(Plan),
+    /// Confirmed: the configs are moved into a Backup on the next tick.
+    Removing(Plan),
+    /// The configs are moved; `sudo pacman -Rns` waits for the App to lend the terminal.
+    RootPending {
+        plan: Plan,
+        outcomes: Vec<Outcome>,
+        log: Log,
+    },
     Done {
         outcomes: Vec<Outcome>,
         scroll: u16,
@@ -81,24 +90,61 @@ impl Screen {
     pub fn has_plan(&self) -> bool {
         matches!(self.state, State::Ready(_))
     }
+
+    #[cfg(test)]
+    fn is_removing(&self) -> bool {
+        matches!(self.state, State::Removing(_))
+    }
+
+    /// Moves the confirmed configs into a Backup. Nothing moves without fresh path rules, the
+    /// mount points and the Operation Log; packages wait for the terminal.
+    fn remove(&self, plan: Plan) -> State {
+        let prepared = (|| -> Result<_, String> {
+            let home = dirs::home_dir().ok_or("the home directory could not be found")?;
+            let rules = rules(&home, &self.config)
+                .map_err(|err| format!("resolving {}: {err}", home.display()))?;
+            let mounts = Mounts::load().map_err(|err| {
+                format!("reading the mount points from /proc/self/mountinfo: {err}")
+            })?;
+            Ok((home, rules, mounts, Log::open_default("orphans")?))
+        })();
+        let (home, rules, mounts, mut log) = match prepared {
+            Ok(prepared) => prepared,
+            Err(err) => return State::Failed(format!("Nothing was removed: {err}")),
+        };
+        let now = SystemTime::now();
+        let outcomes = remove::move_configs(&plan, &home, &rules, &mounts, &mut log, now);
+        if plan.selected_packages().next().is_some() {
+            State::RootPending {
+                plan,
+                outcomes,
+                log,
+            }
+        } else {
+            State::Done {
+                outcomes,
+                scroll: 0,
+            }
+        }
+    }
 }
 
 impl ModuleScreen for Screen {
-    /// Moves background work along: starts the scan and picks up its result.
+    /// Moves background work along: starts the scan and picks up its result, and moves the
+    /// confirmed configs.
     fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
             State::NotStarted => State::Scanning(Self::start(self.config.clone())),
             State::Scanning(receiver) => match receiver.try_recv() {
                 Ok(Ok(plan)) => State::Ready(PlanView::new(plan)),
-                Ok(Err(err)) => {
-                    State::Failed(format!("Could not look for orphaned packages: {err}"))
-                }
+                Ok(Err(err)) => State::Failed(format!("Could not look for orphans: {err}")),
                 Err(TryRecvError::Empty) => State::Scanning(receiver),
                 Err(TryRecvError::Disconnected) => {
                     State::Failed("the scan stopped unexpectedly".into())
                 }
             },
+            State::Removing(plan) => self.remove(plan),
             state => state,
         };
     }
@@ -111,9 +157,15 @@ impl ModuleScreen for Screen {
         );
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
-            State::Ready(view) if key.code == KeyCode::Enter => {
-                if view.plan.selected().next().is_some() {
-                    (State::Confirm { view, scroll: 0 }, true)
+            State::Ready(mut view) if key.code == KeyCode::Enter => {
+                if view.plan.any_selected() {
+                    refresh_in_use(&mut view.plan, &self.config);
+                    let confirm = State::Confirm {
+                        view,
+                        in_use: false,
+                        scroll: 0,
+                    };
+                    (confirm, true)
                 } else {
                     (State::Ready(view), true)
                 }
@@ -122,18 +174,39 @@ impl ModuleScreen for Screen {
                 let used = view.on_key(key);
                 (State::Ready(view), used)
             }
-            State::Confirm { view, .. } if key.code == KeyCode::Char('y') => {
-                (State::RootPending(view.plan), true)
+            // The In Use step takes another key (Y), so a double-tap or auto-repeat of y can't
+            // pass it before it is even drawn.
+            State::Confirm {
+                mut view, in_use, ..
+            } if key.code == KeyCode::Char(if in_use { 'Y' } else { 'y' }) => {
+                refresh_in_use(&mut view.plan, &self.config);
+                let any_in_use = view.plan.selected_configs().any(|config| config.in_use);
+                if any_in_use && !in_use {
+                    let confirm = State::Confirm {
+                        view,
+                        in_use: true,
+                        scroll: 0,
+                    };
+                    (confirm, true)
+                } else {
+                    (State::Removing(view.plan), true)
+                }
             }
             State::Confirm { view, .. } if back => (State::Ready(view), true),
-            State::Confirm { view, scroll } => (
-                State::Confirm {
+            State::Confirm {
+                view,
+                in_use,
+                scroll,
+            } => {
+                let scroll = ui::scrolled(scroll, key);
+                let confirm = State::Confirm {
                     view,
-                    scroll: ui::scrolled(scroll, key),
-                },
-                true,
-            ),
-            state @ State::RootPending(_) => (state, true),
+                    in_use,
+                    scroll,
+                };
+                (confirm, true)
+            }
+            state @ (State::Removing(_) | State::RootPending { .. }) => (state, true),
             State::Done { .. } | State::Failed(_) if key.code == KeyCode::Enter => {
                 (State::NotStarted, true)
             }
@@ -156,10 +229,14 @@ impl ModuleScreen for Screen {
     fn hint(&self) -> &'static str {
         match self.state {
             State::Ready(_) => "↑↓/jk move · space select · a select all · enter remove…",
-            State::Confirm { .. } => "↑↓ scroll · y remove · n back",
+            State::Confirm { in_use: false, .. } => "↑↓ scroll · y remove · n back",
+            State::Confirm { in_use: true, .. } => "↑↓ scroll · Y remove anyway · n back",
             State::Done { .. } => "↑↓ scroll · enter scan again",
             State::Failed(_) => "enter scan again",
-            State::NotStarted | State::Scanning(_) | State::RootPending(_) => "",
+            State::NotStarted
+            | State::Scanning(_)
+            | State::Removing(_)
+            | State::RootPending { .. } => "",
         }
     }
 
@@ -171,32 +248,31 @@ impl ModuleScreen for Screen {
             | State::Ready(_)
             | State::Done { .. }
             | State::Failed(_) => true,
-            State::Confirm { .. } | State::RootPending(_) => false,
+            State::Confirm { .. } | State::Removing(_) | State::RootPending { .. } => false,
         }
     }
 
-    /// Whether `sudo pacman -Rns` is waiting for [`Screen::run_root`].
+    /// Whether `sudo pacman -Rns` is waiting for [`ModuleScreen::run_root`].
     fn needs_terminal(&self) -> bool {
-        matches!(self.state, State::RootPending(_))
+        matches!(self.state, State::RootPending { .. })
     }
 
     /// Removes the confirmed packages; `run_root` runs `sudo pacman -Rns` with the TUI paused.
     /// Fails when the TUI couldn't be brought back afterwards; the result is logged either way.
     fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()> {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
-        let State::RootPending(plan) = state else {
+        let State::RootPending {
+            plan,
+            mut outcomes,
+            mut log,
+        } = state
+        else {
             self.state = state;
             return Ok(());
         };
-        // Nothing is removed without the log to write it to.
-        let mut log = match Log::open_default("orphans") {
-            Ok(log) => log,
-            Err(err) => {
-                self.state = State::Failed(format!("Nothing was removed: {err}"));
-                return Ok(());
-            }
-        };
-        let (outcomes, terminal) = remove::remove(&plan, &mut log, run_root, &remove::System);
+        let (packages, terminal) =
+            remove::remove_packages(&plan, &mut log, run_root, &remove::System);
+        outcomes.extend(packages);
         self.state = State::Done {
             outcomes,
             scroll: 0,
@@ -208,15 +284,19 @@ impl ModuleScreen for Screen {
         let block = Block::bordered().title(" orphans ");
         match &mut self.state {
             State::NotStarted | State::Scanning(_) => frame.render_widget(
-                Paragraph::new("Looking for orphaned packages…").block(block),
+                Paragraph::new("Looking for orphaned packages and configs…").block(block),
                 area,
             ),
             State::Failed(err) => {
                 frame.render_widget(Paragraph::new(err.as_str()).block(block), area)
             }
             State::Ready(view) => view.draw(frame, area, block),
-            State::Confirm { view, scroll } => draw_confirm(frame, area, block, &view.plan, scroll),
-            State::RootPending(_) => {
+            State::Confirm {
+                view,
+                in_use,
+                scroll,
+            } => draw_confirm(frame, area, block, &view.plan, *in_use, scroll),
+            State::Removing(_) | State::RootPending { .. } => {
                 frame.render_widget(Paragraph::new("Removing…").block(block), area)
             }
             State::Done { outcomes, scroll } => {
@@ -226,40 +306,101 @@ impl ModuleScreen for Screen {
     }
 }
 
-fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, plan: &Plan, scroll: &mut u16) {
-    let selected: Vec<&Package> = plan.selected().collect();
+fn draw_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block,
+    plan: &Plan,
+    in_use: bool,
+    scroll: &mut u16,
+) {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let packages: Vec<&Package> = plan.selected_packages().collect();
+    let configs: Vec<&OrphanedConfig> = plan.selected_configs().collect();
     let width = usize::from(block.inner(area).width);
-    let mut lines = vec![
-        Line::styled(
-            match selected.len() {
-                1 => format!(
-                    "Remove this package, freeing about {}?",
-                    size::format(plan.selected_size())
-                ),
-                count => format!(
-                    "Remove these {count} packages, freeing about {}?",
-                    size::format(plan.selected_size())
-                ),
-            },
-            Style::new().add_modifier(Modifier::BOLD),
-        ),
-        Line::from("vole pauses so sudo can ask for your password; pacman then asks once more."),
-    ];
-    if selected
-        .iter()
-        .any(|package| !package.config_files.is_empty())
-    {
-        lines.push(Line::from(
-            "Their config files go too, even changed ones: -n keeps no .pacsave copies.",
+    let mut lines = Vec::new();
+    if in_use {
+        let count = configs.iter().filter(|config| config.in_use).count();
+        lines.push(Line::styled(
+            format!("{count} of these configs are in use by running programs."),
+            bold,
         ));
+        lines.push(Line::from(
+            "Moving them can make those programs misbehave. Press Y (shift+y) to move them anyway.",
+        ));
+    } else {
+        lines.push(Line::styled(question(&packages, &configs), bold));
+        if !packages.is_empty() {
+            lines.push(Line::from(
+                "vole pauses so sudo can ask for your password; pacman then asks once more.",
+            ));
+        }
+        if packages
+            .iter()
+            .any(|package| !package.config_files.is_empty())
+        {
+            lines.push(Line::from(
+                "Their config files go too, even changed ones: -n keeps no .pacsave copies.",
+            ));
+        }
+        if !configs.is_empty() {
+            lines.push(Line::from(format!(
+                "Configs aren't deleted: they move into a dated Backup in ~/{BACKUPS}/."
+            )));
+        }
     }
     lines.push(Line::default());
-    for package in &selected {
+    for package in &packages {
         let name = vec![Span::raw(format!("  {}", package.name))];
         lines.push(ui::right_aligned(name, size::format(package.size), width));
         lines.extend(config_file_lines(&package.config_files, 4));
     }
+    for config in &configs {
+        let mut spans = vec![
+            Span::raw(format!("  {}", config.label)),
+            Span::styled(
+                format!("  {}", config.confidence.name()),
+                Style::new().add_modifier(Modifier::DIM),
+            ),
+        ];
+        if config.in_use {
+            spans.push(Span::styled("  in use", bold));
+        }
+        lines.push(ui::right_aligned(spans, size::format(config.size), width));
+    }
     ui::draw_scrolled(frame, area, block, lines, scroll);
+}
+
+/// What the confirmation asks: `Remove these 2 packages, freeing about 3 MiB, and move this
+/// config into a Backup?`
+fn question(packages: &[&Package], configs: &[&OrphanedConfig]) -> String {
+    let freed: u64 = packages.iter().map(|package| package.size).sum();
+    let packages = match packages.len() {
+        0 => None,
+        1 => Some(format!(
+            "Remove this package, freeing about {}",
+            size::format(freed)
+        )),
+        count => Some(format!(
+            "Remove these {count} packages, freeing about {}",
+            size::format(freed)
+        )),
+    };
+    let configs = match configs.len() {
+        0 => None,
+        1 => Some("move this config into a Backup".to_string()),
+        count => Some(format!("move these {count} configs into a Backup")),
+    };
+    match (packages, configs) {
+        (Some(packages), Some(configs)) => format!("{packages}, and {configs}?"),
+        (Some(packages), None) => format!("{packages}?"),
+        (None, Some(configs)) => {
+            let mut configs = configs;
+            configs[..1].make_ascii_uppercase();
+            format!("{configs}?")
+        }
+        (None, None) => String::new(),
+    }
 }
 
 /// A row of the Plan list.
@@ -300,18 +441,21 @@ impl PlanView {
     fn on_key(&mut self, key: KeyEvent) -> bool {
         let last = self.rows.len().saturating_sub(1);
         let index = self.list.selected().unwrap_or(0).min(last);
-        let on_packages = matches!(self.current(), Some(Row::Packages | Row::Package(_)));
         match key.code {
             KeyCode::Down | KeyCode::Char('j') => self.list.select(Some((index + 1).min(last))),
             KeyCode::Up | KeyCode::Char('k') => self.list.select(Some(index.saturating_sub(1))),
             KeyCode::Char(' ') => match self.current() {
-                Some(Row::Package(package)) => self.plan.toggle(package),
-                Some(Row::Packages) => self.plan.toggle_all(),
-                // The Orphaned Configs are only listed for now.
-                Some(Row::Configs | Row::Config(_)) | None => {}
+                Some(Row::Package(package)) => self.plan.toggle_package(package),
+                Some(Row::Packages) => self.plan.toggle_all_packages(),
+                Some(Row::Config(config)) => self.plan.toggle_config(config),
+                Some(Row::Configs) => self.plan.toggle_all_configs(),
+                None => {}
             },
-            KeyCode::Char('a') if on_packages => self.plan.toggle_all(),
-            KeyCode::Char('a') => {}
+            KeyCode::Char('a') => match self.current() {
+                Some(Row::Packages | Row::Package(_)) => self.plan.toggle_all_packages(),
+                Some(Row::Configs | Row::Config(_)) => self.plan.toggle_all_configs(),
+                None => {}
+            },
             _ => return false,
         }
         true
@@ -360,7 +504,7 @@ impl PlanView {
         if self.plan.packages.is_empty() {
             return heading_empty(spans);
         }
-        ui::right_aligned(spans, size::format(self.plan.size()), width)
+        ui::right_aligned(spans, size::format(self.plan.packages_size()), width)
     }
 
     fn configs_heading(&self, width: usize) -> Line<'static> {
@@ -387,8 +531,9 @@ impl PlanView {
         if config.confidence == Confidence::High {
             confidence = confidence.add_modifier(Modifier::BOLD);
         }
+        let check = if config.selected { "[x]" } else { "[ ]" };
         let mut spans = vec![
-            Span::raw(format!("  {}", config.label)),
+            Span::raw(format!("  {check} {}", config.label)),
             Span::styled(format!("  {}", config.confidence.name()), confidence),
             Span::styled(
                 format!(" · {}", config.reason),
@@ -606,6 +751,7 @@ mod tests {
             confidence,
             reason: reason.into(),
             in_use: false,
+            selected: false,
         };
         let mut screen = Screen::with_plan(Plan {
             configs: vec![
@@ -632,13 +778,15 @@ mod tests {
                 .trim_end()
                 .ends_with("2.0 KiB")
         );
-        assert!(rows[3].contains("~/.config/gone  High · unchanged since Mar 2025"));
-        assert!(rows[4].contains("~/.gonerc  Low · dotfile directly in ~"));
-        // Only listed for now: nothing to select.
-        for _ in 0..3 {
-            press(&mut screen, KeyCode::Char('j'));
-        }
+        assert!(rows[3].contains("[ ] ~/.config/gone  High · unchanged since Mar 2025"));
+        assert!(rows[4].contains("[ ] ~/.gonerc  Low · dotfile directly in ~"));
+        // Space on a config selects it, a on the configs selects them all.
+        press(&mut screen, KeyCode::Char('j'));
+        press(&mut screen, KeyCode::Char('j'));
         press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(selected_size(&screen), 2048);
+        press(&mut screen, KeyCode::Char('a'));
+        assert_eq!(selected_size(&screen), 2058);
         press(&mut screen, KeyCode::Char('a'));
         assert_eq!(selected_size(&screen), 0);
     }
@@ -657,7 +805,7 @@ mod tests {
         assert_eq!(selected_size(&screen), 30);
         press(&mut screen, KeyCode::Enter);
         press(&mut screen, KeyCode::Char('y'));
-        assert!(screen.needs_terminal());
+        assert!(screen.is_removing());
     }
 
     #[test]
@@ -668,7 +816,7 @@ mod tests {
         press(&mut screen, KeyCode::Char('y'));
         assert!(press(&mut screen, KeyCode::Char('q')));
         assert!(press(&mut screen, KeyCode::Esc));
-        assert!(screen.needs_terminal() && !screen.can_leave());
+        assert!(screen.is_removing() && !screen.can_leave());
     }
 
     #[test]
@@ -693,6 +841,75 @@ mod tests {
         assert!(rows.contains("│  cups "));
         assert!(rows.contains("│    /etc/cups/cupsd.conf  modified"));
         assert!(!rows.contains("zstd"));
+    }
+
+    fn configs(in_use: bool) -> Screen {
+        let config = |label: &str, size| OrphanedConfig {
+            path: label.replace('~', "/nonexistent-home").into(),
+            label: label.into(),
+            size,
+            confidence: Confidence::High,
+            reason: String::new(),
+            in_use,
+            selected: true,
+        };
+        Screen::with_plan(Plan {
+            configs: vec![
+                config("~/.config/gone", 2048),
+                config("~/.cache/gone", 1024),
+            ],
+            ..Plan::default()
+        })
+    }
+
+    #[test]
+    fn configs_move_into_a_backup_after_confirming() {
+        let mut screen = configs(false);
+        press(&mut screen, KeyCode::Enter);
+        let rows = render(&mut screen, 90, 10).join("\n");
+        assert!(
+            rows.contains("Move these 2 configs into a Backup?"),
+            "{rows}"
+        );
+        assert!(rows.contains("they move into a dated Backup in ~/.local/share/vole/backups/"));
+        assert!(rows.contains("│  ~/.config/gone  High "));
+        assert!(!rows.contains("sudo"));
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(screen.is_removing());
+    }
+
+    #[test]
+    fn in_use_configs_need_a_second_confirmation() {
+        let mut screen = configs(true);
+        press(&mut screen, KeyCode::Enter);
+        press(&mut screen, KeyCode::Char('y'));
+        let rows = render(&mut screen, 100, 10).join("\n");
+        assert!(rows.contains("2 of these configs are in use"), "{rows}");
+        // A second y (a double-tap, auto-repeat) doesn't pass the In Use step.
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(!screen.is_removing());
+        press(&mut screen, KeyCode::Char('Y'));
+        assert!(screen.is_removing());
+    }
+
+    #[test]
+    fn the_question_names_what_goes_and_what_moves() {
+        let a = Package::new("a", 1024);
+        let b = Package::new("b", 1024);
+        let configs = configs(false);
+        let State::Ready(view) = &configs.state else {
+            panic!("no plan");
+        };
+        let one: Vec<&OrphanedConfig> = view.plan.configs.iter().take(1).collect();
+        assert_eq!(
+            question(&[&a], &[]),
+            "Remove this package, freeing about 1.0 KiB?"
+        );
+        assert_eq!(question(&[], &one), "Move this config into a Backup?");
+        assert_eq!(
+            question(&[&a, &b], &one),
+            "Remove these 2 packages, freeing about 2.0 KiB, and move this config into a Backup?"
+        );
     }
 
     #[test]

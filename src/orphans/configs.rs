@@ -66,6 +66,7 @@ pub struct OrphanedConfig {
     pub reason: String,
     /// Held by a running process.
     pub in_use: bool,
+    pub selected: bool,
 }
 
 /// The files and folders directly in the [`ROOTS`] and the dotfiles directly in `home` that the
@@ -96,6 +97,15 @@ pub fn candidates(home: &Path, rules: &Rules, mounts: &Mounts) -> (Vec<Candidate
     }
     look_in(home, true);
     (found, refused)
+}
+
+/// Whether `path` is where a config may be proposed: directly in one of the [`ROOTS`], or a
+/// dotfile directly in `home`.
+pub fn is_candidate_path(home: &Path, path: &Path) -> bool {
+    let in_root = ROOTS
+        .iter()
+        .any(|root| path.parent() == Some(home.join(root).as_path()));
+    in_root || is_loose_dotfile(home, path)
 }
 
 /// Whether `path` is a dotfile directly in `home`, and not one of the folders holding the
@@ -135,6 +145,7 @@ pub fn find(
             confidence,
             reason,
             in_use: false,
+            selected: false,
         });
     }
     orphans.sort_by_key(|orphan| (orphan.confidence, Reverse(orphan.size)));
@@ -142,7 +153,11 @@ pub fn find(
 }
 
 /// Flags the configs held by a running program; `open` is from [`in_use::open_paths`].
-pub fn mark_in_use(configs: &mut [OrphanedConfig], rules: &Rules, open: &[PathBuf]) {
+pub fn mark_in_use<'a>(
+    configs: impl IntoIterator<Item = &'a mut OrphanedConfig>,
+    rules: &Rules,
+    open: &[PathBuf],
+) {
     for config in configs {
         config.in_use |= rules
             .resolve(&config.path)
@@ -342,6 +357,7 @@ mod tests {
             confidence: Confidence::High,
             reason: String::new(),
             in_use: false,
+            selected: false,
             path,
         };
         let mut configs = [config(held.clone()), config(home.dir(".config/free"))];

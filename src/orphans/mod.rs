@@ -1,5 +1,6 @@
 //! `orphans`: Orphaned Packages and Orphaned Configs.
 
+mod backup;
 mod configs;
 mod detect;
 mod known;
@@ -10,6 +11,7 @@ mod remove;
 mod screen;
 
 use std::collections::HashMap;
+use std::io;
 use std::path::Path;
 use std::thread;
 use std::time::SystemTime;
@@ -24,11 +26,14 @@ use owners::Owners;
 use plan::Plan;
 pub use screen::Screen;
 
+/// The path rules for Orphaned Configs: the roots, and the dotfiles directly in `home`.
+fn rules(home: &Path, config: &Config) -> io::Result<Rules> {
+    Ok(Rules::new(home, configs::ROOTS, &config.protected_paths(home))?.with_loose_dotfiles())
+}
+
 /// Builds the Plan. Only reads: nothing changes.
 pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
-    let rules = Rules::new(home, configs::ROOTS, &config.protected_paths(home))
-        .with_context(|| format!("resolving {}", home.display()))?
-        .with_loose_dotfiles();
+    let rules = rules(home, config).with_context(|| format!("resolving {}", home.display()))?;
     // Measuring only: without the mount points, the walk still stops at other filesystems.
     let mounts = Mounts::load().unwrap_or_default();
     let (candidates, refused) = configs::candidates(home, &rules, &mounts);
@@ -78,4 +83,20 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
         plan.configs_note = Some(format!("{refused} path(s) left out by the safety rules"));
     }
     Ok(plan)
+}
+
+/// Checks the selected configs against the programs running now, since one may have started
+/// using a config after the scan. Flags already set stay set.
+pub fn refresh_in_use(plan: &mut Plan, config: &Config) {
+    if plan.selected_configs().next().is_none() {
+        return;
+    }
+    let Some(home) = dirs::home_dir() else {
+        return;
+    };
+    let Ok(rules) = rules(&home, config) else {
+        return;
+    };
+    let selected = plan.configs.iter_mut().filter(|config| config.selected);
+    configs::mark_in_use(selected, &rules, &in_use::open_paths());
 }

@@ -56,16 +56,27 @@ pub fn draw_outcomes(
     scroll: &mut u16,
 ) {
     let width = usize::from(block.inner(area).width);
-    let freed: u64 = outcomes
-        .iter()
-        .filter(|o| o.error.is_none())
-        .map(|o| o.size)
-        .sum();
+    let done = |moved: bool| -> u64 {
+        outcomes
+            .iter()
+            .filter(|o| o.error.is_none() && o.moved == moved)
+            .map(|o| o.size)
+            .sum()
+    };
+    let (freed, moved) = (done(false), done(true));
     let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
-    let mut summary = format!("Freed about {}", size::format(freed));
-    if failed > 0 {
-        summary.push_str(&format!(" · {failed} failed"));
+    let mut parts = Vec::new();
+    if freed > 0 || moved == 0 {
+        parts.push(format!("freed about {}", size::format(freed)));
     }
+    if moved > 0 {
+        parts.push(format!("moved {} into a Backup", size::format(moved)));
+    }
+    if failed > 0 {
+        parts.push(format!("{failed} failed"));
+    }
+    let mut summary = parts.join(" · ");
+    summary[..1].make_ascii_uppercase();
     let mut lines = vec![
         Line::styled(summary, Style::new().add_modifier(Modifier::BOLD)),
         Line::default(),
@@ -73,11 +84,14 @@ pub fn draw_outcomes(
     let dim = Style::new().add_modifier(Modifier::DIM);
     for outcome in outcomes {
         match &outcome.error {
-            None => lines.push(right_aligned(
-                vec![Span::raw(format!("  ✓ {}", outcome.label))],
-                size::format(outcome.size),
-                width,
-            )),
+            None => {
+                let to = if outcome.moved { " → Backup" } else { "" };
+                lines.push(right_aligned(
+                    vec![Span::raw(format!("  ✓ {}{to}", outcome.label))],
+                    size::format(outcome.size),
+                    width,
+                ))
+            }
             Some(err) => {
                 lines.push(Line::from(format!("  ✗ {}", outcome.label)));
                 lines.push(Line::styled(format!("      {err}"), dim));
@@ -93,6 +107,49 @@ pub fn draw_outcomes(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn outcome(label: &str, size: u64, error: Option<&str>, moved: bool) -> Outcome {
+        Outcome {
+            label: label.into(),
+            size,
+            error: error.map(String::from),
+            log_error: None,
+            moved,
+        }
+    }
+
+    /// The result screen as text.
+    fn render(outcomes: &[Outcome]) -> String {
+        let backend = ratatui::backend::TestBackend::new(80, 8);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| {
+                draw_outcomes(frame, frame.area(), Block::bordered(), outcomes, &mut 0);
+            })
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..8)
+            .map(|y| (0..80).map(|x| buffer[(x, y)].symbol()).collect::<String>())
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn results_tell_freed_from_moved() {
+        let text = render(&[
+            outcome("pkg", 2048, None, false),
+            outcome("~/.config/gone", 1024, None, true),
+            outcome("~/.config/stuck", 1, Some("refused"), true),
+        ]);
+        assert!(
+            text.contains("Freed about 2.0 KiB · moved 1.0 KiB into a Backup · 1 failed"),
+            "{text}"
+        );
+        assert!(text.contains("✓ ~/.config/gone → Backup"));
+        let text = render(&[outcome("~/.config/gone", 1024, None, true)]);
+        assert!(text.contains("Moved 1.0 KiB into a Backup"), "{text}");
+        assert!(render(&[]).contains("Freed about 0 B"));
+    }
 
     #[test]
     fn sizes_line_up_with_wide_characters() {

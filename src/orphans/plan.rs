@@ -75,19 +75,50 @@ impl Plan {
     }
 
     pub fn size(&self) -> u64 {
+        self.packages_size() + self.configs.iter().map(|config| config.size).sum::<u64>()
+    }
+
+    pub fn packages_size(&self) -> u64 {
         self.packages.iter().map(|package| package.size).sum()
     }
 
     pub fn selected_size(&self) -> u64 {
-        self.selected().map(|package| package.size).sum()
+        self.selected_packages()
+            .map(|package| package.size)
+            .sum::<u64>()
+            + self
+                .selected_configs()
+                .map(|config| config.size)
+                .sum::<u64>()
     }
 
-    pub fn selected(&self) -> impl Iterator<Item = &Package> {
+    pub fn selected_packages(&self) -> impl Iterator<Item = &Package> {
         self.packages.iter().filter(|package| package.selected)
     }
 
+    pub fn selected_configs(&self) -> impl Iterator<Item = &OrphanedConfig> {
+        self.configs.iter().filter(|config| config.selected)
+    }
+
+    /// Whether anything is selected.
+    pub fn any_selected(&self) -> bool {
+        self.selected_packages().next().is_some() || self.selected_configs().next().is_some()
+    }
+
+    pub fn toggle_config(&mut self, index: usize) {
+        self.configs[index].selected = !self.configs[index].selected;
+    }
+
+    /// Selects every config, or deselects them all when they already are.
+    pub fn toggle_all_configs(&mut self) {
+        let select = !self.configs.iter().all(|config| config.selected);
+        for config in &mut self.configs {
+            config.selected = select;
+        }
+    }
+
     /// Selects or deselects a package, together with the packages that go or stay with it.
-    pub fn toggle(&mut self, index: usize) {
+    pub fn toggle_package(&mut self, index: usize) {
         if self.packages[index].selected {
             self.deselect(index);
         } else {
@@ -96,7 +127,7 @@ impl Plan {
     }
 
     /// Selects every package, or deselects them all when they already are.
-    pub fn toggle_all(&mut self) {
+    pub fn toggle_all_packages(&mut self) {
         let select = !self.packages.iter().all(|package| package.selected);
         for package in &mut self.packages {
             package.selected = select;
@@ -442,7 +473,7 @@ mod tests {
 
     fn toggle(plan: &mut Plan, name: &str) {
         let index = index(plan, name);
-        plan.toggle(index);
+        plan.toggle_package(index);
     }
 
     #[test]
@@ -564,9 +595,9 @@ mod tests {
         let installed = system(&[("a", &["b"]), ("b", &[]), ("c", &[])]);
         let mut plan = Plan::build(&installed, &orphans(&["a", "c"]));
         toggle(&mut plan, "c");
-        plan.toggle_all();
+        plan.toggle_all_packages();
         assert_eq!(plan.selected_size(), 3);
-        plan.toggle_all();
+        plan.toggle_all_packages();
         assert_eq!(plan.selected_size(), 0);
     }
 }

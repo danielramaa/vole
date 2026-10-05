@@ -1,6 +1,7 @@
 //! Reading the installed packages from pacman, as the user: root-owned things are only measured
 //! through the official tools (ADR 0001).
 
+use std::collections::{BTreeSet, HashSet};
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
@@ -57,10 +58,7 @@ fn orphan_names(output: &Output) -> Result<Vec<String>> {
         return Ok(Vec::new());
     }
     check(output)?;
-    Ok(String::from_utf8_lossy(&output.stdout)
-        .split_whitespace()
-        .map(String::from)
-        .collect())
+    Ok(words(&output.stdout))
 }
 
 /// Every installed package (`pacman -Qi`).
@@ -79,6 +77,41 @@ pub fn backup_files(names: &[&str]) -> Result<Vec<Info>> {
     Ok(parse_info(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// What `pacman -Rns` would remove when given `names`: them and the dependencies only they
+/// need. (`--print` can't be combined with `-n`, which only changes what happens to config
+/// files.)
+pub fn would_remove(names: &[&str]) -> Result<BTreeSet<String>> {
+    let mut args = vec!["-Rsp", "--print-format", "%n", "--"];
+    args.extend_from_slice(names);
+    let output = query(&args)?;
+    check(&output)?;
+    Ok(words(&output.stdout).into_iter().collect())
+}
+
+/// The names of every installed package (`pacman -Qq`).
+pub fn installed_names() -> Result<HashSet<String>> {
+    let output = query(&["-Qq"])?;
+    check(&output)?;
+    Ok(words(&output.stdout).into_iter().collect())
+}
+
+/// Whether `name` is a valid package name: alphanumerics and `@._+-`, not starting with `-` or
+/// `.` (makepkg's rule), so it can't be read as an option.
+pub fn is_package_name(name: &str) -> bool {
+    !name.is_empty()
+        && !name.starts_with(['-', '.'])
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "@._+-".contains(c))
+}
+
+fn words(stdout: &[u8]) -> Vec<String> {
+    String::from_utf8_lossy(stdout)
+        .split_whitespace()
+        .map(String::from)
+        .collect()
+}
+
 /// Runs a read-only pacman command as the user: in the C locale and without a terminal width,
 /// so its output can be parsed.
 fn query(args: &[&str]) -> Result<Output> {
@@ -95,17 +128,35 @@ fn check(output: &Output) -> Result<()> {
     if output.status.success() {
         return Ok(());
     }
-    bail!("pacman failed: {}", message(&output.stderr))
+    match message(output) {
+        message if message.is_empty() => bail!("pacman failed ({})", output.status),
+        message => bail!("pacman: {message}"),
+    }
 }
 
-/// pacman's error message on one row.
-fn message(stderr: &[u8]) -> String {
-    String::from_utf8_lossy(stderr)
+/// pacman's error message on one row. When pacman explains the error in `::` lines (printed to
+/// stdout, e.g. which package depends on one being removed), those, since they say more.
+fn message(output: &Output) -> String {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let explained: Vec<&str> = stdout
         .lines()
-        .map(|line| line.trim().trim_start_matches("error: "))
+        .filter_map(|line| line.strip_prefix("::"))
+        .collect();
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let lines: Vec<&str> = if explained.is_empty() {
+        stderr
+            .lines()
+            .map(|line| line.trim_start_matches("error: "))
+            .collect()
+    } else {
+        explained
+    };
+    lines
+        .iter()
+        .map(|line| line.trim())
         .filter(|line| !line.is_empty())
         .collect::<Vec<_>>()
-        .join(" ")
+        .join("; ")
 }
 
 /// Reads `pacman -Qi` output: a block of `Field : value` lines per package. A value pacman
@@ -267,13 +318,52 @@ Backup Files    : None
     }
 
     #[test]
+    fn package_names_cannot_be_options() {
+        for name in [
+            "zstd",
+            "python-pkg_resources",
+            "lib32-libcap",
+            "gtk+3",
+            "foo@bar.baz",
+        ] {
+            assert!(is_package_name(name), "{name}");
+        }
+        for name in [
+            "",
+            "-Syu",
+            "--root=/tmp",
+            ".hidden",
+            "a b",
+            "a/b",
+            "caf\u{e9}",
+        ] {
+            assert!(!is_package_name(name), "{name}");
+        }
+    }
+
+    #[test]
     fn error_messages_fit_on_one_row() {
-        let stderr = b"error: failed to prepare transaction (could not satisfy dependencies)\n\
-                       :: removing b breaks dependency 'b' required by a\n";
+        let failed = output(
+            1,
+            "a\n:: removing b breaks dependency 'b' required by a\n",
+            "error: failed to prepare transaction (could not satisfy dependencies)\n",
+        );
         assert_eq!(
-            message(stderr),
-            "failed to prepare transaction (could not satisfy dependencies) \
-             :: removing b breaks dependency 'b' required by a"
+            check(&failed).unwrap_err().to_string(),
+            "pacman: removing b breaks dependency 'b' required by a"
+        );
+        let unexplained = output(
+            1,
+            "",
+            "error: target not found: x\nerror: target not found: y\n",
+        );
+        assert_eq!(
+            check(&unexplained).unwrap_err().to_string(),
+            "pacman: target not found: x; target not found: y"
+        );
+        assert_eq!(
+            check(&output(1, "", "")).unwrap_err().to_string(),
+            "pacman failed (exit status: 1)"
         );
     }
 }

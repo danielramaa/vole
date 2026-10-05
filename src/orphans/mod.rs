@@ -2,6 +2,7 @@
 
 mod pacman;
 pub mod plan;
+mod remove;
 mod screen;
 
 use std::collections::HashMap;

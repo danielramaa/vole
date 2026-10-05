@@ -1,37 +1,18 @@
 //! Applying the Plan: removing the selected Items and writing the Operation Log.
 
-use std::fs::{self, File, OpenOptions, Permissions};
-use std::io::{self, Write};
+use std::fs::{self, Permissions};
+use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::{MetadataExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::time::{SystemTime, UNIX_EPOCH};
-
-use serde::Serialize;
 
 use super::plan::{Item, Kind, Plan, RootCommand};
 use super::scan::{Mounts, is_real_dir, trash_parts};
+use crate::log::{Log, Outcome};
 use crate::safety::Rules;
-use crate::term::Ran;
-
-const SUDO: &str = "/usr/bin/sudo";
-
-/// What happened to one selected Item.
-#[derive(Debug)]
-pub struct Outcome {
-    pub label: String,
-    /// Bytes freed; for root commands, the Plan's estimate.
-    pub size: u64,
-    /// Why the Item wasn't (fully) removed.
-    pub error: Option<String>,
-    /// Why the attempt is missing from the Operation Log, whatever its result.
-    pub log_error: Option<String>,
-}
-
-/// Runs root commands, all under one pause of the TUI.
-pub type RunRoot<'a> = dyn FnMut(&mut [Command]) -> Ran + 'a;
+use crate::term::{self, RunRoot};
 
 /// Removes the selected home Items, each after a last safety check, and writes each attempt
 /// to `log`. `progress` is told about each Item before it is removed. Once `stop` is set, the
@@ -61,7 +42,7 @@ pub fn remove_home(
             Kind::Root(_) => continue,
         };
         let target = item.path().unwrap_or(Path::new("")).display().to_string();
-        outcomes.push(log.record(item, &target, result));
+        outcomes.push(record(log, item, &target, result));
     }
     outcomes
 }
@@ -84,32 +65,36 @@ pub fn remove_root(
     let mut commands: Vec<Command> = root
         .iter()
         .map(|(command, _)| {
-            let mut sudo = Command::new(SUDO);
-            sudo.arg(command.program()).args(command.args());
+            let mut sudo = term::as_root(command.program());
+            sudo.args(command.args());
             sudo
         })
         .collect();
     if commands.is_empty() {
         return (Vec::new(), Ok(()));
     }
-    let targets: Vec<String> = commands.iter().map(crate::term::describe).collect();
+    let targets: Vec<String> = commands.iter().map(term::describe).collect();
     let ran = run_root(&mut commands);
-    let not_run = match &ran.terminal {
-        Err(err) if ran.statuses.is_empty() => format!("the terminal could not be paused: {err}"),
-        _ => "did not run".to_string(),
-    };
-    let mut statuses = ran.statuses.into_iter();
-    let mut outcomes = Vec::new();
-    for ((_, item), target) in root.iter().zip(&targets) {
-        let result = match statuses.next() {
-            Some(Ok(status)) if status.success() => Ok(()),
-            Some(Ok(status)) => Err(format!("{target} failed ({status})")),
-            Some(Err(err)) => Err(format!("{target} could not run: {err}")),
-            None => Err(format!("{target} {not_run}")),
-        };
-        outcomes.push(log.record(item, target, result));
-    }
+    let outcomes = root
+        .iter()
+        .zip(&targets)
+        .enumerate()
+        .map(|(i, ((_, item), target))| {
+            let result = ran.error(i, target).map_or(Ok(()), Err);
+            record(log, item, target, result)
+        })
+        .collect();
     (outcomes, ran.terminal)
+}
+
+/// Writes the attempt to remove `item` to the Operation Log.
+fn record(log: &mut Log, item: &Item, target: &str, result: Result<(), String>) -> Outcome {
+    let kind = match item.kind {
+        Kind::Regenerable(_) => "regenerable",
+        Kind::Trash(_) => "trash",
+        Kind::Root(_) => "root",
+    };
+    log.record(&item.label, kind, item.size, target, result)
 }
 
 /// The Outcome of an Item vole didn't try to remove, so there is nothing to log.
@@ -287,80 +272,12 @@ fn remove_tree(path: &Path, meta: &fs::Metadata, device: u64, mounts: &Mounts) -
     }
 }
 
-/// The Operation Log: one JSON line per Item vole tried to remove, and the outcome.
-pub struct Log {
-    file: File,
-}
-
-#[derive(Serialize)]
-struct Entry<'a> {
-    /// Seconds since the Unix epoch.
-    time: u64,
-    module: &'static str,
-    item: &'a str,
-    /// The removed path, or the command that was run.
-    target: &'a str,
-    kind: &'static str,
-    size: u64,
-    removed: bool,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    error: Option<&'a str>,
-}
-
-impl Log {
-    pub fn path() -> Option<PathBuf> {
-        dirs::state_dir().map(|dir| dir.join("vole").join("log.jsonl"))
-    }
-
-    pub fn open(path: &Path) -> io::Result<Self> {
-        if let Some(dir) = path.parent() {
-            fs::create_dir_all(dir)?;
-        }
-        let file = OpenOptions::new().create(true).append(true).open(path)?;
-        Ok(Self { file })
-    }
-
-    /// Writes the attempt to the log and turns it into an Outcome.
-    fn record(&mut self, item: &Item, target: &str, result: Result<(), String>) -> Outcome {
-        let entry = Entry {
-            time: SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map_or(0, |d| d.as_secs()),
-            module: "clean",
-            item: &item.label,
-            target,
-            kind: match item.kind {
-                Kind::Regenerable(_) => "regenerable",
-                Kind::Trash(_) => "trash",
-                Kind::Root(_) => "root",
-            },
-            size: item.size,
-            removed: result.is_ok(),
-            error: result.as_ref().err().map(String::as_str),
-        };
-        let written = self.write(&entry);
-        Outcome {
-            label: item.label.clone(),
-            size: item.size,
-            error: result.err(),
-            log_error: written
-                .err()
-                .map(|err| format!("not written to the operation log: {err}")),
-        }
-    }
-
-    fn write(&mut self, entry: &Entry) -> io::Result<()> {
-        let mut line = serde_json::to_string(entry)?;
-        line.push('\n');
-        self.file.write_all(line.as_bytes())
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::clean::plan::{Category, RootCommand};
     use crate::clean::scan::ALLOWED_ROOTS;
+    use crate::term::Ran;
     use crate::testdir::TestDir;
     use std::os::unix::process::ExitStatusExt;
     use std::process::ExitStatus;
@@ -393,7 +310,7 @@ mod tests {
         let plan = Plan {
             categories: vec![category],
         };
-        let mut log = Log::open(&setup.log_path).unwrap();
+        let mut log = Log::open(&setup.log_path, "clean").unwrap();
         let mut no_progress = |_: usize, _: usize, _: &str| {};
         let stop = AtomicBool::new(false);
         remove_home(
@@ -463,7 +380,7 @@ mod tests {
             categories: vec![category],
         };
         // Every write to /dev/full fails with "no space left".
-        let mut log = Log::open(Path::new("/dev/full")).unwrap();
+        let mut log = Log::open(Path::new("/dev/full"), "clean").unwrap();
         let stop = AtomicBool::new(false);
         let outcomes = remove_home(
             &plan,
@@ -646,7 +563,7 @@ mod tests {
         let plan = Plan {
             categories: vec![category],
         };
-        let mut log = Log::open(&s.log_path).unwrap();
+        let mut log = Log::open(&s.log_path, "clean").unwrap();
         let stop = AtomicBool::new(false);
         let mut seen = Vec::new();
         let mut progress = |done: usize, total: usize, _: &str| {
@@ -675,7 +592,7 @@ mod tests {
         let plan = Plan {
             categories: vec![category],
         };
-        let mut log = Log::open(&s.log_path).unwrap();
+        let mut log = Log::open(&s.log_path, "clean").unwrap();
         let mut run = |_: &mut [Command]| Ran {
             statuses: vec![Ok(ExitStatus::from_raw(0))],
             terminal: Err(io::Error::other("no tty")),
@@ -698,10 +615,10 @@ mod tests {
         let plan = Plan {
             categories: vec![category],
         };
-        let mut log = Log::open(&s.log_path).unwrap();
+        let mut log = Log::open(&s.log_path, "clean").unwrap();
         let mut ran = Vec::new();
         let mut run = |commands: &mut [Command]| -> Ran {
-            ran = commands.iter().map(crate::term::describe).collect();
+            ran = commands.iter().map(term::describe).collect();
             // The journal vacuum fails.
             Ran {
                 statuses: vec![

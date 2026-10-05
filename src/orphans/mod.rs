@@ -13,7 +13,7 @@ mod screen;
 
 use std::collections::HashMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::SystemTime;
 
@@ -33,8 +33,9 @@ fn rules(home: &Path, config: &Config) -> io::Result<Rules> {
     Ok(Rules::new(home, configs::ROOTS, &config.protected_paths(home))?.with_loose_dotfiles())
 }
 
-/// Builds the Plan. Only reads: nothing changes.
-pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
+/// Builds the Plan. Only reads: nothing changes. The configs packages just removed `left`
+/// behind come first.
+pub fn build_plan(home: &Path, config: &Config, left: &[(PathBuf, String)]) -> Result<Plan> {
     let rules = rules(home, config).with_context(|| format!("resolving {}", home.display()))?;
     // Measuring only: without the mount points, the walk still stops at other filesystems.
     let mounts = Mounts::load().unwrap_or_default();
@@ -80,7 +81,10 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
         owners.add_known(known::load(&path, home)?);
     }
     let now = SystemTime::now();
-    plan.configs = configs::find(home, &candidates, &owners, &mounts, now);
+    let found = configs::find(home, &candidates, &owners, &mounts, now);
+    plan.configs = found.orphans;
+    plan.package_owned = found.package_owned;
+    configs::mark_left_behind(&mut plan.configs, left);
     configs::mark_in_use(&mut plan.configs, &rules, &open);
     plan.backups = backup::old(home, &mounts, now);
     if refused > 0 {

@@ -1,6 +1,7 @@
 //! The `orphans` screens: looking for Orphaned Packages and Configs, the Plan with selection,
 //! confirmation, and the result.
 
+use std::collections::HashSet;
 use std::io;
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -17,7 +18,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::backup::{BACKUPS, OLD_DAYS, OldBackup};
-use super::configs::{Confidence, OrphanedConfig};
+use super::configs::{Confidence, OrphanedConfig, PackageOwned};
 use super::pacman::{ConfigFile, FileState};
 use super::plan::{Package, Plan};
 use super::{build_plan, refresh_in_use, remove, rules};
@@ -32,6 +33,9 @@ use crate::{size, ui};
 pub struct Screen {
     config: Config,
     state: State,
+    /// What packages just removed left behind (each path with who left it), for the next scan to
+    /// put first.
+    left: Vec<(PathBuf, String)>,
 }
 
 enum State {
@@ -63,6 +67,8 @@ enum State {
     },
     Done {
         outcomes: Vec<Outcome>,
+        /// The configs the packages just removed left behind.
+        leftovers: Vec<PackageOwned>,
         scroll: u16,
     },
     Failed(String),
@@ -79,15 +85,17 @@ impl Screen {
         Self {
             config: config.clone(),
             state: State::NotStarted,
+            left: Vec::new(),
         }
     }
 
-    /// Starts building the Plan in the background.
-    fn start(config: Config) -> Receiver<Result<Plan, String>> {
+    /// Starts building the Plan in the background; what packages just removed `left` behind
+    /// comes first.
+    fn start(config: Config, left: Vec<(PathBuf, String)>) -> Receiver<Result<Plan, String>> {
         let (sender, receiver) = mpsc::channel();
         thread::spawn(move || {
             let plan = match dirs::home_dir() {
-                Some(home) => build_plan(&home, &config).map_err(|err| format!("{err:#}")),
+                Some(home) => build_plan(&home, &config, &left).map_err(|err| format!("{err:#}")),
                 None => Err("the home directory could not be found".into()),
             };
             // The user may have left the screen already; then nobody is listening.
@@ -101,6 +109,7 @@ impl Screen {
         Self {
             config: Config::default(),
             state: State::Ready(PlanView::new(plan)),
+            left: Vec::new(),
         }
     }
 
@@ -175,7 +184,10 @@ impl ModuleScreen for Screen {
     fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
-            State::NotStarted => State::Scanning(Self::start(self.config.clone())),
+            State::NotStarted => {
+                let left = std::mem::take(&mut self.left);
+                State::Scanning(Self::start(self.config.clone(), left))
+            }
             State::Scanning(receiver) => match receiver.try_recv() {
                 Ok(Ok(plan)) => State::Ready(PlanView::new(plan)),
                 Ok(Err(err)) => State::Failed(format!("Could not look for orphans: {err}")),
@@ -209,6 +221,7 @@ impl ModuleScreen for Screen {
                             }
                             break State::Done {
                                 outcomes,
+                                leftovers: Vec::new(),
                                 scroll: 0,
                             };
                         }
@@ -299,18 +312,27 @@ impl ModuleScreen for Screen {
             state @ (State::Removing(_)
             | State::RemovingHome { .. }
             | State::RootPending { .. }) => (state, true),
-            State::Done { .. } | State::Failed(_) if key.code == KeyCode::Enter => {
+            // Scanning again, with what the removed packages left behind first.
+            State::Done { leftovers, .. } if key.code == KeyCode::Enter => {
+                self.left = leftovers
+                    .into_iter()
+                    .map(|left| (left.path, left.packages.join(", ")))
+                    .collect();
                 (State::NotStarted, true)
             }
-            State::Done { outcomes, scroll } => {
+            State::Failed(_) if key.code == KeyCode::Enter => (State::NotStarted, true),
+            State::Done {
+                outcomes,
+                leftovers,
+                scroll,
+            } => {
                 let next = ui::scrolled(scroll, key);
-                (
-                    State::Done {
-                        outcomes,
-                        scroll: next,
-                    },
-                    next != scroll,
-                )
+                let done = State::Done {
+                    outcomes,
+                    leftovers,
+                    scroll: next,
+                };
+                (done, next != scroll)
             }
             state => (state, false),
         };
@@ -324,6 +346,9 @@ impl ModuleScreen for Screen {
             State::Confirm { in_use: false, .. } => "↑↓ scroll · y remove · n back",
             State::Confirm { in_use: true, .. } => "↑↓ scroll · Y remove anyway · n back",
             State::RemovingHome { .. } => "esc stop after this Item",
+            State::Done { ref leftovers, .. } if !leftovers.is_empty() => {
+                "↑↓ scroll · enter look at what they left"
+            }
             State::Done { .. } => "↑↓ scroll · enter scan again",
             State::Failed(_) => "enter scan again",
             State::NotStarted
@@ -368,9 +393,11 @@ impl ModuleScreen for Screen {
         };
         let (packages, terminal) =
             remove::remove_packages(&plan, &mut log, run_root, &remove::System);
+        let leftovers = left_behind(&plan, &packages);
         outcomes.extend(packages);
         self.state = State::Done {
             outcomes,
+            leftovers,
             scroll: 0,
         };
         terminal
@@ -403,11 +430,57 @@ impl ModuleScreen for Screen {
                 };
                 frame.render_widget(Paragraph::new(text).block(block), area)
             }
-            State::Done { outcomes, scroll } => {
-                ui::draw_outcomes(frame, area, block, outcomes, scroll)
-            }
+            State::Done {
+                outcomes,
+                leftovers,
+                scroll,
+            } => draw_done(frame, area, block, outcomes, leftovers, scroll),
         }
     }
+}
+
+/// The configs only the packages that `removed` says went owned: what they left behind.
+fn left_behind(plan: &Plan, removed: &[Outcome]) -> Vec<PackageOwned> {
+    let gone: HashSet<&str> = removed
+        .iter()
+        .filter(|outcome| outcome.error.is_none())
+        .map(|outcome| outcome.label.as_str())
+        .collect();
+    plan.package_owned
+        .iter()
+        .filter(|owned| owned.packages.iter().all(|p| gone.contains(p.as_str())))
+        .cloned()
+        .collect()
+}
+
+/// The result, and the configs the removed packages left behind.
+fn draw_done(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block,
+    outcomes: &[Outcome],
+    leftovers: &[PackageOwned],
+    scroll: &mut u16,
+) {
+    let width = usize::from(block.inner(area).width);
+    let mut lines = ui::outcome_lines(outcomes, width);
+    if !leftovers.is_empty() {
+        lines.push(Line::default());
+        lines.push(Line::styled(
+            "The removed packages left these configs behind; enter looks at them:",
+            Style::new().add_modifier(Modifier::BOLD),
+        ));
+        for left in leftovers {
+            lines.push(Line::from(vec![
+                Span::raw(format!("  {}", left.label)),
+                Span::styled(
+                    format!("  {}", left.packages.join(", ")),
+                    Style::new().add_modifier(Modifier::DIM),
+                ),
+            ]));
+        }
+    }
+    ui::draw_scrolled(frame, area, block, lines, scroll);
 }
 
 fn draw_confirm(
@@ -1122,6 +1195,50 @@ mod tests {
             "{rows}"
         );
         assert!(rows.contains("Old Backups are deleted for good."));
+    }
+
+    #[test]
+    fn offers_what_removed_packages_left_behind() {
+        let owned = |path: &str, packages: &[&str]| PackageOwned {
+            path: format!("/home/me/{path}").into(),
+            label: format!("~/{path}"),
+            packages: packages.iter().map(|p| p.to_string()).collect(),
+        };
+        let plan = Plan {
+            package_owned: vec![
+                owned(".config/htop", &["htop"]),
+                owned(".config/both", &["htop", "kept"]),
+                owned(".config/failed", &["failed"]),
+            ],
+            ..Plan::default()
+        };
+        let outcome = |name: &str, error: Option<&str>| Outcome {
+            label: name.into(),
+            size: 1,
+            error: error.map(String::from),
+            log_error: None,
+            moved: false,
+        };
+        let removed = [outcome("htop", None), outcome("failed", Some("no"))];
+        let leftovers = left_behind(&plan, &removed);
+        assert_eq!(leftovers, [owned(".config/htop", &["htop"])]);
+
+        let mut screen = Screen::with_plan(Plan::default());
+        screen.state = State::Done {
+            outcomes: removed.into(),
+            leftovers,
+            scroll: 0,
+        };
+        let rows = render(&mut screen, 90, 12).join("\n");
+        assert!(rows.contains("left these configs behind"), "{rows}");
+        assert!(rows.contains("~/.config/htop  htop"));
+        assert_eq!(screen.hint(), "↑↓ scroll · enter look at what they left");
+        // Enter scans again, with them first.
+        press(&mut screen, KeyCode::Enter);
+        assert_eq!(
+            screen.left,
+            [(PathBuf::from("/home/me/.config/htop"), "htop".to_string())]
+        );
     }
 
     #[test]

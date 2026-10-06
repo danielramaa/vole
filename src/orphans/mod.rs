@@ -58,7 +58,6 @@ pub fn build_plan(home: &Path, config: &Config, left: &[(PathBuf, String)]) -> R
     });
     let orphans = orphans.context("listing the orphaned packages")?;
     let installed = installed.context("reading the installed packages")?;
-    let files = files.context("listing the installed files")?;
 
     let mut plan = Plan::build(&installed, &orphans);
     if !plan.packages.is_empty() {
@@ -73,23 +72,37 @@ pub fn build_plan(home: &Path, config: &Config, left: &[(PathBuf, String)]) -> R
         }
     }
 
-    let names: Vec<String> = candidates.iter().map(configs::Candidate::name).collect();
-    let wanted = owners::wanted(names.iter().map(String::as_str));
-    let mut owners = Owners::from_pacman(&installed, &files, &wanted);
-    owners.add_outside_pacman(&outside);
-    if let Some(path) = known::path() {
-        owners.add_known(known::load(&path, home)?);
-    }
+    // Without every Owner, no config can be called orphaned; the packages can still be shown.
     let now = SystemTime::now();
-    let found = configs::find(home, &candidates, &owners, &mounts, now);
-    plan.configs = found.orphans;
-    plan.package_owned = found.package_owned;
-    configs::mark_left_behind(&mut plan.configs, left);
-    configs::mark_in_use(&mut plan.configs, &rules, &open);
-    plan.backups = backup::old(home, &mounts, now);
-    if refused > 0 {
-        plan.configs_note = Some(format!("{refused} path(s) left out by the safety rules"));
+    let owners = (|| -> Result<Owners> {
+        let files = files.context("listing the installed files")?;
+        let names: Vec<String> = candidates.iter().map(configs::Candidate::name).collect();
+        let wanted = owners::wanted(names.iter().map(String::as_str));
+        let mut owners = Owners::from_pacman(&installed, &files, &wanted);
+        owners.add_outside_pacman(&outside);
+        if let Some(path) = known::path() {
+            owners.add_known(known::load(&path, home)?);
+        }
+        Ok(owners)
+    })();
+    match owners {
+        Ok(owners) => {
+            let found = configs::find(home, &candidates, &owners, &mounts, now);
+            plan.configs = found.orphans;
+            plan.package_owned = found.package_owned;
+            configs::mark_left_behind(&mut plan.configs, left);
+            configs::mark_in_use(&mut plan.configs, &rules, &open);
+            if refused > 0 {
+                plan.configs_note = Some(format!("{refused} path(s) left out by the safety rules"));
+            }
+        }
+        // Shown on one row: some errors (TOML's) go on to quote the file.
+        Err(err) => {
+            let err = format!("{err:#}");
+            plan.configs_error = Some(err.lines().next().unwrap_or_default().to_string());
+        }
     }
+    plan.backups = backup::old(home, &mounts, now);
     Ok(plan)
 }
 

@@ -459,7 +459,10 @@ fn draw_confirm(
         };
         lines.push(Line::styled(question, bold));
         lines.push(Line::from(
-            "The trash keeps them, and your file manager can put them back, until it is emptied; vole clean empties it.",
+            "They stay in the trash, where your file manager can put them back.",
+        ));
+        lines.push(Line::from(
+            "The space is freed when the trash is emptied; vole clean empties it.",
         ));
     }
     lines.push(Line::default());
@@ -1415,8 +1418,9 @@ mod tests {
         press(&mut screen, KeyCode::Char(' '));
         press(&mut screen, KeyCode::Char('t'));
         assert!(!screen.can_leave());
-        let rows = render(&mut screen, 100, 10).join("\n");
+        let rows = render(&mut screen, 80, 10).join("\n");
         assert!(rows.contains("Move this Item ("), "{rows}");
+        assert!(rows.contains("vole clean empties it."), "{rows}");
         assert!(rows.contains(") to the trash?"), "{rows}");
         assert!(rows.contains("~/Videos"), "{rows}");
         // Back keeps the selection.

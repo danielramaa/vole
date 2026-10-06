@@ -1278,6 +1278,82 @@ mod tests {
         assert!(!rows.contains("none found  couldn't"));
     }
 
+    /// The screen as the removal thread finishes, for a Plan with `packages` selected.
+    fn finishing(packages: bool, stopped: bool) -> (Screen, mpsc::Sender<Progress>) {
+        let mut plan = Plan::default();
+        if packages {
+            let mut package = Package::new("a", 10);
+            package.selected = true;
+            plan.packages.push(package);
+        }
+        let (sender, receiver) = mpsc::channel();
+        let mut screen = Screen::with_plan(Plan::default());
+        screen.state = State::RemovingHome {
+            plan,
+            receiver,
+            stop: Arc::new(AtomicBool::new(stopped)),
+            now: String::new(),
+        };
+        (screen, sender)
+    }
+
+    fn log() -> Log {
+        let dir = crate::testdir::TestDir::new();
+        Log::open(&dir.path().join("log.jsonl"), "orphans").unwrap()
+    }
+
+    #[test]
+    fn shows_what_is_being_removed_and_stops_on_esc() {
+        let (mut screen, sender) = finishing(false, false);
+        sender
+            .send(Progress::Item("~/.config/a (1 of 2)".into()))
+            .unwrap();
+        screen.tick();
+        assert!(
+            render(&mut screen, 60, 5)
+                .join("")
+                .contains("Removing ~/.config/a (1 of 2)…")
+        );
+        assert_eq!(screen.hint(), "esc stop after this Item");
+        assert!(press(&mut screen, KeyCode::Esc));
+        assert!(!screen.can_leave());
+        assert!(
+            render(&mut screen, 60, 5)
+                .join("")
+                .contains("Stopping after ~/.config/a")
+        );
+    }
+
+    #[test]
+    fn packages_wait_for_the_terminal_after_the_rest() {
+        let (mut screen, sender) = finishing(true, false);
+        sender.send(Progress::Finished(Vec::new(), log())).unwrap();
+        screen.tick();
+        assert!(screen.needs_terminal());
+
+        // Without packages, it is done.
+        let (mut screen, sender) = finishing(false, false);
+        sender.send(Progress::Finished(Vec::new(), log())).unwrap();
+        screen.tick();
+        assert!(!screen.needs_terminal() && screen.can_leave());
+    }
+
+    #[test]
+    fn stopping_leaves_the_packages_alone() {
+        let (mut screen, sender) = finishing(true, true);
+        sender.send(Progress::Finished(Vec::new(), log())).unwrap();
+        screen.tick();
+        assert!(!screen.needs_terminal());
+        let State::Done { outcomes, .. } = &screen.state else {
+            panic!("not done");
+        };
+        assert_eq!(outcomes[0].label, "a");
+        assert_eq!(
+            outcomes[0].error.as_deref(),
+            Some("stopped before removing it")
+        );
+    }
+
     #[test]
     fn leaving_keys_are_not_used() {
         let mut screen = screen();

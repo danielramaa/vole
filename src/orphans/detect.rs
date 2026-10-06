@@ -3,11 +3,18 @@
 
 use std::env;
 use std::fs;
+use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
-use std::process::Command;
+use std::process::{Command, Stdio};
+use std::thread;
+use std::time::{Duration, Instant};
 
 const FLATPAK: &str = "/usr/bin/flatpak";
+
+/// How long `flatpak list` may take. Past that, the scan goes on without it: Flatpak's apps are
+/// still known by the desktop entries it exports.
+const FLATPAK_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// Where user programs live even when they aren't on `$PATH` when vole runs.
 const USER_BIN: &[&str] = &[".local/bin", ".cargo/bin"];
@@ -187,24 +194,53 @@ fn exec_words(exec: &str) -> Vec<String> {
     words
 }
 
-/// The Flatpak apps installed, by id (`flatpak list`); none when Flatpak isn't.
+/// The Flatpak apps installed, by id (`flatpak list`); none when Flatpak isn't, or doesn't answer
+/// in time.
 pub fn flatpaks() -> Vec<String> {
     if !Path::new(FLATPAK).exists() {
         return Vec::new();
     }
-    let output = Command::new(FLATPAK)
+    let mut command = Command::new(FLATPAK);
+    command
         .args(["list", "--app", "--columns=application"])
-        .env("LC_ALL", "C")
-        .output();
-    match output {
-        Ok(output) if output.status.success() => String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .map(str::trim)
-            .filter(|id| !id.is_empty())
-            .map(String::from)
-            .collect(),
-        _ => Vec::new(),
-    }
+        .env("LC_ALL", "C");
+    run_for_a_while(command, FLATPAK_TIMEOUT)
+        .unwrap_or_default()
+        .lines()
+        .map(str::trim)
+        .filter(|id| !id.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// What `command` prints, if it succeeds within `timeout`; it is killed when it takes longer.
+fn run_for_a_while(mut command: Command, timeout: Duration) -> Option<String> {
+    let mut child = command
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .ok()?;
+    // Read meanwhile, so a full pipe can't keep it from finishing.
+    let mut stdout = child.stdout.take()?;
+    let reader = thread::spawn(move || {
+        let mut text = String::new();
+        stdout.read_to_string(&mut text).ok().map(|_| text)
+    });
+    let started = Instant::now();
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if started.elapsed() < timeout => thread::sleep(Duration::from_millis(20)),
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
+    };
+    let text = reader.join().ok()??;
+    status.success().then_some(text)
 }
 
 /// The AppImages in the folders they are usually kept in.
@@ -264,6 +300,24 @@ StartupWMClass=Other
             Some("/opt/My App/app")
         );
         assert_eq!(exec_program("").as_deref(), None);
+    }
+
+    #[test]
+    fn gives_up_on_commands_that_take_too_long() {
+        let mut quick = Command::new("sh");
+        quick.args(["-c", "echo com.example.App"]);
+        assert_eq!(
+            run_for_a_while(quick, Duration::from_secs(5)).as_deref(),
+            Some("com.example.App\n")
+        );
+        let mut slow = Command::new("sleep");
+        slow.arg("10");
+        let started = Instant::now();
+        assert_eq!(run_for_a_while(slow, Duration::from_millis(200)), None);
+        assert!(started.elapsed() < Duration::from_secs(5));
+        let mut failing = Command::new("false");
+        failing.arg("");
+        assert_eq!(run_for_a_while(failing, Duration::from_secs(5)), None);
     }
 
     #[test]

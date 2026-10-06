@@ -253,7 +253,7 @@ fn confidence(
 mod tests {
     use super::*;
     use crate::orphans::owners::{self, Owners};
-    use crate::orphans::pacman::Info;
+    use crate::pacman::Info;
     use crate::testdir::TestDir;
     use std::time::Duration;
 

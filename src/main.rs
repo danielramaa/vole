@@ -6,6 +6,7 @@ mod disk;
 mod in_use;
 mod log;
 mod orphans;
+mod pacman;
 mod safety;
 mod size;
 mod term;

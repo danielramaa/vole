@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use super::detect::{self, OutsidePacman};
-use super::pacman::Info;
+use crate::pacman::Info;
 
 /// Something installed that accounts for a config or data folder.
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]

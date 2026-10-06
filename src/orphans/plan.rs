@@ -9,7 +9,7 @@ use std::collections::{HashMap, HashSet};
 
 use super::backup::OldBackup;
 use super::configs::{OrphanedConfig, PackageOwned};
-use super::pacman::{ConfigFile, Info};
+use crate::pacman::{ConfigFile, Info};
 
 /// An Orphaned Package: one Item of the Plan.
 #[derive(Debug, Clone)]

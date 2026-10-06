@@ -10,10 +10,10 @@ use std::time::SystemTime;
 
 use super::backup::{BACKUPS, NewBackup, OldBackup};
 use super::configs::{self, OrphanedConfig};
-use super::pacman::{self, PACMAN};
 use super::plan::{Package, Plan};
 use crate::disk::{self, Mounts};
 use crate::log::{Log, Outcome};
+use crate::pacman::{self, PACMAN};
 use crate::safety::Rules;
 use crate::term::{self, RunRoot};
 

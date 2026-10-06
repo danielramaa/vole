@@ -218,9 +218,14 @@ fn whole_disks(sys: &Path, depth: usize) -> Vec<Disk> {
     let Ok(sys) = fs::canonicalize(sys) else {
         return Vec::new();
     };
-    if sys.join("partition").exists() {
-        let disk = sys.parent().map(|disk| Disk::Block(disk.to_path_buf()));
-        return disk.into_iter().collect();
+    if depth >= 8 {
+        return vec![Disk::Block(sys)];
+    }
+    // The folder above a partition is its device, itself maybe made of others: md0 for md0p1.
+    if sys.join("partition").exists()
+        && let Some(device) = sys.parent()
+    {
+        return whole_disks(device, depth + 1);
     }
     let under: Vec<PathBuf> = fs::read_dir(sys.join("slaves"))
         .into_iter()
@@ -228,7 +233,7 @@ fn whole_disks(sys: &Path, depth: usize) -> Vec<Disk> {
         .flatten()
         .map(|entry| entry.path())
         .collect();
-    if under.is_empty() || depth >= 8 {
+    if under.is_empty() {
         return vec![Disk::Block(sys)];
     }
     under
@@ -336,8 +341,21 @@ mod tests {
             whole_disks(&disk.join("nvme0n1p2"), 0),
             [Disk::Block(disk.clone())]
         );
-        assert_eq!(whole_disks(&crypt, 0), [Disk::Block(disk)]);
+        assert_eq!(whole_disks(&crypt, 0), [Disk::Block(disk.clone())]);
         assert!(whole_disks(&sys.path().join("missing"), 0).is_empty());
+        // A partition of a RAID is on the RAID's disks.
+        let other = sys.dir("devices/pci/sda");
+        sys.file("devices/pci/sda/sda1/partition", 1);
+        let raid = sys.dir("devices/virtual/block/md0");
+        sys.file("devices/virtual/block/md0/md0p1/partition", 1);
+        sys.symlink(
+            "devices/virtual/block/md0/slaves/nvme0n1p2",
+            &disk.join("nvme0n1p2"),
+        );
+        sys.symlink("devices/virtual/block/md0/slaves/sda1", &other.join("sda1"));
+        let mut disks = whole_disks(&raid.join("md0p1"), 0);
+        disks.sort_by(|a, b| format!("{a:?}").cmp(&format!("{b:?}")));
+        assert_eq!(disks, [Disk::Block(disk), Disk::Block(other)]);
     }
 
     #[test]

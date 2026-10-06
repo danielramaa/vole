@@ -41,7 +41,14 @@ const KNOWN_NAMES: &[(&str, &[&str])] = &[
     ("kdeglobals", &["kconfig", "plasma-workspace"]),
     ("kdedefaults", &["kconfig", "plasma-workspace"]),
     ("kglobalshortcuts", &["kglobalacceld", "plasma-workspace"]),
-    ("kcminput", &["plasma-desktop"]),
+    (
+        "kcm*",
+        &["plasma-desktop", "plasma-workspace", "systemsettings"],
+    ),
+    ("kioslave", &["kio"]),
+    ("kcookiejar", &["kio"]),
+    ("kuriikwsfilter", &["kio"]),
+    ("klipper", &["plasma-workspace"]),
     ("kxkb", &["plasma-desktop"]),
     ("ktimezoned", &["plasma-workspace"]),
     ("powermanagementprofiles", &["powerdevil"]),
@@ -923,6 +930,8 @@ picom /etc/xdg/picom/
             ..outside()
         });
         assert_eq!(of(&owners, "kdeglobals"), [package("kconfig")]);
+        let kio = Owners::from_pacman(&[info("kio")], "", &HashSet::new());
+        assert_eq!(of(&kio, "kioslaverc"), [package("kio")]);
         assert_eq!(of(&owners, "Kitware"), [package("cmake")]);
         for name in [
             ".zcompdump-host-5.9.zwc",

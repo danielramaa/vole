@@ -45,7 +45,7 @@ impl Mounts {
 }
 
 /// Decodes the `\040`-style escapes mountinfo uses for spaces and other special bytes.
-fn unescape_octal(field: &str) -> PathBuf {
+pub fn unescape_octal(field: &str) -> PathBuf {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;

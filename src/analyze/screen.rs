@@ -15,10 +15,10 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
+use super::disks::{Mount, MountTable};
 use super::scan::{self, Progress};
 use super::tree::{Id, Kind, ROOT, Tree, Unwalked};
 use crate::app::ModuleScreen;
-use crate::disk::Mounts;
 use crate::term::RunRoot;
 use crate::{size, ui};
 
@@ -70,7 +70,7 @@ impl Screen {
         let counting = Arc::clone(&progress);
         thread::spawn(move || {
             // Without the mount points, the walk would go into other disks and into /proc.
-            let tree = Mounts::load()
+            let tree = MountTable::load()
                 .map(|mounts| scan::scan(Path::new(SCANNED), &mounts, &counting))
                 .map_err(|err| {
                     format!("reading the mount points from /proc/self/mountinfo: {err}")
@@ -319,7 +319,15 @@ impl View {
     /// A word or two after the name, saying what is special about `id`.
     fn mark(&self, id: Id) -> Option<&'static str> {
         match self.tree.unwalked(id) {
-            Some(Unwalked::Mount) => Some("mount point"),
+            Some(Unwalked::Mount(mount)) => Some(match mount {
+                Mount::SameDisk => "mount point",
+                Mount::OtherDisk => "other disk",
+                Mount::UsbDisk => "USB disk",
+                Mount::Network => "network share",
+                Mount::Automount => "not mounted",
+                Mount::NotADisk => "not on a disk",
+            }),
+            Some(Unwalked::Elsewhere) => Some("counted elsewhere"),
             Some(Unwalked::Unreadable) => Some("can't read"),
             None if self.tree.linked(id) => Some("hard link"),
             None if self.tree.kind(id) == Kind::Symlink => Some("symlink"),
@@ -330,8 +338,24 @@ impl View {
     /// What to know about `id`, shown under the list while the cursor is on it.
     fn note(&self, id: Id) -> Option<&'static str> {
         match self.tree.unwalked(id) {
-            Some(Unwalked::Mount) => {
-                return Some("Another filesystem is mounted here; it isn't scanned.");
+            Some(Unwalked::Mount(mount)) => {
+                return Some(match mount {
+                    Mount::SameDisk => "A mount point.",
+                    Mount::OtherDisk => "Another disk is mounted here; it isn't scanned.",
+                    Mount::UsbDisk => "A USB disk is mounted here; it isn't scanned.",
+                    Mount::Network => {
+                        "A network share is mounted here; vole doesn't look into network shares."
+                    }
+                    Mount::Automount => "Mounted when first used, and not mounted now.",
+                    Mount::NotADisk => {
+                        "Not on a disk: kept in memory, made up by the kernel, or a mounted image file."
+                    }
+                });
+            }
+            Some(Unwalked::Elsewhere) => {
+                return Some(
+                    "The same folder as one at another path (a bind mount), where it is counted.",
+                );
             }
             Some(Unwalked::Unreadable) => {
                 return Some("vole may not read this folder, so what is in it isn't counted.");
@@ -435,7 +459,7 @@ mod tests {
     fn screen() -> Screen {
         let mut tree = Tree::new("/".into(), 0);
         let mut mnt = entry("mnt", 0, Kind::Dir);
-        mnt.unwalked = Some(Unwalked::Mount);
+        mnt.unwalked = Some(Unwalked::Mount(Mount::OtherDisk));
         let first = tree.add(
             ROOT,
             vec![
@@ -553,7 +577,7 @@ mod tests {
         );
         assert!(rows[2].trim_end_matches('│').trim_end().ends_with("600 B"));
         assert!(rows[5].contains("bin  symlink"), "{rows:#?}");
-        assert!(rows[6].contains("mnt/  mount point"), "{rows:#?}");
+        assert!(rows[6].contains("mnt/  other disk"), "{rows:#?}");
         assert_eq!(view(&screen).page, 5);
     }
 
@@ -563,7 +587,7 @@ mod tests {
         press(&mut screen, KeyCode::End);
         let rows = render(&mut screen, 70, 9);
         assert!(
-            rows[7].contains("Another filesystem is mounted here"),
+            rows[7].contains("Another disk is mounted here"),
             "{rows:#?}"
         );
     }

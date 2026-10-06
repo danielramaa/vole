@@ -1,5 +1,5 @@
-//! Walking the filesystem on several threads at once, without following symlinks or going into
-//! other filesystems.
+//! Walking the filesystem on several threads at once, without following symlinks or leaving the
+//! disk it starts on.
 
 use std::collections::HashSet;
 use std::fs::{self, Metadata};
@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 
+use super::disks::{Mount, MountTable};
 use super::tree::{Entry, Id, Kind, ROOT, Tree, Unwalked};
-use crate::disk::Mounts;
 
 /// How far a scan has got, for the screen to show while it runs.
 #[derive(Debug, Default)]
@@ -28,12 +28,15 @@ const THREADS: usize = 16;
 
 const POISONED: &str = "a scanning thread panicked";
 
-/// Walks everything under `root` into a [`Tree`]. The insides of mount points are left out, since
-/// another filesystem is mounted there, and so are the folders vole may not read.
-pub fn scan(root: &Path, mounts: &Mounts, progress: &Progress) -> Tree {
-    let size = fs::symlink_metadata(root).map_or(0, |meta| meta.blocks() * 512);
+/// Walks everything under `root` into a [`Tree`], going into the mounts on the same disk only.
+/// The folders vole may not read are left out.
+pub fn scan(root: &Path, mounts: &MountTable, progress: &Progress) -> Tree {
+    let meta = fs::symlink_metadata(root).ok();
     let walk = Walk {
-        tree: Mutex::new(Tree::new(root.to_path_buf(), size)),
+        tree: Mutex::new(Tree::new(
+            root.to_path_buf(),
+            meta.as_ref().map_or(0, |meta| meta.blocks() * 512),
+        )),
         queue: Mutex::new(Queue {
             waiting: vec![Folder {
                 path: root.to_path_buf(),
@@ -42,10 +45,13 @@ pub fn scan(root: &Path, mounts: &Mounts, progress: &Progress) -> Tree {
             reading: 0,
         }),
         wake: Condvar::new(),
-        linked: Mutex::new(HashSet::new()),
+        counted: Counted::default(),
         mounts,
         progress,
     };
+    if let Some(meta) = &meta {
+        walk.counted.first_time(meta);
+    }
     let threads = thread::available_parallelism().map_or(THREADS, |n| n.get().min(THREADS));
     thread::scope(|scope| {
         for _ in 0..threads {
@@ -62,9 +68,8 @@ struct Walk<'a> {
     queue: Mutex<Queue>,
     /// Woken when folders are queued, and when the last one has been read.
     wake: Condvar,
-    /// The files with several hard links counted already, by device and inode.
-    linked: Mutex<HashSet<(u64, u64)>>,
-    mounts: &'a Mounts,
+    counted: Counted,
+    mounts: &'a MountTable,
     progress: &'a Progress,
 }
 
@@ -147,18 +152,20 @@ impl Walk<'_> {
                 continue;
             };
             let name = item.file_name();
-            // The listing tells folders apart without looking at them, so a mount point isn't
-            // even looked at: a network share that doesn't answer would keep the walk waiting.
+            // The listing tells folders apart without looking at them, so a mount point that
+            // isn't scanned isn't even looked at: a network share that doesn't answer would keep
+            // the walk waiting.
             let path = item
                 .file_type()
                 .is_ok_and(|kind| kind.is_dir())
                 .then(|| folder.path.join(&name));
-            if path.as_ref().is_some_and(|path| self.mounts.contains(path)) {
+            let mount = path.as_ref().and_then(|path| self.mounts.get(path));
+            if let Some(mount) = mount.filter(|&mount| mount != Mount::SameDisk) {
                 entries.push(Entry {
                     name,
                     size: 0,
                     kind: Kind::Dir,
-                    unwalked: Some(Unwalked::Mount),
+                    unwalked: Some(Unwalked::Mount(mount)),
                     linked: false,
                 });
                 continue;
@@ -175,16 +182,17 @@ impl Walk<'_> {
             };
             let kind = kind(&meta);
             let mut size = meta.blocks() * 512;
+            let mut unwalked = None;
             let mut linked = false;
-            if kind != Kind::Dir && meta.nlink() > 1 {
-                // Counted at the first of its links the walk reaches.
-                let mut counted = self.linked.lock().expect(POISONED);
-                linked = !counted.insert((meta.dev(), meta.ino()));
-                if linked {
-                    size = 0;
-                }
+            // Counted where the walk reaches it first.
+            if kind == Kind::Dir && !self.counted.first_time(&meta) {
+                unwalked = Some(Unwalked::Elsewhere);
+                size = 0;
+            } else if kind != Kind::Dir && meta.nlink() > 1 && !self.counted.first_time(&meta) {
+                linked = true;
+                size = 0;
             }
-            if kind == Kind::Dir {
+            if kind == Kind::Dir && unwalked.is_none() {
                 let path = path.unwrap_or_else(|| folder.path.join(&name));
                 folders.push((entries.len(), path));
             }
@@ -193,7 +201,7 @@ impl Walk<'_> {
                 name,
                 size,
                 kind,
-                unwalked: None,
+                unwalked,
                 linked,
             });
         }
@@ -216,6 +224,19 @@ impl Walk<'_> {
     }
 }
 
+/// The folders, and the files with several hard links, the walk has counted: by device and inode,
+/// since a bind mount shows a folder at a second path, and a hard link shows a file.
+#[derive(Default)]
+struct Counted(Mutex<HashSet<(u64, u64)>>);
+
+impl Counted {
+    /// Whether this is the first time the walk reaches what `meta` is about.
+    fn first_time(&self, meta: &Metadata) -> bool {
+        let mut counted = self.0.lock().expect(POISONED);
+        counted.insert((meta.dev(), meta.ino()))
+    }
+}
+
 fn kind(meta: &Metadata) -> Kind {
     let kind = meta.file_type();
     if kind.is_dir() {
@@ -232,12 +253,12 @@ fn kind(meta: &Metadata) -> Kind {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::disk;
+    use crate::disk::{self, Mounts};
     use crate::testdir::TestDir;
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
-    fn scan_dir(dir: &TestDir, mounts: &Mounts) -> Tree {
+    fn scan_dir(dir: &TestDir, mounts: &MountTable) -> Tree {
         scan(dir.path(), mounts, &Progress::default())
     }
 
@@ -261,7 +282,7 @@ mod tests {
         dir.file("a/b/two", 100_000);
         dir.file("three", 1);
         let progress = Progress::default();
-        let tree = scan(dir.path(), &Mounts::default(), &progress);
+        let tree = scan(dir.path(), &MountTable::default(), &progress);
         let usage = |path: &Path| disk::disk_usage(path, &Mounts::default());
         assert_eq!(tree.size(ROOT), usage(dir.path()));
         assert_eq!(tree.size(find(&tree, "a")), usage(&dir.path().join("a")));
@@ -280,7 +301,7 @@ mod tests {
         let outside = TestDir::new();
         outside.file("big", 100_000);
         dir.symlink("link", outside.path());
-        let tree = scan_dir(&dir, &Mounts::default());
+        let tree = scan_dir(&dir, &MountTable::default());
         let link = find(&tree, "link");
         assert_eq!(tree.kind(link), Kind::Symlink);
         assert!(!tree.can_open(link));
@@ -288,15 +309,40 @@ mod tests {
     }
 
     #[test]
-    fn leaves_mount_points_out() {
+    fn goes_into_mounts_on_the_same_disk_only() {
         let dir = TestDir::new();
-        let mounted = dir.dir("mnt/disk");
-        dir.file("mnt/disk/big", 100_000);
-        let tree = scan_dir(&dir, &Mounts::from_paths([mounted]));
-        let disk = find(&tree, "mnt/disk");
-        assert_eq!(tree.unwalked(disk), Some(Unwalked::Mount));
-        assert_eq!(tree.size(disk), 0);
-        assert!(tree.largest_first(disk).is_empty());
+        let boot = dir.dir("boot");
+        dir.file("boot/vmlinuz", 1000);
+        let mut mounts = vec![(boot, Mount::SameDisk)];
+        for (name, mount) in [
+            ("other", Mount::OtherDisk),
+            ("usb", Mount::UsbDisk),
+            ("nas", Mount::Network),
+            ("efi", Mount::Automount),
+            ("proc", Mount::NotADisk),
+        ] {
+            mounts.push((dir.dir(&format!("mnt/{name}")), mount));
+            dir.file(&format!("mnt/{name}/big"), 100_000);
+        }
+        let tree = scan_dir(&dir, &MountTable::from_mounts(mounts));
+        assert!(tree.size(find(&tree, "boot/vmlinuz")) > 0);
+        let usb = find(&tree, "mnt/usb");
+        assert_eq!(tree.unwalked(usb), Some(Unwalked::Mount(Mount::UsbDisk)));
+        assert_eq!(tree.size(usb), 0);
+        assert!(tree.largest_first(usb).is_empty());
+        assert!(tree.size(ROOT) < 100_000);
+    }
+
+    #[test]
+    fn counts_a_folder_reached_twice_once() {
+        let dir = TestDir::new();
+        let meta = fs::symlink_metadata(dir.dir("a")).unwrap();
+        // As through a bind mount, which can't be made without root.
+        let counted = Counted::default();
+        assert!(counted.first_time(&meta));
+        assert!(!counted.first_time(&meta));
+        let tree = scan_dir(&dir, &MountTable::default());
+        assert_eq!(tree.unwalked(find(&tree, "a")), None);
     }
 
     #[test]
@@ -305,7 +351,7 @@ mod tests {
         let file = dir.file("a/file", 100_000);
         dir.dir("b");
         fs::hard_link(&file, dir.path().join("b/file")).unwrap();
-        let tree = scan_dir(&dir, &Mounts::default());
+        let tree = scan_dir(&dir, &MountTable::default());
         let (a, b) = (find(&tree, "a/file"), find(&tree, "b/file"));
         assert_ne!(tree.linked(a), tree.linked(b));
         assert_eq!(
@@ -323,7 +369,7 @@ mod tests {
         let locked = dir.dir("deep/locked");
         dir.file("deep/locked/secret", 100);
         fs::set_permissions(&locked, Permissions::from_mode(0o000)).unwrap();
-        let tree = scan_dir(&dir, &Mounts::default());
+        let tree = scan_dir(&dir, &MountTable::default());
         fs::set_permissions(&locked, Permissions::from_mode(0o755)).unwrap();
         let id = find(&tree, "deep/locked");
         assert_eq!(tree.unwalked(id), Some(Unwalked::Unreadable));

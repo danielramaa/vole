@@ -5,6 +5,8 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::PathBuf;
 
+use super::disks::Mount;
+
 /// A file or folder of a [`Tree`].
 pub type Id = u32;
 
@@ -24,8 +26,11 @@ pub enum Kind {
 /// Why what is in a folder isn't in the tree.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Unwalked {
-    /// Another filesystem is mounted on it.
-    Mount,
+    /// What is mounted on it isn't scanned (never [`Mount::SameDisk`]).
+    Mount(Mount),
+    /// The same folder as one reached by another path (through a bind mount), and counted
+    /// there.
+    Elsewhere,
     /// vole may not read it.
     Unreadable,
 }

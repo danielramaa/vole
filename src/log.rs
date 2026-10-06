@@ -40,7 +40,12 @@ struct Entry<'a> {
     moved_to: Option<&'a str>,
     kind: &'static str,
     size: u64,
-    removed: bool,
+    /// Whether it was removed; for an attempt to remove it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    removed: Option<bool>,
+    /// Whether it was put back where it was; for an attempt to restore it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    restored: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
 }
@@ -77,7 +82,7 @@ impl Log {
         target: &str,
         result: Result<(), String>,
     ) -> Outcome {
-        self.write_attempt(item, kind, size, target, None, result)
+        self.write_attempt(item, kind, size, target, None, false, result)
     }
 
     /// Writes the attempt to move `item` from `target` into a Backup at `to` to the log, and
@@ -91,9 +96,23 @@ impl Log {
         to: &str,
         result: Result<(), String>,
     ) -> Outcome {
-        self.write_attempt(item, kind, size, target, Some(to), result)
+        self.write_attempt(item, kind, size, target, Some(to), false, result)
     }
 
+    /// Writes the attempt to put `item` back from `target`, in a Backup, to `to`, where it was.
+    pub fn record_restored(
+        &mut self,
+        item: &str,
+        kind: &'static str,
+        size: u64,
+        target: &str,
+        to: &str,
+        result: Result<(), String>,
+    ) -> Outcome {
+        self.write_attempt(item, kind, size, target, Some(to), true, result)
+    }
+
+    #[allow(clippy::too_many_arguments)]
     fn write_attempt(
         &mut self,
         item: &str,
@@ -101,6 +120,7 @@ impl Log {
         size: u64,
         target: &str,
         moved_to: Option<&str>,
+        restoring: bool,
         result: Result<(), String>,
     ) -> Outcome {
         let entry = Entry {
@@ -113,7 +133,8 @@ impl Log {
             moved_to: moved_to.filter(|_| result.is_ok()),
             kind,
             size,
-            removed: result.is_ok(),
+            removed: (!restoring).then_some(result.is_ok()),
+            restored: restoring.then_some(result.is_ok()),
             error: result.as_ref().err().map(String::as_str),
         };
         let written = self.write(&entry);
@@ -124,7 +145,7 @@ impl Log {
             log_error: written
                 .err()
                 .map(|err| format!("not written to the operation log: {err}")),
-            moved: moved_to.is_some(),
+            moved: moved_to.is_some() && !restoring,
         }
     }
 
@@ -196,5 +217,26 @@ mod tests {
         assert_eq!(lines[0]["removed"], true);
         // Nothing was moved anywhere.
         assert!(lines[1].get("moved_to").is_none());
+    }
+
+    #[test]
+    fn restores_are_not_removals() {
+        let dir = TestDir::new();
+        let path = dir.path().join("log.jsonl");
+        let mut log = Log::open(&path, "restore").unwrap();
+        let back = log.record_restored(
+            "~/.config/a",
+            "orphaned config",
+            1,
+            "/b/.config/a",
+            "/h/.config/a",
+            Ok(()),
+        );
+        assert!(back.error.is_none() && !back.moved);
+        let line: serde_json::Value =
+            serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
+        assert_eq!(line["restored"], true);
+        assert!(line.get("removed").is_none());
+        assert_eq!(line["moved_to"], "/h/.config/a");
     }
 }

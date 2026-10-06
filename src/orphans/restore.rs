@@ -32,6 +32,8 @@ enum State {
     },
     Done {
         outcomes: Vec<Outcome>,
+        /// What went wrong besides putting configs back, like a Backup's list not updated.
+        notes: Vec<String>,
         scroll: u16,
     },
     Failed(String),
@@ -67,6 +69,7 @@ impl Screen {
             Err(err) => return State::Failed(format!("Nothing was put back: {err}")),
         };
         let mut outcomes = Vec::new();
+        let mut notes = Vec::new();
         for listed in &view.backups {
             let mut restored: Vec<Entry> = Vec::new();
             for (entry, _) in listed.entries().filter(|(_, selected)| *selected) {
@@ -82,24 +85,22 @@ impl Screen {
                 }
                 let result = result.map(|_| ());
                 let outcome =
-                    log.record_moved(&label, "orphaned config", entry.size, &from, &to, result);
+                    log.record_restored(&label, "orphaned config", entry.size, &from, &to, result);
                 outcomes.push(outcome);
             }
             if !restored.is_empty()
                 && let Err(err) = backup::forget(&listed.backup.dir, &restored)
             {
                 // Put back, but still listed: the list says more than the Backup holds.
-                outcomes.push(Outcome {
-                    label: format!("the list of {}", listed.backup.dir.display()),
-                    size: 0,
-                    error: Some(format!("could not be updated: {err}")),
-                    log_error: None,
-                    moved: false,
-                });
+                notes.push(format!(
+                    "the list of {} could not be updated, so it still names what was put back: {err}",
+                    listed.backup.dir.display()
+                ));
             }
         }
         State::Done {
             outcomes,
+            notes,
             scroll: 0,
         }
     }
@@ -146,15 +147,18 @@ impl ModuleScreen for Screen {
             State::Done { .. } | State::Failed(_) if key.code == KeyCode::Enter => {
                 (State::NotStarted, true)
             }
-            State::Done { outcomes, scroll } => {
+            State::Done {
+                outcomes,
+                notes,
+                scroll,
+            } => {
                 let next = ui::scrolled(scroll, key);
-                (
-                    State::Done {
-                        outcomes,
-                        scroll: next,
-                    },
-                    next != scroll,
-                )
+                let done = State::Done {
+                    outcomes,
+                    notes,
+                    scroll: next,
+                };
+                (done, next != scroll)
             }
             state => (state, false),
         };
@@ -199,7 +203,11 @@ impl ModuleScreen for Screen {
             }
             State::Ready(view) => view.draw(frame, area, block),
             State::Confirm { view, scroll } => draw_confirm(frame, area, block, view, scroll),
-            State::Done { outcomes, scroll } => draw_done(frame, area, block, outcomes, scroll),
+            State::Done {
+                outcomes,
+                notes,
+                scroll,
+            } => draw_done(frame, area, block, outcomes, notes, scroll),
         }
     }
 }
@@ -223,7 +231,14 @@ fn draw_confirm(frame: &mut Frame, area: Rect, block: Block, view: &View, scroll
     ui::draw_scrolled(frame, area, block, lines, scroll);
 }
 
-fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome], scroll: &mut u16) {
+fn draw_done(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block,
+    outcomes: &[Outcome],
+    notes: &[String],
+    scroll: &mut u16,
+) {
     let back = outcomes.iter().filter(|o| o.error.is_none()).count();
     let failed = outcomes.len() - back;
     let mut summary = match back {
@@ -249,6 +264,9 @@ fn draw_done(frame: &mut Frame, area: Rect, block: Block, outcomes: &[Outcome], 
         if let Some(err) = &outcome.log_error {
             lines.push(Line::styled(format!("      ! {err}"), dim));
         }
+    }
+    for note in notes {
+        lines.push(Line::styled(format!("  ! {note}"), dim));
     }
     ui::draw_scrolled(frame, area, block, lines, scroll);
 }
@@ -497,6 +515,26 @@ mod tests {
             panic!("not listing");
         };
         assert_eq!(view.selected().count(), 1);
+    }
+
+    #[test]
+    fn notes_are_not_counted_as_failures() {
+        let mut screen = Screen::with_backups(Vec::new());
+        screen.state = State::Done {
+            outcomes: vec![Outcome {
+                label: "~/.config/gone".into(),
+                size: 1,
+                error: None,
+                log_error: None,
+                moved: false,
+            }],
+            notes: vec!["the list of /b could not be updated".into()],
+            scroll: 0,
+        };
+        let text = render(&mut screen);
+        assert!(text.contains("Put back 1 config"), "{text}");
+        assert!(!text.contains("failed"));
+        assert!(text.contains("! the list of /b could not be updated"));
     }
 
     #[test]

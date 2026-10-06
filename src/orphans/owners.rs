@@ -51,6 +51,8 @@ const KNOWN_NAMES: &[(&str, &[&str])] = &[
     ("plasma*", &["plasma-workspace"]),
     ("ksycoca*", &["kservice"]),
     ("user-places*", &["kio"]),
+    ("kicker", &["plasma-desktop", "plasma-workspace"]),
+    ("org.kde.unitconversion", &["kunitconversion"]),
     // Qt and GTK.
     ("qtproject", &["qt6-base", "qt5-base"]),
     ("trolltech", &["qt6-base", "qt5-base"]),
@@ -62,10 +64,15 @@ const KNOWN_NAMES: &[(&str, &[&str])] = &[
     ("histfile", &["zsh"]),
     ("zcompdump*", &["zsh"]),
     ("p10k*", &["zsh"]),
+    ("gitstatus", &["zsh"]),
     ("oh-my-zsh", &["zsh"]),
     ("inputrc", &["readline", "bash"]),
     // Editors, and the plugins that keep their own folders.
     ("vscode*", &["code", "codium"]),
+    (
+        "copilot",
+        &["code", "codium", "jetbrains-toolbox", "nvim", "vim", "gh"],
+    ),
     (
         "github-copilot",
         &["code", "codium", "jetbrains-toolbox", "nvim", "vim"],
@@ -88,6 +95,10 @@ const KNOWN_NAMES: &[(&str, &[&str])] = &[
     ("junie", &["jetbrains-toolbox"]),
     ("refsrcsymbols", &["rider", "jetbrains-toolbox"]),
     ("symbolsourcesymbols", &["rider", "jetbrains-toolbox"]),
+    ("symbols", &["rider", "jetbrains-toolbox"]),
+    ("kotlin", &["kotlin", "jetbrains-toolbox", "idea", "gradle"]),
+    // Flatpak keeps its apps' data in ~/.var.
+    ("var", &["flatpak"]),
     // Toolchains.
     ("java", &["java"]),
     ("gradle", &["gradle", "java"]),
@@ -162,6 +173,22 @@ const MIN_PREFIX: usize = 4;
 const GENERIC: &[&str] = &[
     "app", "com", "config", "data", "default", "dev", "github", "gitlab", "io", "lib", "local",
     "net", "new", "old", "org", "share", "state", "the", "tmp", "user",
+];
+
+/// The parts of reverse-DNS names that name a vendor, not a program: `org.kde.kdenlive` is
+/// kdenlive's, not `kde`'s.
+const VENDORS: &[&str] = &["flathub", "freedesktop", "gnome", "kde", "sourceforge"];
+
+/// The folders whose entries are named after what installs them: `/usr/share/fish` is fish's.
+/// Deeper down, names say less: ncurses installs `/usr/share/terminfo/a/alacritty`.
+const INSTALL_DIRS: &[&str] = &[
+    "/usr/share/",
+    "/usr/lib/",
+    "/usr/lib32/",
+    "/usr/libexec/",
+    "/etc/",
+    "/etc/xdg/",
+    "/opt/",
 ];
 
 /// Extensions a config file's name may end with.
@@ -262,7 +289,10 @@ pub fn name_keys(name: &str) -> Vec<String> {
     }
     // Reverse-DNS names: org.kde.dolphin, UserFeedback.org.kde.dolphin → dolphin.
     if stem.matches('.').count() >= 2 {
-        for segment in stem.split('.').filter(|s| s.len() >= 3) {
+        for segment in stem
+            .split('.')
+            .filter(|s| s.len() >= 3 && !VENDORS.contains(s))
+        {
             add(segment);
             if let Some(word) = segment.split(['-', '_']).next() {
                 add(word);
@@ -324,7 +354,10 @@ fn flatpak_keys(id: &str) -> Vec<String> {
     let lower = id.to_lowercase();
     let mut keys = Vec::new();
     add_key(&mut keys, &lower);
-    for segment in lower.split('.').filter(|s| s.len() >= 3) {
+    for segment in lower
+        .split('.')
+        .filter(|s| s.len() >= 3 && !VENDORS.contains(s))
+    {
         add_key(&mut keys, segment);
     }
     keys
@@ -422,12 +455,16 @@ impl Owners {
                     owners.add_named(key, &owner);
                 }
             }
-            // Installed paths naming the folder: /usr/share/fish for ~/.config/fish.
-            for component in path.split('/').filter(|c| !c.is_empty()) {
-                if wanted.contains(component) {
-                    owners.add(component.to_string(), &owner);
-                } else if component.bytes().any(|b| b.is_ascii_uppercase()) {
-                    let lower = component.to_lowercase();
+            // Installed folders and files naming the folder: /usr/share/fish for ~/.config/fish.
+            for dir in INSTALL_DIRS {
+                let Some(rest) = path.strip_prefix(dir) else {
+                    continue;
+                };
+                let name = rest.split('/').next().unwrap_or_default();
+                if wanted.contains(name) {
+                    owners.add(name.to_string(), &owner);
+                } else if name.bytes().any(|b| b.is_ascii_uppercase()) {
+                    let lower = name.to_lowercase();
                     if wanted.contains(&lower) {
                         owners.add(lower, &owner);
                     }
@@ -690,6 +727,36 @@ htop /usr/bin/htop
     }
 
     #[test]
+    fn only_folders_named_right_under_install_folders_count() {
+        let files = "\
+ncurses /usr/share/terminfo/a/alacritty
+hicolor-icon-theme /usr/share/icons/hicolor/48x48/stock/code/
+filesystem /etc/profile
+picom /etc/xdg/picom/
+";
+        let names = ["alacritty", "Code", ".profile", "picom"];
+        let owners = Owners::from_pacman(&[], files, &wanted(names));
+        assert!(of(&owners, "alacritty").is_empty());
+        assert!(of(&owners, "Code").is_empty());
+        assert_eq!(of(&owners, ".profile"), [package("filesystem")]);
+        assert_eq!(of(&owners, "picom"), [package("picom")]);
+    }
+
+    #[test]
+    fn vendors_name_no_owner() {
+        let installed = [info("dolphin")];
+        let files = "kio /usr/share/kde/\n";
+        let names = ["org.kde.kdenlive", "org.kde.dolphin"];
+        let mut owners = Owners::from_pacman(&installed, files, &wanted(names));
+        owners.add_outside_pacman(&OutsidePacman {
+            flatpaks: vec!["org.kde.krita".into()],
+            ..outside()
+        });
+        assert!(of(&owners, "org.kde.kdenlive").is_empty());
+        assert_eq!(of(&owners, "org.kde.dolphin"), [package("dolphin")]);
+    }
+
+    #[test]
     fn short_names_are_not_prefixes() {
         let installed = [info("kio")];
         let owners = Owners::from_pacman(&installed, "", &HashSet::new());
@@ -843,6 +910,12 @@ htop /usr/bin/htop
         assert_eq!(of(&owners, "nextjs-nodejs"), [Owner::Program(node)]);
         // Only while what owns them is installed.
         assert!(of(&owners, "qtshadercache-x86_64-little_endian-lp64").is_empty());
+        // Flatpak's apps keep their data in ~/.var.
+        let owners_with_flatpak = Owners::from_pacman(&[info("flatpak")], "", &HashSet::new());
+        assert_eq!(
+            owners_with_flatpak.of(Path::new("/home/me/.var"), ".var"),
+            [package("flatpak")]
+        );
         // A name too common to go by alone still counts as a whole: ~/.net.
         let owners = Owners::from_pacman(&[info("dotnet")], "", &HashSet::new());
         assert_eq!(

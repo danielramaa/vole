@@ -1,8 +1,10 @@
 //! The `analyze` screens: the scan as it goes, then the tree, largest first, one folder at a
 //! time.
 
+use std::collections::HashMap;
+use std::fs;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::sync::mpsc::{self, Receiver, TryRecvError};
@@ -17,6 +19,7 @@ use ratatui::widgets::{Block, List, ListState, Paragraph};
 
 use super::disks::{Mount, MountTable};
 use super::scan::{self, Progress};
+use super::tip;
 use super::tree::{Id, Kind, ROOT, Tree, Unwalked};
 use crate::app::ModuleScreen;
 use crate::term::RunRoot;
@@ -38,6 +41,7 @@ enum State {
     Scanning {
         receiver: Receiver<Result<Tree, String>>,
         progress: Arc<Progress>,
+        home: PathBuf,
     },
     Ready(View),
     Failed(String),
@@ -57,14 +61,19 @@ impl Screen {
     }
 
     #[cfg(test)]
-    fn with_tree(tree: Tree) -> Self {
+    fn with_tree(tree: Tree, home: &str) -> Self {
         Self {
-            state: State::Ready(View::new(tree)),
+            state: State::Ready(View::new(tree, home.into())),
         }
     }
 
     /// Starts the scan in the background.
     fn start() -> State {
+        let Some(home) = dirs::home_dir() else {
+            return State::Failed("the home directory could not be found".into());
+        };
+        // The scan doesn't follow symlinks, so it finds the home folder where it really is.
+        let home = fs::canonicalize(&home).unwrap_or(home);
         let (sender, receiver) = mpsc::channel();
         let progress = Arc::new(Progress::default());
         let counting = Arc::clone(&progress);
@@ -78,24 +87,40 @@ impl Screen {
             // The user may have left the screen already; then nobody is listening.
             let _ = sender.send(tree);
         });
-        State::Scanning { receiver, progress }
+        State::Scanning {
+            receiver,
+            progress,
+            home,
+        }
     }
 }
 
 impl ModuleScreen for Screen {
-    /// Starts the scan, and picks up the tree once it is done.
+    /// Starts the scan, picks up the tree once it is done, then asks pacman for tips.
     fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
             State::NotStarted => Self::start(),
-            State::Scanning { receiver, progress } => match receiver.try_recv() {
-                Ok(Ok(tree)) => State::Ready(View::new(tree)),
+            State::Scanning {
+                receiver,
+                progress,
+                home,
+            } => match receiver.try_recv() {
+                Ok(Ok(tree)) => State::Ready(View::new(tree, home)),
                 Ok(Err(err)) => State::Failed(format!("Could not scan: {err}")),
-                Err(TryRecvError::Empty) => State::Scanning { receiver, progress },
+                Err(TryRecvError::Empty) => State::Scanning {
+                    receiver,
+                    progress,
+                    home,
+                },
                 Err(TryRecvError::Disconnected) => {
                     State::Failed("the scan stopped unexpectedly".into())
                 }
             },
+            State::Ready(mut view) => {
+                view.tick();
+                State::Ready(view)
+            }
             state => state,
         };
     }
@@ -158,6 +183,8 @@ impl ModuleScreen for Screen {
 /// The tree, one folder at a time.
 struct View {
     tree: Tree,
+    /// The home folder, where it really is.
+    home: PathBuf,
     /// The folder shown.
     dir: Id,
     /// What is in it, largest first.
@@ -168,20 +195,71 @@ struct View {
     offset: usize,
     /// How many rows were on screen last time, for page up and down.
     page: usize,
+    /// What pacman said about freeing entries outside the home folder.
+    tips: HashMap<Id, String>,
+    /// The entry pacman is being asked about, in the background.
+    asking: Option<(Id, Receiver<String>)>,
 }
 
 impl View {
-    fn new(tree: Tree) -> Self {
+    fn new(tree: Tree, home: PathBuf) -> Self {
         let mut view = Self {
             tree,
+            home,
             dir: ROOT,
             rows: Vec::new(),
             cursor: 0,
             offset: 0,
             page: 1,
+            tips: HashMap::new(),
+            asking: None,
         };
         view.open(ROOT, None);
         view
+    }
+
+    /// Picks up what pacman said, and asks it about the entry under the cursor when that needs
+    /// it: one entry at a time, since pacman takes a moment.
+    fn tick(&mut self) {
+        if let Some((id, receiver)) = self.asking.take() {
+            let tip = match receiver.try_recv() {
+                Ok(tip) => tip,
+                Err(TryRecvError::Empty) => {
+                    self.asking = Some((id, receiver));
+                    return;
+                }
+                Err(TryRecvError::Disconnected) => "pacman couldn't say what it comes from.".into(),
+            };
+            self.tips.insert(id, tip);
+        }
+        let Some(id) = self.current().filter(|&id| self.waits_for_pacman(id)) else {
+            return;
+        };
+        let path = self.tree.path(id);
+        let folder = self.tree.kind(id) == Kind::Dir;
+        let (sender, receiver) = mpsc::channel();
+        thread::spawn(move || {
+            // The user may have left already; then nobody is listening.
+            let _ = sender.send(tip::from_pacman(&path, folder));
+        });
+        self.asking = Some((id, receiver));
+    }
+
+    /// Whether `path` is outside the home folder, where vole only shows.
+    fn is_outside_home(&self, path: &Path) -> bool {
+        !path.starts_with(&self.home) || path == self.home
+    }
+
+    /// Whether the tip for `id` is to come from pacman, and hasn't yet.
+    fn waits_for_pacman(&self, id: Id) -> bool {
+        let path = self.tree.path(id);
+        !self.tips.contains_key(&id)
+            && !matches!(
+                self.tree.unwalked(id),
+                Some(Unwalked::Mount(_) | Unwalked::Elsewhere)
+            )
+            && self.is_outside_home(&path)
+            && tip::known(&path, &self.home).is_none()
     }
 
     /// Shows the folder `dir`, with the cursor on `on` when it is there.
@@ -335,8 +413,23 @@ impl View {
         }
     }
 
-    /// What to know about `id`, shown under the list while the cursor is on it.
-    fn note(&self, id: Id) -> Option<&'static str> {
+    /// What to know about `id`, shown under the list while the cursor is on it: how to free it,
+    /// outside the home folder.
+    fn note(&self, id: Id) -> Option<&str> {
+        let path = self.tree.path(id);
+        if !matches!(
+            self.tree.unwalked(id),
+            Some(Unwalked::Mount(_) | Unwalked::Elsewhere)
+        ) && self.is_outside_home(&path)
+        {
+            return Some(match tip::known(&path, &self.home) {
+                Some(tip) => tip,
+                None => self
+                    .tips
+                    .get(&id)
+                    .map_or("Asking pacman what it comes from…", String::as_str),
+            });
+        }
         match self.tree.unwalked(id) {
             Some(Unwalked::Mount(mount)) => {
                 return Some(match mount {
@@ -479,7 +572,7 @@ mod tests {
         );
         tree.add(first + 1, vec![entry("notes", 10, Kind::File)]);
         tree.finish();
-        Screen::with_tree(tree)
+        Screen::with_tree(tree, "/home/me")
     }
 
     fn press(screen: &mut Screen, code: KeyCode) -> bool {
@@ -592,13 +685,68 @@ mod tests {
         );
     }
 
+    /// The note under the list with the cursor on `name`, in a tree of `root` holding `name`.
+    fn note_on(root: &str, name: &str, kind: Kind, tip: Option<&str>) -> String {
+        let mut tree = Tree::new(root.into(), 0);
+        let id = tree.add(ROOT, vec![entry(name, 1, kind)]);
+        tree.finish();
+        let mut view = View::new(tree, "/home/me".into());
+        if let Some(tip) = tip {
+            view.tips.insert(id, tip.into());
+        }
+        view.note(id).unwrap_or_default().to_string()
+    }
+
+    #[test]
+    fn tells_how_to_free_space_outside_home() {
+        assert_eq!(
+            note_on("/var/cache/pacman", "pkg", Kind::Dir, None),
+            "pacman's package cache: vole clean trims it."
+        );
+        assert_eq!(
+            note_on("/usr/lib", "firefox", Kind::Dir, None),
+            "Asking pacman what it comes from…"
+        );
+        assert_eq!(
+            note_on(
+                "/usr/lib",
+                "firefox",
+                Kind::Dir,
+                Some("From the package firefox.")
+            ),
+            "From the package firefox."
+        );
+        assert_eq!(note_on("/home", "me", Kind::Dir, None), "Your home folder.");
+        // Inside it, what is special about an entry.
+        assert!(note_on("/home/me", "link", Kind::Symlink, None).starts_with("A symlink"));
+        assert_eq!(note_on("/home/me", "notes", Kind::File, None), "");
+    }
+
+    #[test]
+    fn asks_pacman_only_outside_home_and_once() {
+        let mut tree = Tree::new("/".into(), 0);
+        let first = tree.add(
+            ROOT,
+            vec![entry("home", 0, Kind::Dir), entry("opt", 0, Kind::Dir)],
+        );
+        let me = tree.add(first, vec![entry("me", 0, Kind::Dir)]);
+        tree.finish();
+        let view = View::new(tree, "/home/me".into());
+        assert!(view.waits_for_pacman(first + 1));
+        // Known without pacman.
+        assert!(!view.waits_for_pacman(first) && !view.waits_for_pacman(me));
+        let mut view = view;
+        view.tips.insert(first + 1, "From the package x.".into());
+        assert!(!view.waits_for_pacman(first + 1));
+    }
+
     #[test]
     fn long_names_are_cut_so_sizes_show() {
         let mut tree = Tree::new("/".into(), 0);
         let long = "a-very-long-name-".repeat(10);
         tree.add(ROOT, vec![entry(&long, 2048, Kind::File)]);
         tree.finish();
-        let mut screen = Screen::with_tree(tree);
+        let mut screen = Screen::with_tree(tree, "/home/me");
         let rows = render(&mut screen, 50, 6);
         assert!(rows[2].contains("a-very-long-n…"), "{rows:#?}");
         assert!(
@@ -617,7 +765,7 @@ mod tests {
             .collect();
         tree.add(ROOT, entries);
         tree.finish();
-        let mut screen = Screen::with_tree(tree);
+        let mut screen = Screen::with_tree(tree, "/home/me");
         render(&mut screen, 50, 12);
         press(&mut screen, KeyCode::PageDown);
         assert_eq!(rows(&screen).1, "file008");
@@ -639,7 +787,11 @@ mod tests {
         progress.found.store(1_234_567, Ordering::Relaxed);
         progress.bytes.store(2048, Ordering::Relaxed);
         let mut screen = Screen {
-            state: State::Scanning { receiver, progress },
+            state: State::Scanning {
+                receiver,
+                progress,
+                home: "/home/me".into(),
+            },
         };
         let rows = render(&mut screen, 70, 5).join("\n");
         assert!(

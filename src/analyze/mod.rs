@@ -4,6 +4,7 @@
 mod disks;
 mod scan;
 mod screen;
+mod tip;
 mod tree;
 
 pub use screen::Screen;

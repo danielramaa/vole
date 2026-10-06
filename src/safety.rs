@@ -6,7 +6,8 @@ use std::io;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-/// Secrets and keys vole never removes by any means (relative to the home directory).
+/// Secrets and keys vole never removes by any means (relative to the home directory): keys,
+/// password stores and keyrings, credentials, and wallets.
 const SEALED: &[&str] = &[
     ".ssh",
     ".gnupg",
@@ -14,12 +15,29 @@ const SEALED: &[&str] = &[
     ".pki",
     ".local/share/keyrings",
     ".local/share/kwalletd",
+    ".netrc",
+    ".git-credentials",
+    ".pgpass",
+    ".my.cnf",
+    ".pypirc",
+    ".vault-token",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".kube",
+    ".docker/config.json",
+    ".terraform.d",
+    ".bitcoin",
+    ".electrum",
+    ".ethereum",
+    ".monero",
 ];
 
-/// Paths no module proposes on its own (relative to the home directory): browser profiles and
-/// project folders. The user extends this with `protected_paths` in the config.
+/// Paths no module proposes on its own (relative to the home directory): browser and mail
+/// profiles, and project folders. The user extends this with `protected_paths` in the config.
 const PROTECTED: &[&str] = &[
     ".mozilla",
+    ".thunderbird",
     ".librewolf",
     ".config/google-chrome",
     ".config/chromium",
@@ -253,6 +271,25 @@ mod tests {
                 .unwrap()
                 .check(&home.path().join(".foorc")),
             Err(Refusal::OutsideAllowedRoots)
+        );
+    }
+
+    #[test]
+    fn credentials_and_wallets_are_sealed() {
+        let home = TestDir::new();
+        let rules = rules(&home, &[]).with_loose_dotfiles();
+        for path in [".pgpass", ".aws", ".bitcoin", ".netrc"] {
+            assert_eq!(
+                rules.check(&home.path().join(path)),
+                Err(Refusal::Sealed),
+                "{path}"
+            );
+        }
+        // A folder holding credentials goes with them.
+        home.file(".docker/config.json", 1);
+        assert_eq!(
+            rules.check(&home.path().join(".docker")),
+            Err(Refusal::Sealed)
         );
     }
 

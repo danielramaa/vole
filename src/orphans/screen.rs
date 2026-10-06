@@ -123,20 +123,35 @@ impl Screen {
         matches!(self.state, State::Removing(_))
     }
 
-    /// Starts removing what was confirmed. Nothing is removed without fresh path rules, the mount
-    /// points and the Operation Log; packages wait for the terminal.
+    /// Starts removing what was confirmed. Nothing is removed without the Operation Log, nor
+    /// configs and old Backups without fresh path rules and the mount points; packages wait for
+    /// the terminal.
     fn remove(&self, plan: Plan) -> State {
-        let prepared = (|| -> Result<(PathBuf, Rules, Mounts, Log), String> {
+        let log = match Log::open_default("orphans") {
+            Ok(log) => log,
+            Err(err) => return State::Failed(format!("Nothing was removed: {err}")),
+        };
+        // Packages alone need nothing more: pacman checks them itself.
+        let home_items =
+            plan.selected_configs().next().is_some() || plan.selected_backups().next().is_some();
+        if !home_items {
+            return State::RootPending {
+                plan,
+                outcomes: Vec::new(),
+                log,
+            };
+        }
+        let prepared = (|| -> Result<(PathBuf, Rules, Mounts), String> {
             let home = dirs::home_dir().ok_or("the home directory could not be found")?;
             let rules = rules(&home, &self.config)
                 .map_err(|err| format!("resolving {}: {err}", home.display()))?;
             let mounts = Mounts::load().map_err(|err| {
                 format!("reading the mount points from /proc/self/mountinfo: {err}")
             })?;
-            Ok((home, rules, mounts, Log::open_default("orphans")?))
+            Ok((home, rules, mounts))
         })();
         match prepared {
-            Ok((home, rules, mounts, log)) => Self::start_removal(plan, home, rules, mounts, log),
+            Ok((home, rules, mounts)) => Self::start_removal(plan, home, rules, mounts, log),
             Err(err) => State::Failed(format!("Nothing was removed: {err}")),
         }
     }

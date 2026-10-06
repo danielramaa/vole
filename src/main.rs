@@ -1,3 +1,4 @@
+mod analyze;
 mod app;
 mod clean;
 mod config;

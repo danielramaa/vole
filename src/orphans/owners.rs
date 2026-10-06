@@ -622,8 +622,12 @@ impl Owners {
         if SHARED.iter().any(|pattern| matches(pattern, &keys)) {
             add_owner(&mut found, &Owner::Shared);
         }
-        if let Some(owner) = self.known.get(real) {
-            add_owner(&mut found, &Owner::Known(owner.clone()));
+        // A Known Owners entry keeps what holds it too, like the Protected List: an entry for
+        // ~/.local/share/Steam/steamapps keeps ~/.local/share/Steam.
+        for (path, owner) in &self.known {
+            if path.starts_with(real) || real.starts_with(path) {
+                add_owner(&mut found, &Owner::Known(owner.clone()));
+            }
         }
         found
     }
@@ -981,5 +985,16 @@ picom /etc/xdg/picom/
             [Owner::Known("my script".into())]
         );
         assert!(of(&owners, "other-tool").is_empty());
+        // What holds an entry, or is inside one, is kept too.
+        let library = PathBuf::from("/home/me/.local/share/Steam/steamapps");
+        let mut owners = Owners::default();
+        owners.add_known([(library, "my game library".to_string())]);
+        assert_eq!(
+            owners.of(Path::new("/home/me/.local/share/Steam"), "Steam"),
+            [Owner::Known("my game library".into())]
+        );
+        let mut owners = Owners::default();
+        owners.add_known([(PathBuf::from("/home/me/.config"), "me".to_string())]);
+        assert_eq!(of(&owners, "anything").len(), 1);
     }
 }

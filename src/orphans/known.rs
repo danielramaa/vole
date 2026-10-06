@@ -5,8 +5,8 @@
 //! "~/.config/my-tool" = "my-tool, installed by hand in ~/apps"
 //! ```
 //!
-//! A folder listed there is owned, whatever is installed. Like the Protected List, the file can
-//! only keep things from being proposed.
+//! A folder listed there is owned, whatever is installed, and so is a folder holding one or inside
+//! one. Like the Protected List, the file can only keep things from being proposed.
 
 use std::collections::BTreeMap;
 use std::fs;

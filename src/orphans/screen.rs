@@ -735,6 +735,13 @@ impl PlanView {
             "Orphaned configs",
             Style::new().add_modifier(Modifier::BOLD),
         )];
+        if let Some(err) = &self.plan.configs_error {
+            spans.push(Span::styled(
+                format!("  couldn't look for them: {err}"),
+                Style::new().add_modifier(Modifier::BOLD),
+            ));
+            return Line::from(spans);
+        }
         if let Some(note) = &self.plan.configs_note {
             spans.push(Span::styled(
                 format!("  {note}"),
@@ -1254,6 +1261,21 @@ mod tests {
             screen.left,
             [(PathBuf::from("/home/me/.config/htop"), "htop".to_string())]
         );
+    }
+
+    #[test]
+    fn says_why_configs_couldnt_be_looked_for() {
+        let mut screen = Screen::with_plan(Plan {
+            packages: vec![Package::new("a", 10)],
+            configs_error: Some("reading known-owners.toml: expected `=`".into()),
+            ..Plan::default()
+        });
+        let rows = render(&mut screen, 100, 8).join("\n");
+        assert!(rows.contains("[ ] a"), "{rows}");
+        assert!(rows.contains(
+            "Orphaned configs  couldn't look for them: reading known-owners.toml: expected `=`"
+        ));
+        assert!(!rows.contains("none found  couldn't"));
     }
 
     #[test]

@@ -62,6 +62,8 @@ pub struct Plan {
     pub configs: Vec<OrphanedConfig>,
     /// Shown next to the configs, e.g. how many paths the safety rules left out.
     pub configs_note: Option<String>,
+    /// Why the configs couldn't be looked for, e.g. a mistake in the Known Owners file.
+    pub configs_error: Option<String>,
     /// The Backups old enough to delete, oldest first.
     pub backups: Vec<OldBackup>,
     /// The configs only packages own, which removing them leaves behind.

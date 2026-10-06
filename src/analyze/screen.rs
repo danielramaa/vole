@@ -804,12 +804,8 @@ impl View {
         let tree = &self.tree;
         let path = tree.path(id);
         let outside = self.is_outside_home(&path);
-        let sealed = !outside
-            && self
-                .picker
-                .as_ref()
-                .is_ok_and(|picker| picker.is_sealed(&path));
-        let check = if outside || sealed {
+        let kept = if outside { None } else { self.kept(&path) };
+        let check = if outside || kept.is_some() {
             "    "
         } else if self.is_selected(id) {
             "[x] "
@@ -827,10 +823,13 @@ impl View {
         if tree.kind(id) == Kind::Dir {
             name.push('/');
         }
-        let mark = if sealed {
-            Some("sealed")
-        } else {
-            self.mark(id)
+        let mark = match kept {
+            Some(Kept::Sealed) => Some("sealed"),
+            kept => self.mark(id).or(kept.map(|kept| match kept {
+                Kept::Sealed => "sealed",
+                Kept::Mount => "mount point",
+                Kept::HoldsMount => "holds a mount point",
+            })),
         };
         let mark = mark.map(|mark| format!("  {mark}"));
         // Long names are cut, so the size always shows.
@@ -842,6 +841,21 @@ impl View {
             spans.push(Span::styled(mark, Style::new().add_modifier(Modifier::DIM)));
         }
         ui::right_aligned(spans, right, width)
+    }
+
+    /// Why `path`, in the home folder, can never be picked, when that shows without looking at
+    /// the disk.
+    fn kept(&self, path: &Path) -> Option<Kept> {
+        let picker = self.picker.as_ref().ok()?;
+        if picker.is_sealed(path) {
+            Some(Kept::Sealed)
+        } else if picker.is_mount(path) {
+            Some(Kept::Mount)
+        } else if picker.holds_mount(path) {
+            Some(Kept::HoldsMount)
+        } else {
+            None
+        }
     }
 
     /// `id`'s size, as "at least" when something in it couldn't be read.
@@ -918,8 +932,21 @@ impl View {
             Some(Unwalked::Unreadable) | None => {}
         }
         if let Ok(picker) = &self.picker {
-            if picker.is_sealed(&path) {
-                return Some("A Sealed Path, or holds one: vole never removes it, even by hand.");
+            match self.kept(&path) {
+                Some(Kept::Sealed) => {
+                    return Some(
+                        "A Sealed Path, or holds one: vole never removes it, even by hand.",
+                    );
+                }
+                Some(Kept::Mount) => {
+                    return Some("A mount point: what is mounted doesn't go to the trash.");
+                }
+                Some(Kept::HoldsMount) => {
+                    return Some(
+                        "Holds a mount point: the trash would take what is mounted along.",
+                    );
+                }
+                None => {}
             }
             if picker.is_protected(&path) {
                 return Some(
@@ -939,6 +966,14 @@ impl View {
         (self.tree.kind(id) == Kind::Symlink)
             .then_some("A symlink: what it points to is counted where it is.")
     }
+}
+
+/// Why an entry in the home folder can never be picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Kept {
+    Sealed,
+    Mount,
+    HoldsMount,
 }
 
 /// `part`'s share of `whole`, out of `scale`.
@@ -1434,6 +1469,28 @@ mod tests {
         let mut screen = Screen::with_view(View::new(tree, home.path().into(), picker));
         press(&mut screen, KeyCode::Char(' '));
         assert_eq!(view(&screen).picked()[0].1.label, "~/a?b");
+    }
+
+    #[test]
+    fn mount_points_in_home_have_no_box() {
+        let home = TestDir::new();
+        let usb = home.dir("data/usb");
+        home.file("data/usb/photo.jpg", 100);
+        home.file("notes", 10);
+        let table = MountTable::from_mounts([(usb.clone(), Mount::UsbDisk)]);
+        let tree = scan::scan(home.path(), &table, false, &Progress::default());
+        let picker = Picker::with_mounts(home.path(), crate::disk::Mounts::from_paths([usb]));
+        let view = View::new(tree, home.path().into(), Ok(picker));
+        let mut screen = Screen::with_view(view);
+        let rows = render(&mut screen, 80, 8).join("\n");
+        assert!(rows.contains("    data/  holds a mount point"), "{rows}");
+        assert!(rows.contains("[ ] notes"), "{rows}");
+        go_to(&mut screen, "data");
+        let rows = render(&mut screen, 80, 8).join("\n");
+        assert!(rows.contains("Holds a mount point"), "{rows}");
+        press(&mut screen, KeyCode::Char('l'));
+        let rows = render(&mut screen, 80, 8).join("\n");
+        assert!(rows.contains("    usb/  USB disk"), "{rows}");
     }
 
     #[test]

@@ -52,6 +52,12 @@ impl Picker {
         Ok(Self::new(home, rules, mounts))
     }
 
+    /// What may be picked in `home`, with `mounts` for the mount points.
+    #[cfg(test)]
+    pub fn with_mounts(home: &Path, mounts: Mounts) -> Self {
+        Self::new(home, Rules::new(home, &[], &[]).unwrap(), mounts)
+    }
+
     fn new(home: &Path, rules: Rules, mounts: Mounts) -> Self {
         let mut own: Vec<PathBuf> = [".config", ".local/share", ".local/state"]
             .iter()
@@ -108,6 +114,14 @@ impl Picker {
     /// Whether moving `path` would move a Sealed Path.
     pub fn is_sealed(&self, path: &Path) -> bool {
         self.rules.is_sealed(path)
+    }
+
+    pub fn is_mount(&self, path: &Path) -> bool {
+        self.mounts.contains(path)
+    }
+
+    pub fn holds_mount(&self, path: &Path) -> bool {
+        self.mounts.any_inside(path)
     }
 
     pub fn is_protected(&self, path: &Path) -> bool {

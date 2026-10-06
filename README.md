@@ -7,7 +7,7 @@ vole brings the pacman cache, AUR helper cache, systemd journal, user caches, or
 It's inspired by [Mole](https://github.com/tw93/Mole) on macOS, but built for Arch: it knows about pacman, the AUR and systemd instead of treating Linux as generic.
 
 > [!WARNING]
-> **vole is in early development.** `vole clean`, `vole orphans` and `vole restore` work; `analyze` and `status` are still to come. See [Status](#status) for what works today and [ROADMAP.md](ROADMAP.md) for what's next.
+> **vole is in early development.** `vole clean`, `vole orphans`, `vole restore` and `vole analyze` work; `status` is still to come. See [Status](#status) for what works today and [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -34,7 +34,7 @@ The alternatives are separate tools (gdu, btop, paccache), scripts without a rea
 | **`clean`** | Frees space from the pacman cache (keeps the last 2 versions of each installed package), the AUR helper cache, the systemd journal (shrunk to 200 MB), developer caches (pip, npm, cargo, go), everything else in `~/.cache`, and the trash. |
 | **`orphans`** | Finds **orphaned packages** (including packages that only become orphans once others are removed) and **orphaned configs**: folders in `~/.config`, `~/.local/share`, `~/.local/state`, `~/.cache` and dotfiles in `~` that no installed program owns. |
 | **`restore`** | Puts orphaned configs you removed back where they were, from their dated backup. |
-| **`analyze`** | An interactive disk explorer, like ncdu or gdu. Covers the whole filesystem on the current disk. You can delete files in your home folder; outside it, vole shows the safe way to free the space. |
+| **`analyze`** | An interactive disk explorer, like ncdu or gdu. Covers the whole filesystem on the current disk. You can move what you pick in your home folder to the trash; outside it, vole shows how to free the space. |
 | **`status`** | A real-time dashboard read from `/proc` and `/sys`: CPU per core, memory, disk, network, temperatures, top processes, battery, and a system-health panel (cache sizes, orphans, journal size, pending updates). |
 
 ### How orphaned packages are found
@@ -59,6 +59,13 @@ Detection is a heuristic, so each orphan gets a **confidence** level:
 
 Removed orphaned configs aren't deleted. They move into a dated **backup** in `~/.local/share/vole/backups/`, which `vole restore` puts back where they were; it never overwrites anything there now. Backups 30 days old or more show up in later Plans, to delete for good. When you remove a package, vole also offers its leftover configs straight away.
 
+### How the disk explorer works
+
+`vole analyze` scans the whole filesystem from `/`, reading many folders at once, and shows a folder at a time, largest first, each entry with its share of the folder. It stays on the disk `/` is on: other partitions and btrfs subvolumes of that disk (`/boot`, a separate `/home`) are scanned with it, while other disks, USB disks, network shares and what isn't on a disk (`/proc`, `/sys`, `/run`, `/tmp`) are listed but left out. `o` scans other disks too, USB disks among them; network shares are never looked into. Sizes are the space used on disk, and a file with several hard links counts once. A folder vole may not read is marked, and the folders holding it show "at least" (`≥`).
+
+- **Inside your home folder** you can select files and folders and move them to the desktop trash (`gio trash`), where your file manager can put them back until the trash is emptied. Anything can be picked, the Protected List included, but never Sealed Paths or what holds them, the trash itself, vole's own folders or mount points.
+- **Outside it** vole only shows. The line under the list says how to free the space: known folders have their own tool (`vole clean` for the pacman cache and the journal, `docker system prune`, `flatpak uninstall --unused`, …), and for anything else, `pacman -Qo` tells which package it comes from, and whether other packages need it.
+
 ## Safety
 
 vole deletes files, so safety comes first.
@@ -72,7 +79,7 @@ vole deletes files, so safety comes first.
   | Regenerable (caches) | Deleted permanently |
   | Orphaned config | Moved to a dated backup in `~/.local/share/vole/backups/`, restorable |
   | Orphaned package | `pacman -Rns`; the plan shows the `/etc` files that go with it |
-  | Picked by hand in `analyze` | Moved to the desktop trash |
+  | Picked by hand in `analyze` | Moved to the desktop trash, where your file manager can put it back |
   | Trash | Emptying it is its own item, never automatic |
 
 - **Items in use are flagged.** If a running program is using an item, removing it needs an extra confirmation.
@@ -85,7 +92,7 @@ vole deletes files, so safety comes first.
 
 ### Privileges
 
-vole **runs as your normal user and refuses to run as root.** It only removes files itself inside your home folder. System-level work (pacman cache, journal, packages) is done by the official tools, `/usr/bin/paccache`, `/usr/bin/journalctl` and `/usr/bin/pacman`, through `sudo`, after you confirm. The TUI pauses so `sudo` can ask for your password itself; vole never sees it.
+vole **runs as your normal user and refuses to run as root.** It only removes files itself inside your home folder; what you pick in `analyze` goes to the trash through `/usr/bin/gio`, as you. System-level work (pacman cache, journal, packages) is done by the official tools, `/usr/bin/paccache`, `/usr/bin/journalctl` and `/usr/bin/pacman`, through `sudo`, after you confirm. The TUI pauses so `sudo` can ask for your password itself; vole never sees it.
 
 Only validated numbers from your config reach those commands, never free text, so a tampered config file can't be turned into root access. The only other arguments are the names of the packages you picked, which come from pacman itself and are checked to be valid package names. Details: [ADR 0001](docs/adr/0001-privilege-model.md).
 
@@ -98,15 +105,15 @@ Only validated numbers from your config reach those commands, never free text, s
 | **M2**: `clean` removes selected items | ✅ Done ([#3](https://github.com/danielramaa/vole/issues/3)) |
 | **M3**: `orphans`, packages | ✅ Done ([#4](https://github.com/danielramaa/vole/issues/4)) |
 | **M4**: `orphans`, configs and backups | ✅ Done ([#5](https://github.com/danielramaa/vole/issues/5)) |
-| **M5**: `analyze` | ⏳ Next ([#6](https://github.com/danielramaa/vole/issues/6)) |
-| **M6**: `status` | [#7](https://github.com/danielramaa/vole/issues/7) |
+| **M5**: `analyze` | ✅ Done ([#6](https://github.com/danielramaa/vole/issues/6)) |
+| **M6**: `status` | ⏳ Next ([#7](https://github.com/danielramaa/vole/issues/7)) |
 | **M7**: AUR release | [#8](https://github.com/danielramaa/vole/issues/8) |
 
 ## Installation
 
 vole isn't on the AUR yet (planned for M7). For now, build it from source.
 
-Requirements: Rust **1.88** or newer, and `pacman-contrib` (for `paccache`).
+Requirements: Rust **1.88** or newer, `pacman-contrib` (for `paccache`) and `glib2` (for `gio`, which moves what you pick in `analyze` to the trash).
 
 ```sh
 git clone https://github.com/danielramaa/vole.git
@@ -159,6 +166,19 @@ In `restore`:
 | `Space` | Select or deselect the config (on a backup, all its configs) |
 | `a` | Select or deselect every config of the current backup |
 | `Enter` | Review the selection, then `y` to put it back or `n` to go back |
+
+In `analyze`:
+
+| Key | Action |
+|---|---|
+| `l` / `→` / `Enter` | Open the folder |
+| `h` / `←` / `Backspace` | Go up a folder (at the top, `h` and `←` leave `analyze`) |
+| `PgUp` `PgDn` / `g` `G` | Move a page, or to the first or last entry |
+| `~` | Go to your home folder |
+| `Space` | Select or deselect the file or folder, inside your home folder. A folder takes what is in it along. |
+| `t` | Review the selection, then `y` to move it to the trash or `n` to go back. If something is in use by a running program, it takes `Y` (shift+y) on a second screen. While moving, `Esc` stops after the current one. |
+| `o` | Scan again with other disks too, or without them |
+| `r` | Scan again |
 
 ## Configuration
 

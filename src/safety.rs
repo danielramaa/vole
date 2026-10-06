@@ -60,6 +60,8 @@ pub enum Refusal {
     /// Relative, or contains `.` or `..`.
     NotNormalized,
     OutsideAllowedRoots,
+    /// Not inside the home directory, where the Items picked by hand come from.
+    OutsideHome,
     Protected,
     Sealed,
     /// A folder above the path is a symlink, so the path may really be somewhere else.
@@ -71,6 +73,7 @@ impl fmt::Display for Refusal {
         f.write_str(match self {
             Refusal::NotNormalized => "not a plain absolute path",
             Refusal::OutsideAllowedRoots => "outside the allowed roots",
+            Refusal::OutsideHome => "outside the home folder",
             Refusal::Protected => "on the protected list",
             Refusal::Sealed => "a sealed path",
             Refusal::Symlinked => "reached through a symlink",
@@ -138,16 +141,33 @@ impl Rules {
     /// returns where it really is (see [`Rules::resolve`]). `path` itself may be a symlink:
     /// removing it only removes the link.
     pub fn check(&self, path: &Path) -> Result<PathBuf, Refusal> {
-        self.check_with(path, true)
+        self.check_with(path, Purpose::Propose)
     }
 
     /// Checks that something vole removed may be put back at `path`: like [`Rules::check`], but
     /// the Protected List, which only keeps things from being proposed, doesn't stop it.
     pub fn check_put_back(&self, path: &Path) -> Result<PathBuf, Refusal> {
-        self.check_with(path, false)
+        self.check_with(path, Purpose::PutBack)
     }
 
-    fn check_with(&self, path: &Path, protected: bool) -> Result<PathBuf, Refusal> {
+    /// Checks that the user may pick `path` by hand in the disk explorer, and returns where it
+    /// really is: anywhere inside the home directory, the Protected List included, but never a
+    /// Sealed Path, nor through a symlinked folder.
+    pub fn check_picked(&self, path: &Path) -> Result<PathBuf, Refusal> {
+        self.check_with(path, Purpose::Pick)
+    }
+
+    /// Whether removing `path` would remove a Sealed Path: it is one, is inside one, or holds one.
+    pub fn is_sealed(&self, path: &Path) -> bool {
+        overlaps(path, &self.sealed)
+    }
+
+    /// Whether `path` is on the Protected List or inside a path that is.
+    pub fn is_protected(&self, path: &Path) -> bool {
+        self.protected.iter().any(|rule| path.starts_with(rule))
+    }
+
+    fn check_with(&self, path: &Path, purpose: Purpose) -> Result<PathBuf, Refusal> {
         if !path.is_absolute()
             || path
                 .components()
@@ -158,14 +178,14 @@ impl Rules {
         if overlaps(path, &self.sealed) {
             return Err(Refusal::Sealed);
         }
-        let loose_dotfile = self.loose_dotfiles
-            && path.parent() == Some(self.home.as_path())
-            && path
-                .file_name()
-                .is_some_and(|name| name.as_bytes().starts_with(b"."));
-        if !(loose_dotfile || self.allowed_roots.iter().any(|root| path.starts_with(root))) {
+        if purpose == Purpose::Pick {
+            if !path.starts_with(&self.home) || path == self.home {
+                return Err(Refusal::OutsideHome);
+            }
+        } else if !self.in_allowed_roots(path) {
             return Err(Refusal::OutsideAllowedRoots);
         }
+        let protected = purpose == Purpose::Propose;
         if protected && overlaps(path, &self.protected) {
             return Err(Refusal::Protected);
         }
@@ -179,6 +199,15 @@ impl Rules {
         Ok(real)
     }
 
+    fn in_allowed_roots(&self, path: &Path) -> bool {
+        let loose_dotfile = self.loose_dotfiles
+            && path.parent() == Some(self.home.as_path())
+            && path
+                .file_name()
+                .is_some_and(|name| name.as_bytes().starts_with(b"."));
+        loose_dotfile || self.allowed_roots.iter().any(|root| path.starts_with(root))
+    }
+
     /// Where `path` (inside the home directory) really is, without following `path` itself.
     /// `None` when a folder between the home directory and `path` is a symlink, or is missing.
     pub fn resolve(&self, path: &Path) -> Option<PathBuf> {
@@ -189,6 +218,17 @@ impl Rules {
         }
         Some(expected.join(path.file_name()?))
     }
+}
+
+/// What a path is checked for.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Purpose {
+    /// Proposed by a module, or removed after it was.
+    Propose,
+    /// Put back where vole took it from.
+    PutBack,
+    /// Picked by hand in the disk explorer.
+    Pick,
 }
 
 /// Whether `path` is one of `rules`, inside one, or contains one (removing it would remove the rule path).
@@ -345,6 +385,52 @@ mod tests {
             rules.check_put_back(&home.dir(".local/share/keyrings")),
             Err(Refusal::Sealed)
         );
+    }
+
+    #[test]
+    fn picking_reaches_the_whole_home_but_sealed_paths() {
+        let home = TestDir::new();
+        let kept = home.dir(".cache/keep");
+        let rules = rules(&home, std::slice::from_ref(&kept));
+        let video = home.file("Videos/old.mkv", 1);
+        assert_eq!(rules.check_picked(&video), Ok(video.clone()));
+        // The Protected List only keeps modules from proposing things.
+        assert_eq!(rules.check(&kept), Err(Refusal::Protected));
+        assert_eq!(rules.check_picked(&kept), Ok(kept.clone()));
+        let project = home.dir("projects/app");
+        assert_eq!(rules.check_picked(&project), Ok(project.clone()));
+        assert!(rules.is_protected(&project) && rules.is_protected(&kept));
+        assert!(!rules.is_protected(&video));
+        assert_eq!(rules.check_picked(&home.dir(".ssh")), Err(Refusal::Sealed));
+        // A folder holding a sealed path would take it along.
+        assert_eq!(
+            rules.check_picked(&home.path().join(".local")),
+            Err(Refusal::Sealed)
+        );
+        assert!(rules.is_sealed(&home.path().join(".local")));
+        assert_eq!(
+            rules.check_picked(Path::new("/etc/passwd")),
+            Err(Refusal::OutsideHome)
+        );
+        let outside = home.path().with_extension("other");
+        assert_eq!(rules.check_picked(&outside), Err(Refusal::OutsideHome));
+    }
+
+    #[test]
+    fn picking_never_takes_the_home_folder_itself_or_goes_through_symlinks() {
+        let home = TestDir::new();
+        let outside = TestDir::new();
+        outside.file("important", 1);
+        home.symlink("link", outside.path());
+        let rules = rules(&home, &[]);
+        assert_eq!(rules.check_picked(home.path()), Err(Refusal::Sealed));
+        assert_eq!(
+            rules.check_picked(&home.path().join("link/important")),
+            Err(Refusal::Symlinked)
+        );
+        // The link itself can go: only the link moves.
+        let link = home.path().join("link");
+        assert_eq!(rules.check_picked(&link), Ok(link));
     }
 
     #[test]

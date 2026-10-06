@@ -92,7 +92,7 @@ pub fn not_attempted(label: &str, size: u64) -> Outcome {
         size,
         error: Some("stopped before removing it".into()),
         log_error: None,
-        moved: false,
+        moved: None,
     }
 }
 
@@ -366,7 +366,9 @@ mod tests {
         let rc = home.dir.file(".gonerc", 10);
         let outcomes = move_all(&home, vec![gone.clone(), rc.clone()], &Mounts::default());
         assert!(
-            outcomes.iter().all(|o| o.error.is_none() && o.moved),
+            outcomes
+                .iter()
+                .all(|o| o.error.is_none() && o.moved.is_some()),
             "{outcomes:?}"
         );
         assert!(!gone.exists() && !rc.exists());
@@ -512,7 +514,7 @@ mod tests {
         home.dir.dir(".config");
         let gone = home.dir.path().join(".config/gone");
         let outcomes = move_all(&home, vec![gone], &Mounts::default());
-        assert!(outcomes[0].error.is_none() && !outcomes[0].moved);
+        assert!(outcomes[0].error.is_none() && outcomes[0].moved.is_none());
         // Nothing freed by vole.
         assert_eq!(outcomes[0].size, 0);
         assert!(outcomes[0].label.ends_with("(already gone)"));

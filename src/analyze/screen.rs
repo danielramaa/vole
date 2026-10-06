@@ -1,12 +1,13 @@
 //! The `analyze` screens: the scan as it goes, then the tree, largest first, one folder at a
-//! time.
+//! time; and moving what was selected in the home folder to the trash.
 
+use std::cmp::Reverse;
 use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
@@ -20,8 +21,11 @@ use ratatui::widgets::{Block, List, ListState, Paragraph};
 use super::disks::{Mount, MountTable};
 use super::scan::{self, Progress};
 use super::tip;
+use super::trash::{self, GIO, Gio, Picked, Picker};
 use super::tree::{Id, Kind, ROOT, Tree, Unwalked};
 use crate::app::ModuleScreen;
+use crate::config::Config;
+use crate::log::{Log, Outcome};
 use crate::term::RunRoot;
 use crate::{size, ui};
 
@@ -32,43 +36,74 @@ const SCANNED: &str = "/";
 const BAR: usize = 10;
 
 pub struct Screen {
+    config: Config,
     state: State,
 }
+
+/// What a scan sends back: the tree, and what may be picked in it or why nothing may.
+type Scanned = (Tree, Result<Picker, String>);
 
 enum State {
     /// The scan starts on the first tick, so creating the screen touches nothing.
     NotStarted,
     Scanning {
-        receiver: Receiver<Result<Tree, String>>,
+        receiver: Receiver<Result<Scanned, String>>,
         progress: Arc<Progress>,
         home: PathBuf,
     },
     Ready(View),
+    /// Asking before anything moves; `in_use` is the extra step for In Use Items.
+    Confirm {
+        view: View,
+        items: Vec<(Id, Picked)>,
+        in_use: bool,
+        scroll: u16,
+    },
+    /// Confirmed: the Items start moving on the next tick.
+    Confirmed {
+        view: View,
+        items: Vec<(Id, Picked)>,
+    },
+    /// The Items are being moved to the trash on a worker thread.
+    Trashing {
+        view: View,
+        items: Vec<(Id, Picked)>,
+        receiver: Receiver<Moving>,
+        stop: Arc<AtomicBool>,
+        now: String,
+    },
+    Done {
+        view: View,
+        outcomes: Vec<Outcome>,
+        scroll: u16,
+    },
     Failed(String),
 }
 
-impl Default for Screen {
-    fn default() -> Self {
-        Self::new()
-    }
+/// Messages from the thread moving Items to the trash.
+enum Moving {
+    Item(String),
+    Finished(Vec<Outcome>),
 }
 
 impl Screen {
-    pub fn new() -> Self {
+    pub fn new(config: &Config) -> Self {
         Self {
+            config: config.clone(),
             state: State::NotStarted,
         }
     }
 
     #[cfg(test)]
-    fn with_tree(tree: Tree, home: &str) -> Self {
+    fn with_view(view: View) -> Self {
         Self {
-            state: State::Ready(View::new(tree, home.into())),
+            config: Config::default(),
+            state: State::Ready(view),
         }
     }
 
     /// Starts the scan in the background.
-    fn start() -> State {
+    fn start(&self) -> State {
         let Some(home) = dirs::home_dir() else {
             return State::Failed("the home directory could not be found".into());
         };
@@ -77,15 +112,20 @@ impl Screen {
         let (sender, receiver) = mpsc::channel();
         let progress = Arc::new(Progress::default());
         let counting = Arc::clone(&progress);
+        let config = self.config.clone();
+        let picking = home.clone();
         thread::spawn(move || {
             // Without the mount points, the walk would go into other disks and into /proc.
-            let tree = MountTable::load()
-                .map(|mounts| scan::scan(Path::new(SCANNED), &mounts, &counting))
+            let scanned = MountTable::load()
+                .map(|mounts| {
+                    let tree = scan::scan(Path::new(SCANNED), &mounts, &counting);
+                    (tree, Picker::load(&picking, &config))
+                })
                 .map_err(|err| {
                     format!("reading the mount points from /proc/self/mountinfo: {err}")
                 });
             // The user may have left the screen already; then nobody is listening.
-            let _ = sender.send(tree);
+            let _ = sender.send(scanned);
         });
         State::Scanning {
             receiver,
@@ -93,20 +133,60 @@ impl Screen {
             home,
         }
     }
+
+    /// Fresh path rules and mount points, and the Operation Log: nothing moves without all
+    /// three, nor without gio.
+    fn prepare(&self, home: &Path) -> Result<(Picker, Log), String> {
+        if !Path::new(GIO).exists() {
+            return Err("gio not found; install glib2".into());
+        }
+        let picker = Picker::load(home, &self.config)?;
+        let log = Log::open_default("analyze")?;
+        Ok((picker, log))
+    }
+
+    /// Moves the Items to the trash on a worker thread, so the screen keeps drawing.
+    fn start_trashing(view: View, items: Vec<(Id, Picked)>, picker: Picker, mut log: Log) -> State {
+        let (sender, receiver) = mpsc::channel();
+        let stop = Arc::new(AtomicBool::new(false));
+        let worker_stop = Arc::clone(&stop);
+        let picked: Vec<Picked> = items.iter().map(|(_, item)| item.clone()).collect();
+        thread::spawn(move || {
+            let mut progress = |done: usize, total: usize, label: &str| {
+                let _ = sender.send(Moving::Item(format!("{label} ({} of {total})", done + 1)));
+            };
+            let outcomes = trash::trash_all(
+                &picked,
+                &picker,
+                &Gio,
+                &mut log,
+                &mut progress,
+                &worker_stop,
+            );
+            let _ = sender.send(Moving::Finished(outcomes));
+        });
+        State::Trashing {
+            view,
+            items,
+            receiver,
+            stop,
+            now: String::new(),
+        }
+    }
 }
 
 impl ModuleScreen for Screen {
-    /// Starts the scan, picks up the tree once it is done, then asks pacman for tips.
+    /// Moves background work along: the scan, pacman's tips, and moving Items to the trash.
     fn tick(&mut self) {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
-            State::NotStarted => Self::start(),
+            State::NotStarted => self.start(),
             State::Scanning {
                 receiver,
                 progress,
                 home,
             } => match receiver.try_recv() {
-                Ok(Ok(tree)) => State::Ready(View::new(tree, home)),
+                Ok(Ok((tree, picker))) => State::Ready(View::new(tree, home, picker)),
                 Ok(Err(err)) => State::Failed(format!("Could not scan: {err}")),
                 Err(TryRecvError::Empty) => State::Scanning {
                     receiver,
@@ -121,33 +201,168 @@ impl ModuleScreen for Screen {
                 view.tick();
                 State::Ready(view)
             }
+            State::Confirmed { mut view, items } => match self.prepare(&view.home) {
+                Ok((picker, log)) => Self::start_trashing(view, items, picker, log),
+                Err(err) => {
+                    view.flash = Some(format!("Nothing was moved to the trash: {err}"));
+                    State::Ready(view)
+                }
+            },
+            State::Trashing {
+                mut view,
+                items,
+                receiver,
+                stop,
+                mut now,
+            } => loop {
+                match receiver.try_recv() {
+                    Ok(Moving::Item(label)) => now = label,
+                    Ok(Moving::Finished(outcomes)) => {
+                        view.forget(&items, &outcomes);
+                        break State::Done {
+                            view,
+                            outcomes,
+                            scroll: 0,
+                        };
+                    }
+                    Err(TryRecvError::Empty) => {
+                        break State::Trashing {
+                            view,
+                            items,
+                            receiver,
+                            stop,
+                            now,
+                        };
+                    }
+                    Err(TryRecvError::Disconnected) => {
+                        break State::Failed(
+                            "Moving to the trash stopped unexpectedly; the operation log has what was moved."
+                                .into(),
+                        );
+                    }
+                }
+            },
             state => state,
         };
     }
 
     /// Returns whether the key was used.
     fn on_key(&mut self, key: KeyEvent) -> bool {
-        match &mut self.state {
-            State::Ready(view) => view.on_key(key),
-            State::Failed(_) if key.code == KeyCode::Enter => {
-                self.state = State::NotStarted;
-                true
-            }
-            State::NotStarted | State::Scanning { .. } | State::Failed(_) => false,
+        let back = matches!(
+            key.code,
+            KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
+        );
+        if let State::Trashing { stop, .. } = &self.state
+            && key.code == KeyCode::Esc
+        {
+            stop.store(true, Ordering::Relaxed);
+            return true;
         }
+        let state = std::mem::replace(&mut self.state, State::NotStarted);
+        let (state, used) = match state {
+            State::Ready(mut view) if key.code == KeyCode::Char('t') => {
+                let mut items = view.picked();
+                if items.is_empty() {
+                    view.flash =
+                        Some("Nothing selected: space selects what to move to the trash.".into());
+                    (State::Ready(view), true)
+                } else {
+                    view.flash = None;
+                    trash::mark_in_use(items.iter_mut().map(|(_, item)| item));
+                    let confirm = State::Confirm {
+                        view,
+                        items,
+                        in_use: false,
+                        scroll: 0,
+                    };
+                    (confirm, true)
+                }
+            }
+            State::Ready(mut view) => {
+                let used = view.on_key(key);
+                (State::Ready(view), used)
+            }
+            // The In Use step takes another key (Y), so a double-tap or auto-repeat of y can't
+            // pass it before it is even drawn.
+            State::Confirm {
+                view,
+                mut items,
+                in_use,
+                ..
+            } if key.code == KeyCode::Char(if in_use { 'Y' } else { 'y' }) => {
+                trash::mark_in_use(items.iter_mut().map(|(_, item)| item));
+                if !in_use && items.iter().any(|(_, item)| item.in_use) {
+                    let confirm = State::Confirm {
+                        view,
+                        items,
+                        in_use: true,
+                        scroll: 0,
+                    };
+                    (confirm, true)
+                } else {
+                    (State::Confirmed { view, items }, true)
+                }
+            }
+            State::Confirm { view, .. } if back => (State::Ready(view), true),
+            State::Confirm {
+                view,
+                items,
+                in_use,
+                scroll,
+            } => {
+                let scroll = ui::scrolled(scroll, key);
+                let confirm = State::Confirm {
+                    view,
+                    items,
+                    in_use,
+                    scroll,
+                };
+                (confirm, true)
+            }
+            state @ (State::Confirmed { .. } | State::Trashing { .. }) => (state, true),
+            State::Done { view, .. } if key.code == KeyCode::Enter => (State::Ready(view), true),
+            State::Done {
+                view,
+                outcomes,
+                scroll,
+            } => {
+                let next = ui::scrolled(scroll, key);
+                let done = State::Done {
+                    view,
+                    outcomes,
+                    scroll: next,
+                };
+                (done, next != scroll)
+            }
+            State::Failed(_) if key.code == KeyCode::Enter => (State::NotStarted, true),
+            state => (state, false),
+        };
+        self.state = state;
+        used
     }
 
     fn hint(&self) -> &'static str {
         match self.state {
-            State::Ready(_) => "↑↓/jk move · l open · h up",
+            State::Ready(_) => "↑↓/jk move · l open · h up · space select · t trash…",
+            State::Confirm { in_use: false, .. } => "↑↓ scroll · y move to the trash · n back",
+            State::Confirm { in_use: true, .. } => "↑↓ scroll · Y move anyway · n back",
+            State::Trashing { .. } => "esc stop after this Item",
+            State::Done { .. } => "↑↓ scroll · enter back to the list",
             State::Failed(_) => "enter scan again",
-            State::NotStarted | State::Scanning { .. } => "",
+            State::NotStarted | State::Scanning { .. } | State::Confirmed { .. } => "",
         }
     }
 
-    /// q always leaves `analyze`: nothing it does has to finish first.
+    /// Whether q leaves `analyze` here; while confirming or moving, it doesn't.
     fn can_leave(&self) -> bool {
-        true
+        match self.state {
+            State::NotStarted
+            | State::Scanning { .. }
+            | State::Ready(_)
+            | State::Done { .. }
+            | State::Failed(_) => true,
+            State::Confirm { .. } | State::Confirmed { .. } | State::Trashing { .. } => false,
+        }
     }
 
     fn needs_terminal(&self) -> bool {
@@ -176,8 +391,70 @@ impl ModuleScreen for Screen {
                 frame.render_widget(Paragraph::new(err.as_str()).block(block), area)
             }
             State::Ready(view) => view.draw(frame, area, block),
+            State::Confirm {
+                items,
+                in_use,
+                scroll,
+                ..
+            } => draw_confirm(frame, area, block, items, *in_use, scroll),
+            State::Confirmed { .. } => {
+                frame.render_widget(Paragraph::new("Moving to the trash…").block(block), area)
+            }
+            State::Trashing { now, stop, .. } => {
+                let text = if stop.load(Ordering::Relaxed) {
+                    format!("Stopping after {now}…")
+                } else {
+                    format!("Moving {now} to the trash…")
+                };
+                frame.render_widget(Paragraph::new(printable(&text)).block(block), area)
+            }
+            State::Done {
+                outcomes, scroll, ..
+            } => ui::draw_outcomes(frame, area, block, outcomes, scroll),
         }
     }
+}
+
+fn draw_confirm(
+    frame: &mut Frame,
+    area: Rect,
+    block: Block,
+    items: &[(Id, Picked)],
+    in_use: bool,
+    scroll: &mut u16,
+) {
+    let bold = Style::new().add_modifier(Modifier::BOLD);
+    let width = usize::from(block.inner(area).width);
+    let mut lines = Vec::new();
+    if in_use {
+        let count = items.iter().filter(|(_, item)| item.in_use).count();
+        lines.push(Line::styled(
+            format!("{count} of these Items are in use by running programs."),
+            bold,
+        ));
+        lines.push(Line::from(
+            "Moving them can make those programs misbehave. Press Y (shift+y) to move them anyway.",
+        ));
+    } else {
+        let total = size::format(items.iter().map(|(_, item)| item.size).sum());
+        let question = match items.len() {
+            1 => format!("Move this Item ({total}) to the trash?"),
+            count => format!("Move these {count} Items ({total}) to the trash?"),
+        };
+        lines.push(Line::styled(question, bold));
+        lines.push(Line::from(
+            "The trash keeps them, and your file manager can put them back, until it is emptied; vole clean empties it.",
+        ));
+    }
+    lines.push(Line::default());
+    for (_, item) in items {
+        let mut spans = vec![Span::raw(format!("  {}", printable(&item.label)))];
+        if item.in_use {
+            spans.push(Span::styled("  in use", bold));
+        }
+        lines.push(ui::right_aligned(spans, size::format(item.size), width));
+    }
+    ui::draw_scrolled(frame, area, block, lines, scroll);
 }
 
 /// The tree, one folder at a time.
@@ -185,6 +462,8 @@ struct View {
     tree: Tree,
     /// The home folder, where it really is.
     home: PathBuf,
+    /// What may be picked in the home folder, or why nothing may.
+    picker: Result<Picker, String>,
     /// The folder shown.
     dir: Id,
     /// What is in it, largest first.
@@ -195,6 +474,10 @@ struct View {
     offset: usize,
     /// How many rows were on screen last time, for page up and down.
     page: usize,
+    /// The Items selected, in the order they were.
+    selected: Vec<Id>,
+    /// What the last key did, until the next one: why something can't be selected, say.
+    flash: Option<String>,
     /// What pacman said about freeing entries outside the home folder.
     tips: HashMap<Id, String>,
     /// The entry pacman is being asked about, in the background.
@@ -202,15 +485,18 @@ struct View {
 }
 
 impl View {
-    fn new(tree: Tree, home: PathBuf) -> Self {
+    fn new(tree: Tree, home: PathBuf, picker: Result<Picker, String>) -> Self {
         let mut view = Self {
             tree,
             home,
+            picker,
             dir: ROOT,
             rows: Vec::new(),
             cursor: 0,
             offset: 0,
             page: 1,
+            selected: Vec::new(),
+            flash: None,
             tips: HashMap::new(),
             asking: None,
         };
@@ -276,7 +562,108 @@ impl View {
         self.rows.get(self.cursor).copied()
     }
 
+    /// `id`'s path, from `~/` inside the home folder.
+    fn label(&self, id: Id) -> String {
+        let path = self.tree.path(id);
+        match path.strip_prefix(&self.home) {
+            Ok(relative) if !relative.as_os_str().is_empty() => {
+                format!("~/{}", relative.display())
+            }
+            _ => path.display().to_string(),
+        }
+    }
+
+    /// Whether `id` goes to the trash with the selection: it, or a folder holding it, is selected.
+    fn is_selected(&self, id: Id) -> bool {
+        std::iter::once(id)
+            .chain(self.tree.above(id))
+            .any(|id| self.selected.contains(&id))
+    }
+
+    /// Selects or deselects `id`, when it may be picked; else says why not.
+    fn toggle(&mut self, id: Id) {
+        if let Some(index) = self.selected.iter().position(|&selected| selected == id) {
+            self.selected.remove(index);
+            return;
+        }
+        if let Some(folder) = self
+            .tree
+            .above(id)
+            .find(|folder| self.selected.contains(folder))
+        {
+            let folder = printable(&self.label(folder));
+            self.flash = Some(format!("Selected already, with {folder}."));
+            return;
+        }
+        let path = self.tree.path(id);
+        if self.is_outside_home(&path) {
+            self.flash = Some(
+                "Outside your home folder vole only shows; the tip above says how to free the space."
+                    .into(),
+            );
+            return;
+        }
+        let checked = match &self.picker {
+            Ok(picker) => picker.check(&path),
+            Err(err) => {
+                self.flash = Some(format!("Nothing can be selected: {err}"));
+                return;
+            }
+        };
+        if let Err(why) = checked {
+            let label = printable(&self.label(id));
+            self.flash = Some(format!("{label} {why}: vole won't move it to the trash."));
+            return;
+        }
+        // What is in it goes with it.
+        let tree = &self.tree;
+        self.selected
+            .retain(|&selected| !tree.above(selected).any(|folder| folder == id));
+        self.selected.push(id);
+    }
+
+    /// The selected Items, largest first.
+    fn picked(&self) -> Vec<(Id, Picked)> {
+        let mut items: Vec<(Id, Picked)> = self
+            .selected
+            .iter()
+            .map(|&id| {
+                let item = Picked {
+                    path: self.tree.path(id),
+                    label: self.label(id),
+                    size: self.tree.size(id),
+                    in_use: false,
+                };
+                (id, item)
+            })
+            .collect();
+        items.sort_by_key(|(_, item)| Reverse(item.size));
+        items
+    }
+
+    /// Takes what went to the trash, or was gone already, out of the tree, and clears the
+    /// selection. When the folder shown went too, the nearest one above that is left is shown.
+    fn forget(&mut self, items: &[(Id, Picked)], outcomes: &[Outcome]) {
+        for ((id, _), outcome) in items.iter().zip(outcomes) {
+            if outcome.error.is_none() {
+                self.tree.remove(*id);
+            }
+        }
+        self.selected.clear();
+        let mut dir = self.dir;
+        while dir != ROOT && self.tree.is_gone(dir) {
+            dir = self.tree.parent(dir).unwrap_or(ROOT);
+        }
+        let (on, cursor) = (self.current(), self.cursor);
+        self.open(dir, on.filter(|&id| !self.tree.is_gone(id)));
+        if on.is_some_and(|id| self.tree.is_gone(id)) {
+            // Stay about where the cursor was.
+            self.cursor = cursor.min(self.rows.len().saturating_sub(1));
+        }
+    }
+
     fn on_key(&mut self, key: KeyEvent) -> bool {
+        self.flash = None;
         let last = self.rows.len().saturating_sub(1);
         let to = match key.code {
             KeyCode::Down | KeyCode::Char('j') => self.cursor + 1,
@@ -299,6 +686,12 @@ impl View {
                 self.open(parent, Some(self.dir));
                 return true;
             }
+            KeyCode::Char(' ') => {
+                if let Some(id) = self.current() {
+                    self.toggle(id);
+                }
+                return true;
+            }
             _ => return false,
         };
         self.cursor = to.min(last);
@@ -308,12 +701,14 @@ impl View {
     fn draw(&mut self, frame: &mut Frame, area: Rect, block: Block) {
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let [header, list_area, note_area] = Layout::vertical([
+        let [header, list_area, note_area, total_area] = Layout::vertical([
             Constraint::Length(1),
             Constraint::Min(0),
             Constraint::Length(1),
+            Constraint::Length(1),
         ])
         .areas(inner);
+        let bold = Style::new().add_modifier(Modifier::BOLD);
         let dim = Style::new().add_modifier(Modifier::DIM);
 
         // The folder shown, cut at the start when it is long, and how much it uses.
@@ -321,10 +716,7 @@ impl View {
         let width = usize::from(header.width);
         let room = width.saturating_sub(Span::raw(size.as_str()).width() + 1);
         let path = printable(&self.tree.path(self.dir).to_string_lossy());
-        let path = Span::styled(
-            fit_start(&path, room),
-            Style::new().add_modifier(Modifier::BOLD),
-        );
+        let path = Span::styled(fit_start(&path, room), bold);
         frame.render_widget(ui::right_aligned(vec![path], size, width), header);
 
         if self.rows.is_empty() {
@@ -356,11 +748,36 @@ impl View {
         if let Some(note) = self.current().and_then(|id| self.note(id)) {
             frame.render_widget(Line::styled(note, dim), note_area);
         }
+        let total = match &self.flash {
+            Some(flash) => flash.clone(),
+            None if self.selected.is_empty() => String::new(),
+            None => {
+                let size = self.selected.iter().map(|&id| self.tree.size(id)).sum();
+                match self.selected.len() {
+                    1 => format!("Selected 1 Item, {}", size::format(size)),
+                    count => format!("Selected {count} Items, {}", size::format(size)),
+                }
+            }
+        };
+        frame.render_widget(Line::styled(total, bold), total_area);
     }
 
-    /// A row: the entry's name, then its share of the folder (`total`) and its size.
+    /// A row: the entry's name, then its share of the folder (`total`) and its size. Inside
+    /// the home folder, a box tells whether it is selected.
     fn line(&self, id: Id, total: u64, width: usize) -> Line<'static> {
         let tree = &self.tree;
+        let path = tree.path(id);
+        let sealed = self
+            .picker
+            .as_ref()
+            .is_ok_and(|picker| picker.is_sealed(&path));
+        let check = if self.is_outside_home(&path) || sealed {
+            "    "
+        } else if self.is_selected(id) {
+            "[x] "
+        } else {
+            "[ ] "
+        };
         let size = tree.size(id);
         let right = format!(
             "{} {:>4}  {:>12}",
@@ -372,12 +789,17 @@ impl View {
         if tree.kind(id) == Kind::Dir {
             name.push('/');
         }
-        let mark = self.mark(id).map(|mark| format!("  {mark}"));
+        let mark = if sealed {
+            Some("sealed")
+        } else {
+            self.mark(id)
+        };
+        let mark = mark.map(|mark| format!("  {mark}"));
         // Long names are cut, so the size always shows.
         let room = width
-            .saturating_sub(2 + Span::raw(right.as_str()).width() + 1)
+            .saturating_sub(2 + check.len() + Span::raw(right.as_str()).width() + 1)
             .saturating_sub(mark.as_ref().map_or(0, String::len));
-        let mut spans = vec![Span::raw(format!("  {}", fit(&name, room)))];
+        let mut spans = vec![Span::raw(format!("  {check}{}", fit(&name, room)))];
         if let Some(mark) = mark {
             spans.push(Span::styled(mark, Style::new().add_modifier(Modifier::DIM)));
         }
@@ -417,10 +839,9 @@ impl View {
     /// outside the home folder.
     fn note(&self, id: Id) -> Option<&str> {
         let path = self.tree.path(id);
-        if !matches!(
-            self.tree.unwalked(id),
-            Some(Unwalked::Mount(_) | Unwalked::Elsewhere)
-        ) && self.is_outside_home(&path)
+        let unwalked = self.tree.unwalked(id);
+        if !matches!(unwalked, Some(Unwalked::Mount(_) | Unwalked::Elsewhere))
+            && self.is_outside_home(&path)
         {
             return Some(match tip::known(&path, &self.home) {
                 Some(tip) => tip,
@@ -430,7 +851,7 @@ impl View {
                     .map_or("Asking pacman what it comes from…", String::as_str),
             });
         }
-        match self.tree.unwalked(id) {
+        match unwalked {
             Some(Unwalked::Mount(mount)) => {
                 return Some(match mount {
                     Mount::SameDisk => "A mount point.",
@@ -450,10 +871,20 @@ impl View {
                     "The same folder as one at another path (a bind mount), where it is counted.",
                 );
             }
-            Some(Unwalked::Unreadable) => {
-                return Some("vole may not read this folder, so what is in it isn't counted.");
+            Some(Unwalked::Unreadable) | None => {}
+        }
+        if let Ok(picker) = &self.picker {
+            if picker.is_sealed(&path) {
+                return Some("A Sealed Path, or holds one: vole never removes it, even by hand.");
             }
-            None => {}
+            if picker.is_protected(&path) {
+                return Some(
+                    "On the Protected List: no module proposes it, but you can select it here.",
+                );
+            }
+        }
+        if unwalked == Some(Unwalked::Unreadable) {
+            return Some("vole may not read this folder, so what is in it isn't counted.");
         }
         if self.tree.incomplete(id) {
             return Some("Some folders in it can't be read, so it uses at least this much.");
@@ -536,6 +967,17 @@ fn count(n: u64) -> String {
 mod tests {
     use super::*;
     use crate::analyze::tree::Entry;
+    use crate::log::MovedTo;
+    use crate::testdir::TestDir;
+
+    /// A screen showing `tree`, with `home` as the home folder; nothing can be selected.
+    fn screen_of(tree: Tree, home: &str) -> Screen {
+        Screen::with_view(View::new(
+            tree,
+            home.into(),
+            Err("no rules in tests".into()),
+        ))
+    }
 
     fn entry(name: &str, size: u64, kind: Kind) -> Entry {
         Entry {
@@ -572,7 +1014,7 @@ mod tests {
         );
         tree.add(first + 1, vec![entry("notes", 10, Kind::File)]);
         tree.finish();
-        Screen::with_tree(tree, "/home/me")
+        screen_of(tree, "/home/me")
     }
 
     fn press(screen: &mut Screen, code: KeyCode) -> bool {
@@ -657,7 +1099,7 @@ mod tests {
     #[test]
     fn rows_show_their_share_of_the_folder() {
         let mut screen = screen();
-        let rows = render(&mut screen, 60, 9);
+        let rows = render(&mut screen, 60, 10);
         assert!(
             rows[1].contains("/") && rows[1].contains("910 B"),
             "{rows:#?}"
@@ -680,7 +1122,7 @@ mod tests {
         press(&mut screen, KeyCode::End);
         let rows = render(&mut screen, 70, 9);
         assert!(
-            rows[7].contains("Another disk is mounted here"),
+            rows[6].contains("Another disk is mounted here"),
             "{rows:#?}"
         );
     }
@@ -690,7 +1132,7 @@ mod tests {
         let mut tree = Tree::new(root.into(), 0);
         let id = tree.add(ROOT, vec![entry(name, 1, kind)]);
         tree.finish();
-        let mut view = View::new(tree, "/home/me".into());
+        let mut view = View::new(tree, "/home/me".into(), Err("no rules".into()));
         if let Some(tip) = tip {
             view.tips.insert(id, tip.into());
         }
@@ -716,7 +1158,7 @@ mod tests {
             ),
             "From the package firefox."
         );
-        assert_eq!(note_on("/home", "me", Kind::Dir, None), "Your home folder.");
+        assert!(note_on("/home", "me", Kind::Dir, None).starts_with("Your home folder: open it"));
         // Inside it, what is special about an entry.
         assert!(note_on("/home/me", "link", Kind::Symlink, None).starts_with("A symlink"));
         assert_eq!(note_on("/home/me", "notes", Kind::File, None), "");
@@ -731,7 +1173,7 @@ mod tests {
         );
         let me = tree.add(first, vec![entry("me", 0, Kind::Dir)]);
         tree.finish();
-        let view = View::new(tree, "/home/me".into());
+        let view = View::new(tree, "/home/me".into(), Err("no rules".into()));
         assert!(view.waits_for_pacman(first + 1));
         // Known without pacman.
         assert!(!view.waits_for_pacman(first) && !view.waits_for_pacman(me));
@@ -746,9 +1188,9 @@ mod tests {
         let long = "a-very-long-name-".repeat(10);
         tree.add(ROOT, vec![entry(&long, 2048, Kind::File)]);
         tree.finish();
-        let mut screen = Screen::with_tree(tree, "/home/me");
+        let mut screen = screen_of(tree, "/home/me");
         let rows = render(&mut screen, 50, 6);
-        assert!(rows[2].contains("a-very-long-n…"), "{rows:#?}");
+        assert!(rows[2].contains("a-very-lo…"), "{rows:#?}");
         assert!(
             rows[2]
                 .trim_end_matches('│')
@@ -765,14 +1207,14 @@ mod tests {
             .collect();
         tree.add(ROOT, entries);
         tree.finish();
-        let mut screen = Screen::with_tree(tree, "/home/me");
+        let mut screen = screen_of(tree, "/home/me");
         render(&mut screen, 50, 12);
         press(&mut screen, KeyCode::PageDown);
-        assert_eq!(rows(&screen).1, "file008");
+        assert_eq!(rows(&screen).1, "file007");
         press(&mut screen, KeyCode::Char('G'));
         let rows = render(&mut screen, 50, 12);
         assert!(
-            rows[9].contains("> ") && rows[9].contains("file099"),
+            rows[8].contains("> ") && rows[8].contains("file099"),
             "{rows:#?}"
         );
         press(&mut screen, KeyCode::PageUp);
@@ -787,6 +1229,7 @@ mod tests {
         progress.found.store(1_234_567, Ordering::Relaxed);
         progress.bytes.store(2048, Ordering::Relaxed);
         let mut screen = Screen {
+            config: Config::default(),
             state: State::Scanning {
                 receiver,
                 progress,
@@ -811,5 +1254,239 @@ mod tests {
         assert_eq!(count(1000), "1,000");
         assert_eq!(bar(1, 1), "█".repeat(BAR));
         assert_eq!(bar(0, 0), " ".repeat(BAR));
+    }
+
+    /// A home folder holding `Videos/old.mkv`, `Videos/new.mkv`, `.ssh/id` and `notes`, and a
+    /// screen showing it, scanned from the home folder itself.
+    fn home_screen() -> (TestDir, Screen) {
+        let home = TestDir::new();
+        home.file("Videos/old.mkv", 30_000);
+        home.file("Videos/new.mkv", 20_000);
+        home.file(".ssh/id", 100);
+        home.file("notes", 10);
+        let tree = scan::scan(home.path(), &MountTable::default(), &Progress::default());
+        let picker = Picker::load(home.path(), &Config::default());
+        let view = View::new(tree, home.path().into(), picker);
+        (home, Screen::with_view(view))
+    }
+
+    /// Moves the cursor to the row named `name`.
+    fn go_to(screen: &mut Screen, name: &str) {
+        press(screen, KeyCode::Home);
+        while rows(screen).1 != name {
+            assert!(press(screen, KeyCode::Down));
+            assert!(rows(screen).0.iter().any(|row| row == name), "no {name}");
+        }
+    }
+
+    fn selected(screen: &Screen) -> Vec<String> {
+        let view = view(screen);
+        view.selected.iter().map(|&id| view.label(id)).collect()
+    }
+
+    fn flash(screen: &Screen) -> String {
+        view(screen).flash.clone().unwrap_or_default()
+    }
+
+    #[test]
+    fn selects_in_the_home_folder_but_never_sealed_paths() {
+        let (_home, mut screen) = home_screen();
+        go_to(&mut screen, "notes");
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(selected(&screen), ["~/notes"]);
+        go_to(&mut screen, ".ssh");
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(
+            flash(&screen),
+            "~/.ssh is a sealed path: vole won't move it to the trash."
+        );
+        assert_eq!(selected(&screen), ["~/notes"]);
+        // The next key clears the message.
+        press(&mut screen, KeyCode::Char('k'));
+        assert_eq!(flash(&screen), "");
+        go_to(&mut screen, "notes");
+        press(&mut screen, KeyCode::Char(' '));
+        assert!(selected(&screen).is_empty());
+    }
+
+    #[test]
+    fn a_folder_takes_what_is_in_it_along() {
+        let (_home, mut screen) = home_screen();
+        go_to(&mut screen, "Videos");
+        press(&mut screen, KeyCode::Char('l'));
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(selected(&screen), ["~/Videos/old.mkv"]);
+        press(&mut screen, KeyCode::Char('h'));
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(selected(&screen), ["~/Videos"]);
+        press(&mut screen, KeyCode::Char('l'));
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(flash(&screen), "Selected already, with ~/Videos.");
+        press(&mut screen, KeyCode::Char('k'));
+        let rows = render(&mut screen, 70, 8).join("\n");
+        assert!(rows.contains("[x] new.mkv"), "{rows}");
+        assert!(rows.contains("Selected 1 Item"), "{rows}");
+    }
+
+    #[test]
+    fn nothing_outside_home_is_selected() {
+        let mut screen = screen();
+        press(&mut screen, KeyCode::Char(' '));
+        assert!(view(&screen).selected.is_empty());
+        assert!(flash(&screen).starts_with("Outside your home folder vole only shows"));
+        let rows = render(&mut screen, 60, 9);
+        assert!(!rows.join("").contains("[ ]"), "{rows:#?}");
+    }
+
+    #[test]
+    fn rows_in_home_have_boxes_and_sealed_ones_say_so() {
+        let (_home, mut screen) = home_screen();
+        let rows = render(&mut screen, 70, 9).join("\n");
+        assert!(rows.contains("[ ] Videos/"), "{rows}");
+        assert!(rows.contains("    .ssh/  sealed"), "{rows}");
+        go_to(&mut screen, ".ssh");
+        let rows = render(&mut screen, 90, 9).join("\n");
+        assert!(rows.contains("A Sealed Path, or holds one"), "{rows}");
+    }
+
+    #[test]
+    fn t_asks_before_moving_anything() {
+        let (_home, mut screen) = home_screen();
+        press(&mut screen, KeyCode::Char('t'));
+        assert!(flash(&screen).starts_with("Nothing selected"));
+        go_to(&mut screen, "Videos");
+        press(&mut screen, KeyCode::Char(' '));
+        press(&mut screen, KeyCode::Char('t'));
+        assert!(!screen.can_leave());
+        let rows = render(&mut screen, 100, 10).join("\n");
+        assert!(rows.contains("Move this Item ("), "{rows}");
+        assert!(rows.contains(") to the trash?"), "{rows}");
+        assert!(rows.contains("~/Videos"), "{rows}");
+        // Back keeps the selection.
+        assert!(press(&mut screen, KeyCode::Char('n')));
+        assert_eq!(selected(&screen), ["~/Videos"]);
+        press(&mut screen, KeyCode::Char('t'));
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(matches!(screen.state, State::Confirmed { .. }));
+        assert!(press(&mut screen, KeyCode::Char('q')) && !screen.can_leave());
+    }
+
+    #[test]
+    fn in_use_items_need_a_second_confirmation() {
+        let (_home, mut screen) = home_screen();
+        go_to(&mut screen, "notes");
+        press(&mut screen, KeyCode::Char(' '));
+        press(&mut screen, KeyCode::Char('t'));
+        if let State::Confirm { items, .. } = &mut screen.state {
+            items[0].1.in_use = true;
+        }
+        press(&mut screen, KeyCode::Char('y'));
+        let rows = render(&mut screen, 100, 10).join("\n");
+        assert!(rows.contains("1 of these Items are in use"), "{rows}");
+        // A second y (a double-tap, auto-repeat) doesn't pass the In Use step.
+        press(&mut screen, KeyCode::Char('y'));
+        assert!(matches!(screen.state, State::Confirm { in_use: true, .. }));
+        press(&mut screen, KeyCode::Char('Y'));
+        assert!(matches!(screen.state, State::Confirmed { .. }));
+    }
+
+    /// The screen as the thread moving `names` to the trash runs.
+    fn trashing(names: &[&str]) -> (TestDir, Screen, mpsc::Sender<Moving>) {
+        let (home, mut screen) = home_screen();
+        for name in names {
+            go_to(&mut screen, name);
+            press(&mut screen, KeyCode::Char(' '));
+        }
+        press(&mut screen, KeyCode::Char('t'));
+        let State::Confirm { view, items, .. } =
+            std::mem::replace(&mut screen.state, State::NotStarted)
+        else {
+            panic!("not confirming");
+        };
+        let (sender, receiver) = mpsc::channel();
+        screen.state = State::Trashing {
+            view,
+            items,
+            receiver,
+            stop: Arc::new(AtomicBool::new(false)),
+            now: String::new(),
+        };
+        (home, screen, sender)
+    }
+
+    fn outcome(label: &str, error: Option<&str>) -> Outcome {
+        Outcome {
+            label: label.into(),
+            size: 1,
+            error: error.map(String::from),
+            log_error: None,
+            moved: Some(MovedTo::Trash),
+        }
+    }
+
+    #[test]
+    fn shows_what_moves_and_stops_on_esc() {
+        let (_home, mut screen, sender) = trashing(&["notes"]);
+        sender
+            .send(Moving::Item("~/notes (1 of 1)".into()))
+            .unwrap();
+        screen.tick();
+        let rows = render(&mut screen, 60, 5).join("");
+        assert!(
+            rows.contains("Moving ~/notes (1 of 1) to the trash…"),
+            "{rows}"
+        );
+        assert_eq!(screen.hint(), "esc stop after this Item");
+        assert!(press(&mut screen, KeyCode::Esc));
+        assert!(!screen.can_leave());
+        assert!(
+            render(&mut screen, 60, 5)
+                .join("")
+                .contains("Stopping after ~/notes")
+        );
+    }
+
+    #[test]
+    fn what_went_leaves_the_list() {
+        let (_home, mut screen, sender) = trashing(&["Videos", "notes"]);
+        let (before, videos) = match &screen.state {
+            State::Trashing { view, items, .. } => {
+                (view.tree.size(ROOT), view.tree.size(items[0].0))
+            }
+            _ => panic!("not trashing"),
+        };
+        // Largest first: Videos, then notes, which failed.
+        sender
+            .send(Moving::Finished(vec![
+                outcome("~/Videos", None),
+                outcome("~/notes", Some("Permission denied")),
+            ]))
+            .unwrap();
+        screen.tick();
+        let rows = render(&mut screen, 70, 10).join("\n");
+        assert!(rows.contains("✓ ~/Videos → trash"), "{rows}");
+        assert!(rows.contains("✗ ~/notes"), "{rows}");
+        assert_eq!(screen.hint(), "↑↓ scroll · enter back to the list");
+        assert!(press(&mut screen, KeyCode::Enter));
+        let (names, _) = super::tests::rows(&screen);
+        assert!(!names.contains(&"Videos".to_string()), "{names:?}");
+        assert!(names.contains(&"notes".to_string()));
+        assert!(view(&screen).selected.is_empty());
+        assert_eq!(view(&screen).tree.size(ROOT), before - videos);
+    }
+
+    #[test]
+    fn the_folder_shown_goes_up_when_it_went() {
+        let (_home, mut screen, sender) = trashing(&["Videos"]);
+        if let State::Trashing { view, .. } = &mut screen.state {
+            let videos = view.current().unwrap();
+            view.open(videos, None);
+        }
+        sender
+            .send(Moving::Finished(vec![outcome("~/Videos", None)]))
+            .unwrap();
+        screen.tick();
+        press(&mut screen, KeyCode::Enter);
+        assert_eq!(view(&screen).dir, ROOT);
     }
 }

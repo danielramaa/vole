@@ -118,7 +118,8 @@ impl App {
                 self.restore = Some(orphans::RestoreScreen::new(&self.config));
             }
             Some(Module::Analyze) => {
-                self.analyze.get_or_insert_with(analyze::Screen::new);
+                self.analyze
+                    .get_or_insert_with(|| analyze::Screen::new(&self.config));
             }
             Some(Module::Status) | None => {}
         }

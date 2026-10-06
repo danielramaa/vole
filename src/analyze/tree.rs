@@ -56,12 +56,15 @@ struct Node {
     first_child: Id,
     children: u32,
     name_start: u32,
-    name_len: u32,
+    /// A name is at most 255 bytes on Linux.
+    name_len: u16,
     kind: Kind,
     unwalked: Option<Unwalked>,
     linked: bool,
     /// Something in it couldn't be read, so it uses at least `size`.
     incomplete: bool,
+    /// Moved away since the scan: not listed any more.
+    gone: bool,
 }
 
 pub struct Tree {
@@ -84,6 +87,7 @@ impl Tree {
             unwalked: None,
             linked: false,
             incomplete: false,
+            gone: false,
         };
         Self {
             root,
@@ -104,11 +108,12 @@ impl Tree {
                 first_child: 0,
                 children: 0,
                 name_start: Self::id(self.names.len()),
-                name_len: Self::id(bytes.len()),
+                name_len: u16::try_from(bytes.len()).expect("a name longer than Linux allows"),
                 kind: entry.kind,
                 unwalked: entry.unwalked,
                 linked: entry.linked,
                 incomplete: entry.unwalked == Some(Unwalked::Unreadable),
+                gone: false,
             });
             self.names.extend_from_slice(bytes);
         }
@@ -161,7 +166,7 @@ impl Tree {
     pub fn name(&self, id: Id) -> &OsStr {
         let node = &self.nodes[id as usize];
         let start = node.name_start as usize;
-        OsStr::from_bytes(&self.names[start..start + node.name_len as usize])
+        OsStr::from_bytes(&self.names[start..start + usize::from(node.name_len)])
     }
 
     pub fn path(&self, id: Id) -> PathBuf {
@@ -202,6 +207,34 @@ impl Tree {
         (id != ROOT).then(|| self.nodes[id as usize].parent)
     }
 
+    /// The folders holding `id`, from the nearest up to the root.
+    pub fn above(&self, id: Id) -> impl Iterator<Item = Id> + '_ {
+        std::iter::successors(self.parent(id), |&id| self.parent(id))
+    }
+
+    /// Takes `id` out of the tree, once it has been moved away: it isn't listed any more, and the
+    /// folders holding it lose its size.
+    pub fn remove(&mut self, id: Id) {
+        let node = &mut self.nodes[id as usize];
+        if node.gone {
+            return;
+        }
+        node.gone = true;
+        let size = node.size;
+        let above: Vec<Id> = self.above(id).collect();
+        for folder in above {
+            let folder = &mut self.nodes[folder as usize];
+            folder.size = folder.size.saturating_sub(size);
+        }
+    }
+
+    /// Whether `id`, or a folder holding it, has been taken out of the tree.
+    pub fn is_gone(&self, id: Id) -> bool {
+        std::iter::once(id)
+            .chain(self.above(id))
+            .any(|id| self.nodes[id as usize].gone)
+    }
+
     /// Whether `id` is a folder whose insides are in the tree.
     pub fn can_open(&self, id: Id) -> bool {
         self.kind(id) == Kind::Dir && self.unwalked(id).is_none()
@@ -210,7 +243,9 @@ impl Tree {
     /// What is in the folder `id`, largest first, then by name.
     pub fn largest_first(&self, id: Id) -> Vec<Id> {
         let node = &self.nodes[id as usize];
-        let mut children: Vec<Id> = (node.first_child..node.first_child + node.children).collect();
+        let mut children: Vec<Id> = (node.first_child..node.first_child + node.children)
+            .filter(|&child| !self.nodes[child as usize].gone)
+            .collect();
         children.sort_by(|&a, &b| {
             self.size(b)
                 .cmp(&self.size(a))
@@ -287,6 +322,23 @@ mod tests {
             vec![entry("b", 1, Kind::File), entry("a", 1, Kind::File)],
         );
         assert_eq!(names(&tree, tree.largest_first(ROOT)), ["a", "b"]);
+    }
+
+    #[test]
+    fn what_was_moved_away_leaves_the_tree() {
+        let mut tree = tree();
+        let big = tree.largest_first(ROOT)[0];
+        let b = tree.largest_first(big)[0];
+        assert_eq!(tree.above(b).collect::<Vec<_>>(), [big, ROOT]);
+        tree.remove(b);
+        tree.remove(b);
+        assert_eq!(names(&tree, tree.largest_first(big)), ["a"]);
+        assert_eq!(tree.size(big), 104);
+        assert_eq!(tree.size(ROOT), 118);
+        tree.remove(big);
+        assert!(tree.is_gone(big) && tree.is_gone(big + 1) && !tree.is_gone(ROOT));
+        assert_eq!(names(&tree, tree.largest_first(ROOT)), ["small"]);
+        assert_eq!(tree.size(ROOT), 14);
     }
 
     #[test]

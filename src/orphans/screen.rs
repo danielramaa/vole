@@ -1239,7 +1239,7 @@ mod tests {
             size: 1,
             error: error.map(String::from),
             log_error: None,
-            moved: false,
+            moved: None,
         };
         let removed = [outcome("htop", None), outcome("failed", Some("no"))];
         let leftovers = left_behind(&plan, &removed);

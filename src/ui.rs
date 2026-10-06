@@ -7,7 +7,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Paragraph};
 
-use crate::log::Outcome;
+use crate::log::{MovedTo, Outcome};
 use crate::size;
 
 /// `spans` on the left, `right` at the right edge of `width`.
@@ -61,21 +61,25 @@ pub fn draw_outcomes(
 
 /// The lines of the result screen, `width` wide.
 pub fn outcome_lines(outcomes: &[Outcome], width: usize) -> Vec<Line<'static>> {
-    let done = |moved: bool| -> u64 {
+    let done = |moved: Option<MovedTo>| -> u64 {
         outcomes
             .iter()
             .filter(|o| o.error.is_none() && o.moved == moved)
             .map(|o| o.size)
             .sum()
     };
-    let (freed, moved) = (done(false), done(true));
+    let freed = done(None);
+    let (backup, trash) = (done(Some(MovedTo::Backup)), done(Some(MovedTo::Trash)));
     let failed = outcomes.iter().filter(|o| o.error.is_some()).count();
     let mut parts = Vec::new();
-    if freed > 0 || moved == 0 {
+    if freed > 0 || backup == 0 && trash == 0 {
         parts.push(format!("freed about {}", size::format(freed)));
     }
-    if moved > 0 {
-        parts.push(format!("moved {} into a Backup", size::format(moved)));
+    if backup > 0 {
+        parts.push(format!("moved {} into a Backup", size::format(backup)));
+    }
+    if trash > 0 {
+        parts.push(format!("moved {} to the trash", size::format(trash)));
     }
     if failed > 0 {
         parts.push(format!("{failed} failed"));
@@ -90,7 +94,11 @@ pub fn outcome_lines(outcomes: &[Outcome], width: usize) -> Vec<Line<'static>> {
     for outcome in outcomes {
         match &outcome.error {
             None => {
-                let to = if outcome.moved { " → Backup" } else { "" };
+                let to = match outcome.moved {
+                    Some(MovedTo::Backup) => " → Backup",
+                    Some(MovedTo::Trash) => " → trash",
+                    None => "",
+                };
                 lines.push(right_aligned(
                     vec![Span::raw(format!("  ✓ {}{to}", outcome.label))],
                     size::format(outcome.size),
@@ -113,7 +121,7 @@ pub fn outcome_lines(outcomes: &[Outcome], width: usize) -> Vec<Line<'static>> {
 mod tests {
     use super::*;
 
-    fn outcome(label: &str, size: u64, error: Option<&str>, moved: bool) -> Outcome {
+    fn outcome(label: &str, size: u64, error: Option<&str>, moved: Option<MovedTo>) -> Outcome {
         Outcome {
             label: label.into(),
             size,
@@ -141,19 +149,23 @@ mod tests {
 
     #[test]
     fn results_tell_freed_from_moved() {
+        let backup = Some(MovedTo::Backup);
         let text = render(&[
-            outcome("pkg", 2048, None, false),
-            outcome("~/.config/gone", 1024, None, true),
-            outcome("~/.config/stuck", 1, Some("refused"), true),
+            outcome("pkg", 2048, None, None),
+            outcome("~/.config/gone", 1024, None, backup),
+            outcome("~/.config/stuck", 1, Some("refused"), backup),
         ]);
         assert!(
             text.contains("Freed about 2.0 KiB · moved 1.0 KiB into a Backup · 1 failed"),
             "{text}"
         );
         assert!(text.contains("✓ ~/.config/gone → Backup"));
-        let text = render(&[outcome("~/.config/gone", 1024, None, true)]);
+        let text = render(&[outcome("~/.config/gone", 1024, None, backup)]);
         assert!(text.contains("Moved 1.0 KiB into a Backup"), "{text}");
         assert!(render(&[]).contains("Freed about 0 B"));
+        let text = render(&[outcome("~/a.iso", 2048, None, Some(MovedTo::Trash))]);
+        assert!(text.contains("Moved 2.0 KiB to the trash"), "{text}");
+        assert!(text.contains("✓ ~/a.iso → trash"));
     }
 
     #[test]

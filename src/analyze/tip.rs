@@ -61,7 +61,7 @@ const KNOWN: &[(&str, &str)] = &[
 /// The tip for `path`, outside the home folder `home`, when no command has to run for it.
 pub fn known(path: &Path, home: &Path) -> Option<&'static str> {
     if path == home {
-        return Some("Your home folder.");
+        return Some("Your home folder: open it to select what to move to the trash.");
     }
     if home.starts_with(path) {
         return Some("Your home folder is in here.");
@@ -158,7 +158,11 @@ mod tests {
     #[test]
     fn knows_the_home_folders() {
         assert_eq!(known_tip("/home"), Some("Your home folder is in here."));
-        assert_eq!(known_tip("/home/me"), Some("Your home folder."));
+        assert!(
+            known_tip("/home/me")
+                .unwrap()
+                .starts_with("Your home folder: open it")
+        );
         assert!(
             known_tip("/home/other/big")
                 .unwrap()

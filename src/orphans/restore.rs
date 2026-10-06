@@ -531,7 +531,7 @@ mod tests {
                 size: 1,
                 error: None,
                 log_error: None,
-                moved: false,
+                moved: None,
             }],
             notes: vec!["the list of /b could not be updated".into()],
             scroll: 0,

@@ -17,8 +17,28 @@ pub struct Outcome {
     pub error: Option<String>,
     /// Why the attempt is missing from the Operation Log, whatever its result.
     pub log_error: Option<String>,
-    /// Moved into a Backup rather than deleted: its space isn't freed yet.
-    pub moved: bool,
+    /// Where it went rather than being deleted; its space isn't freed yet.
+    pub moved: Option<MovedTo>,
+}
+
+/// Where an Item goes when it is moved rather than deleted.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MovedTo {
+    /// One of vole's Backups, which `restore` puts back from.
+    Backup,
+    /// The desktop trash, which the file manager puts back from.
+    Trash,
+}
+
+/// What vole tried to do with an Item.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Attempt {
+    /// Remove it, deleting it or moving it into a Backup.
+    Remove,
+    /// Put it back from a Backup.
+    Restore,
+    /// Move it to the desktop trash.
+    Trash,
 }
 
 /// The Operation Log, written to by one module.
@@ -46,6 +66,9 @@ struct Entry<'a> {
     /// Whether it was put back where it was; for an attempt to restore it.
     #[serde(skip_serializing_if = "Option::is_none")]
     restored: Option<bool>,
+    /// Whether it was moved to the desktop trash; for an Item picked by hand.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    trashed: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     error: Option<&'a str>,
 }
@@ -82,7 +105,7 @@ impl Log {
         target: &str,
         result: Result<(), String>,
     ) -> Outcome {
-        self.write_attempt(item, kind, size, target, None, false, result)
+        self.write_attempt(item, kind, size, target, None, Attempt::Remove, result)
     }
 
     /// Writes the attempt to move `item` from `target` into a Backup at `to` to the log, and
@@ -96,7 +119,7 @@ impl Log {
         to: &str,
         result: Result<(), String>,
     ) -> Outcome {
-        self.write_attempt(item, kind, size, target, Some(to), false, result)
+        self.write_attempt(item, kind, size, target, Some(to), Attempt::Remove, result)
     }
 
     /// Writes the attempt to put `item` back from `target`, in a Backup, to `to`, where it was.
@@ -109,7 +132,20 @@ impl Log {
         to: &str,
         result: Result<(), String>,
     ) -> Outcome {
-        self.write_attempt(item, kind, size, target, Some(to), true, result)
+        self.write_attempt(item, kind, size, target, Some(to), Attempt::Restore, result)
+    }
+
+    /// Writes the attempt to move `item`, at `target`, to the desktop trash to the log, and
+    /// turns it into an Outcome.
+    pub fn record_trashed(
+        &mut self,
+        item: &str,
+        kind: &'static str,
+        size: u64,
+        target: &str,
+        result: Result<(), String>,
+    ) -> Outcome {
+        self.write_attempt(item, kind, size, target, None, Attempt::Trash, result)
     }
 
     #[allow(clippy::too_many_arguments)]
@@ -120,7 +156,7 @@ impl Log {
         size: u64,
         target: &str,
         moved_to: Option<&str>,
-        restoring: bool,
+        attempt: Attempt,
         result: Result<(), String>,
     ) -> Outcome {
         let entry = Entry {
@@ -133,8 +169,9 @@ impl Log {
             moved_to: moved_to.filter(|_| result.is_ok()),
             kind,
             size,
-            removed: (!restoring).then_some(result.is_ok()),
-            restored: restoring.then_some(result.is_ok()),
+            removed: (attempt == Attempt::Remove).then_some(result.is_ok()),
+            restored: (attempt == Attempt::Restore).then_some(result.is_ok()),
+            trashed: (attempt == Attempt::Trash).then_some(result.is_ok()),
             error: result.as_ref().err().map(String::as_str),
         };
         let written = self.write(&entry);
@@ -145,7 +182,11 @@ impl Log {
             log_error: written
                 .err()
                 .map(|err| format!("not written to the operation log: {err}")),
-            moved: moved_to.is_some() && !restoring,
+            moved: match attempt {
+                Attempt::Remove => moved_to.map(|_| MovedTo::Backup),
+                Attempt::Restore => None,
+                Attempt::Trash => Some(MovedTo::Trash),
+            },
         }
     }
 
@@ -198,7 +239,7 @@ mod tests {
             "/b/.config/a",
             Ok(()),
         );
-        assert!(moved.moved && moved.error.is_none());
+        assert!(moved.moved == Some(MovedTo::Backup) && moved.error.is_none());
         let failed = log.record_moved(
             "~/.config/b",
             "orphaned config",
@@ -232,11 +273,30 @@ mod tests {
             "/h/.config/a",
             Ok(()),
         );
-        assert!(back.error.is_none() && !back.moved);
+        assert!(back.error.is_none() && back.moved.is_none());
         let line: serde_json::Value =
             serde_json::from_str(fs::read_to_string(&path).unwrap().trim()).unwrap();
         assert_eq!(line["restored"], true);
         assert!(line.get("removed").is_none());
         assert_eq!(line["moved_to"], "/h/.config/a");
+    }
+
+    #[test]
+    fn says_what_went_to_the_trash() {
+        let dir = TestDir::new();
+        let path = dir.path().join("log.jsonl");
+        let mut log = Log::open(&path, "analyze").unwrap();
+        let trashed = log.record_trashed("~/a.iso", "hand-picked", 1, "/h/a.iso", Ok(()));
+        assert_eq!(trashed.moved, Some(MovedTo::Trash));
+        log.record_trashed("~/b", "hand-picked", 1, "/h/b", Err("no".into()));
+        let lines: Vec<serde_json::Value> = fs::read_to_string(&path)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str(line).unwrap())
+            .collect();
+        assert_eq!(lines[0]["trashed"], true);
+        assert!(lines[0].get("removed").is_none());
+        assert_eq!(lines[1]["trashed"], false);
+        assert_eq!(lines[1]["module"], "analyze");
     }
 }

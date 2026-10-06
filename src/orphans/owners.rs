@@ -169,6 +169,10 @@ fn matches(pattern: &str, keys: &[String]) -> bool {
 /// names at least this long count, so `kio` doesn't claim `kiosk-browser`.
 const MIN_PREFIX: usize = 4;
 
+/// An owner's name may also start with a folder's whole name (`BurpSuiteCommunity` for
+/// `~/.BurpSuite`), when the folder's name is at least this long.
+const MIN_NAME_START: usize = 6;
+
 /// Names too common to tell an owner by.
 const GENERIC: &[&str] = &[
     "app", "com", "config", "data", "default", "dev", "github", "gitlab", "io", "lib", "local",
@@ -588,6 +592,14 @@ impl Owners {
         }
         for key in primary_keys(name) {
             add(self.first_words.get(&key));
+            // The start of a program's or package's name: .BurpSuite for BurpSuiteCommunity.
+            if key.len() >= MIN_NAME_START {
+                for (owner_key, owners) in &self.named {
+                    if owner_key.starts_with(key.as_str()) {
+                        add(Some(owners));
+                    }
+                }
+            }
         }
         // The whole name too, even when too common to go by alone: ~/.net.
         let mut keys = name_keys(name);
@@ -754,6 +766,18 @@ picom /etc/xdg/picom/
         });
         assert!(of(&owners, "org.kde.kdenlive").is_empty());
         assert_eq!(of(&owners, "org.kde.dolphin"), [package("dolphin")]);
+    }
+
+    #[test]
+    fn a_folder_may_be_the_start_of_its_owners_name() {
+        let installed = [info("burpsuitecommunity"), info("steamcmd")];
+        let owners = Owners::from_pacman(&installed, "", &HashSet::new());
+        assert_eq!(
+            owners.of(Path::new("/home/me/.BurpSuite"), ".BurpSuite"),
+            [package("burpsuitecommunity")]
+        );
+        // A short name says too little: steamcmd is not Steam.
+        assert!(of(&owners, "steam").is_empty());
     }
 
     #[test]

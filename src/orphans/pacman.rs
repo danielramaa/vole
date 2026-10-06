@@ -24,19 +24,19 @@ pub struct Info {
     /// The installed packages that list this one as an optional dependency.
     pub optional_for: Vec<String>,
     /// The package's config files; only `pacman -Qii` lists them.
-    pub backup: Vec<Backup>,
+    pub config_files: Vec<ConfigFile>,
 }
 
 /// A config file of a package (in its `backup` array). Removing the package with `-n` deletes
 /// it even when it was changed, instead of keeping a `.pacsave` copy.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct Backup {
+pub struct ConfigFile {
     pub path: String,
-    pub state: BackupState,
+    pub state: FileState,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum BackupState {
+pub enum FileState {
     Unmodified,
     /// Changed since it was installed.
     Modified,
@@ -72,8 +72,16 @@ pub fn installed() -> Result<Vec<Info>> {
     Ok(parse_info(&String::from_utf8_lossy(&output.stdout)))
 }
 
+/// Every file installed packages own, as `pacman -Ql` lists them: `<package> <path>` per line,
+/// folders ending with `/`.
+pub fn files() -> Result<String> {
+    let output = query(&["-Ql"])?;
+    check(&output)?;
+    Ok(String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
 /// The config files of the packages `names` (`pacman -Qii`).
-pub fn backup_files(names: &[&str]) -> Result<Vec<Info>> {
+pub fn config_files(names: &[&str]) -> Result<Vec<Info>> {
     let mut args = vec!["-Qii", "--"];
     args.extend_from_slice(names);
     let output = query(&args)?;
@@ -221,24 +229,24 @@ fn info(fields: &[(&str, Vec<&str>)]) -> Option<Info> {
         dependency: first("Install Reason") == "Installed as a dependency for another package",
         required_by: names("Required By"),
         optional_for: names("Optional For"),
-        backup: values("Backup Files")
+        config_files: values("Backup Files")
             .iter()
-            .filter_map(|line| backup(line))
+            .filter_map(|line| config_file(line))
             .collect(),
     })
 }
 
 /// Reads e.g. `/etc/pacman.conf [modified]`. A missing file is left out: nothing to remove.
-fn backup(line: &str) -> Option<Backup> {
+fn config_file(line: &str) -> Option<ConfigFile> {
     let (path, state) = line.rsplit_once(' ')?;
     let state = match state {
-        "[unmodified]" => BackupState::Unmodified,
-        "[modified]" => BackupState::Modified,
+        "[unmodified]" => FileState::Unmodified,
+        "[modified]" => FileState::Modified,
         "[missing]" => return None,
         // `[unreadable]`, or `[unknown]` for any other error.
-        _ => BackupState::Unreadable,
+        _ => FileState::Unreadable,
     };
-    Some(Backup {
+    Some(ConfigFile {
         path: path.trim_end().to_string(),
         state,
     })
@@ -307,19 +315,19 @@ Name            : zstd
 Backup Files    : None
 ";
         let infos = parse_info(qii);
-        let backup = |path: &str, state| Backup {
+        let file = |path: &str, state| ConfigFile {
             path: path.into(),
             state,
         };
         assert_eq!(
-            infos[0].backup,
+            infos[0].config_files,
             [
-                backup("/etc/pacman.conf", BackupState::Modified),
-                backup("/etc/makepkg.conf", BackupState::Unmodified),
-                backup("/etc/makepkg.conf.d/my conf.conf", BackupState::Unreadable),
+                file("/etc/pacman.conf", FileState::Modified),
+                file("/etc/makepkg.conf", FileState::Unmodified),
+                file("/etc/makepkg.conf.d/my conf.conf", FileState::Unreadable),
             ]
         );
-        assert!(infos[1].backup.is_empty());
+        assert!(infos[1].config_files.is_empty());
     }
 
     #[test]

@@ -7,7 +7,9 @@
 
 use std::collections::{HashMap, HashSet};
 
-use super::pacman::{Backup, Info};
+use super::backup::OldBackup;
+use super::configs::{OrphanedConfig, PackageOwned};
+use super::pacman::{ConfigFile, Info};
 
 /// An Orphaned Package: one Item of the Plan.
 #[derive(Debug, Clone)]
@@ -23,7 +25,7 @@ pub struct Package {
     /// removes it anyway once nothing depends on it.
     pub optional_for: Vec<String>,
     /// The config files that go with it: `-n` deletes even the changed ones.
-    pub backup: Vec<Backup>,
+    pub config_files: Vec<ConfigFile>,
     pub selected: bool,
     /// The packages of the Plan that depend on this one.
     required_by: Vec<usize>,
@@ -42,7 +44,7 @@ impl Package {
             nested: false,
             also_needs: Vec::new(),
             optional_for: Vec::new(),
-            backup: Vec::new(),
+            config_files: Vec::new(),
             selected: false,
             required_by: Vec::new(),
             depends: Vec::new(),
@@ -56,6 +58,16 @@ impl Package {
 #[derive(Debug, Clone, Default)]
 pub struct Plan {
     pub packages: Vec<Package>,
+    /// The Orphaned Configs, High Confidence first.
+    pub configs: Vec<OrphanedConfig>,
+    /// Shown next to the configs, e.g. how many paths the safety rules left out.
+    pub configs_note: Option<String>,
+    /// Why the configs couldn't be looked for, e.g. a mistake in the Known Owners file.
+    pub configs_error: Option<String>,
+    /// The Backups old enough to delete, oldest first.
+    pub backups: Vec<OldBackup>,
+    /// The configs only packages own, which removing them leaves behind.
+    pub package_owned: Vec<PackageOwned>,
 }
 
 impl Plan {
@@ -63,23 +75,74 @@ impl Plan {
     /// installed package, says about them.
     pub fn build(installed: &[Info], orphans: &[String]) -> Self {
         let system = System::new(installed);
-        system.plan(&system.chain(orphans))
+        Self {
+            packages: system.plan(&system.chain(orphans)),
+            ..Self::default()
+        }
     }
 
     pub fn size(&self) -> u64 {
+        let configs: u64 = self.configs.iter().map(|config| config.size).sum();
+        let backups: u64 = self.backups.iter().map(|backup| backup.size).sum();
+        self.packages_size() + configs + backups
+    }
+
+    pub fn packages_size(&self) -> u64 {
         self.packages.iter().map(|package| package.size).sum()
     }
 
     pub fn selected_size(&self) -> u64 {
-        self.selected().map(|package| package.size).sum()
+        let packages: u64 = self.selected_packages().map(|package| package.size).sum();
+        let configs: u64 = self.selected_configs().map(|config| config.size).sum();
+        let backups: u64 = self.selected_backups().map(|backup| backup.size).sum();
+        packages + configs + backups
     }
 
-    pub fn selected(&self) -> impl Iterator<Item = &Package> {
+    pub fn selected_packages(&self) -> impl Iterator<Item = &Package> {
         self.packages.iter().filter(|package| package.selected)
     }
 
+    pub fn selected_configs(&self) -> impl Iterator<Item = &OrphanedConfig> {
+        self.configs.iter().filter(|config| config.selected)
+    }
+
+    pub fn selected_backups(&self) -> impl Iterator<Item = &OldBackup> {
+        self.backups.iter().filter(|backup| backup.selected)
+    }
+
+    /// Whether anything is selected.
+    pub fn any_selected(&self) -> bool {
+        self.selected_packages().next().is_some()
+            || self.selected_configs().next().is_some()
+            || self.selected_backups().next().is_some()
+    }
+
+    pub fn toggle_backup(&mut self, index: usize) {
+        self.backups[index].selected = !self.backups[index].selected;
+    }
+
+    /// Selects every old Backup, or deselects them all when they already are.
+    pub fn toggle_all_backups(&mut self) {
+        let select = !self.backups.iter().all(|backup| backup.selected);
+        for backup in &mut self.backups {
+            backup.selected = select;
+        }
+    }
+
+    pub fn toggle_config(&mut self, index: usize) {
+        self.configs[index].selected = !self.configs[index].selected;
+    }
+
+    /// Selects every config, or deselects them all when they already are.
+    pub fn toggle_all_configs(&mut self) {
+        let select = !self.configs.iter().all(|config| config.selected);
+        for config in &mut self.configs {
+            config.selected = select;
+        }
+    }
+
     /// Selects or deselects a package, together with the packages that go or stay with it.
-    pub fn toggle(&mut self, index: usize) {
+    pub fn toggle_package(&mut self, index: usize) {
         if self.packages[index].selected {
             self.deselect(index);
         } else {
@@ -88,7 +151,7 @@ impl Plan {
     }
 
     /// Selects every package, or deselects them all when they already are.
-    pub fn toggle_all(&mut self) {
+    pub fn toggle_all_packages(&mut self) {
         let select = !self.packages.iter().all(|package| package.selected);
         for package in &mut self.packages {
             package.selected = select;
@@ -318,7 +381,7 @@ impl<'a> System<'a> {
 
     /// The packages of `chain` that need nothing else removed first, by name, each followed by
     /// the packages that wait for it. A package that waits for several comes after the first.
-    fn plan(&self, chain: &[bool]) -> Plan {
+    fn plan(&self, chain: &[bool]) -> Vec<Package> {
         let name = |p: usize| self.infos[p].name.as_str();
         let mut members: Vec<usize> = (0..chain.len()).filter(|&p| chain[p]).collect();
         members.sort_by_key(|&p| name(p));
@@ -352,7 +415,7 @@ impl<'a> System<'a> {
         let position: HashMap<usize, usize> =
             order.iter().enumerate().map(|(i, &p)| (p, i)).collect();
         let positions = |ids: &[usize]| ids.iter().map(|q| position[q]).collect();
-        let packages = order
+        order
             .iter()
             .map(|&p| Package {
                 nested: !leads(p),
@@ -378,8 +441,7 @@ impl<'a> System<'a> {
                 needs: positions(self.needs(p)),
                 ..Package::new(name(p), self.infos[p].size)
             })
-            .collect();
-        Plan { packages }
+            .collect()
     }
 }
 
@@ -435,7 +497,7 @@ mod tests {
 
     fn toggle(plan: &mut Plan, name: &str) {
         let index = index(plan, name);
-        plan.toggle(index);
+        plan.toggle_package(index);
     }
 
     #[test]
@@ -557,9 +619,9 @@ mod tests {
         let installed = system(&[("a", &["b"]), ("b", &[]), ("c", &[])]);
         let mut plan = Plan::build(&installed, &orphans(&["a", "c"]));
         toggle(&mut plan, "c");
-        plan.toggle_all();
+        plan.toggle_all_packages();
         assert_eq!(plan.selected_size(), 3);
-        plan.toggle_all();
+        plan.toggle_all_packages();
         assert_eq!(plan.selected_size(), 0);
     }
 }

@@ -1,6 +1,5 @@
 //! `clean`: caches, pacman cache, journal and trash.
 
-mod in_use;
 pub mod plan;
 mod remove;
 mod root;
@@ -13,6 +12,8 @@ use std::thread;
 use anyhow::{Context, Result};
 
 use crate::config::Config;
+use crate::disk;
+use crate::in_use;
 use crate::safety::Rules;
 use plan::{Item, Plan};
 pub use screen::Screen;
@@ -27,7 +28,7 @@ pub fn build_plan(home: &Path, config: &Config) -> Result<Plan> {
         let journal = scope.spawn(|| root::journal(config.journal_max_mb));
         let open = scope.spawn(in_use::open_paths);
         // Measuring only: without the mount points, the walk still stops at other filesystems.
-        let mounts = scan::Mounts::load().unwrap_or_default();
+        let mounts = disk::Mounts::load().unwrap_or_default();
         let found = scan::home_categories(home, &rules, &mounts);
         let join = "a measuring thread panicked";
         (

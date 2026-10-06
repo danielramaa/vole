@@ -55,7 +55,7 @@ _Avoid_: History, audit trail
 ### Ownership
 
 **Owner**:
-Something installed that accounts for a config or data folder: a pacman package, a Flatpak, a user-installed binary, or an entry in the Known Owners map.
+Something installed that accounts for a config or data folder: a pacman package, a Flatpak, an AppImage, a user-installed binary or desktop entry, or an entry in the Known Owners map.
 _Avoid_: Parent, source app
 
 **Known Owners**:
@@ -65,11 +65,11 @@ _Avoid_: Manual mappings, overrides
 ### Safety
 
 **Protected List**:
-Paths no module will ever propose as Items; ships with defaults (browser profiles, project folders) and the user can extend it. The user can still hand-pick them in the disk explorer.
+Paths no module will ever propose as Items; ships with defaults (browser and mail profiles, project folders) and the user can extend it. The user can still hand-pick them in the disk explorer.
 _Avoid_: Whitelist, allowlist, exclusions
 
 **Sealed Paths**:
-Paths vole never removes by any means, including hand-picking: secrets and keys such as SSH, GPG, password stores and keyrings. Takes precedence over every other rule.
+Paths vole never removes by any means, including hand-picking: secrets and keys such as SSH, GPG, password stores, keyrings, credentials and wallets. Takes precedence over every other rule.
 _Avoid_: Protected (for this meaning), locked
 
 **Allowed Roots**:

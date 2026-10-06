@@ -22,6 +22,8 @@ pub enum Module {
     Clean,
     /// Orphaned packages and configs
     Orphans,
+    /// Put removed configs back from a Backup
+    Restore,
     /// Interactive disk explorer
     Analyze,
     /// Real-time system dashboard
@@ -75,6 +77,8 @@ pub struct App {
     clean: Option<clean::Screen>,
     /// The `orphans` screen once `orphans` has been opened, kept like `clean`'s.
     orphans: Option<orphans::Screen>,
+    /// The `restore` screen while `restore` is open; it lists the Backups again each time.
+    restore: Option<orphans::RestoreScreen>,
     quit: bool,
 }
 
@@ -87,6 +91,7 @@ impl App {
             config,
             clean: None,
             orphans: None,
+            restore: None,
             quit: false,
         };
         app.open(module);
@@ -102,7 +107,12 @@ impl App {
                     .get_or_insert_with(|| clean::Screen::new(&self.config));
             }
             Some(Module::Orphans) => {
-                self.orphans.get_or_insert_with(orphans::Screen::new);
+                self.orphans
+                    .get_or_insert_with(|| orphans::Screen::new(&self.config));
+            }
+            // Backups change as orphans moves configs: listed afresh each time.
+            Some(Module::Restore) => {
+                self.restore = Some(orphans::RestoreScreen::new(&self.config));
             }
             Some(Module::Analyze | Module::Status) | None => {}
         }
@@ -113,6 +123,7 @@ impl App {
         match module {
             Module::Clean => self.clean.as_mut().map(|s| s as &mut dyn ModuleScreen),
             Module::Orphans => self.orphans.as_mut().map(|s| s as &mut dyn ModuleScreen),
+            Module::Restore => self.restore.as_mut().map(|s| s as &mut dyn ModuleScreen),
             Module::Analyze | Module::Status => None,
         }
     }
@@ -313,6 +324,7 @@ mod tests {
         let mut app = App::new(Some(Module::Orphans), Config::default());
         app.orphans = Some(orphans::Screen::with_plan(orphans::plan::Plan {
             packages: vec![package],
+            ..Default::default()
         }));
         assert!(footer(&mut app).contains("q quit"));
         press(&mut app, KeyCode::Enter);
@@ -330,6 +342,7 @@ mod tests {
         let mut app = App::new(Some(Module::Orphans), Config::default());
         app.orphans = Some(orphans::Screen::with_plan(orphans::plan::Plan {
             packages: vec![package],
+            ..Default::default()
         }));
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Char('y'));
@@ -338,6 +351,28 @@ mod tests {
             assert!(!app.quit, "{code:?}");
         }
         assert!(!footer(&mut app).contains("q quit"));
+    }
+
+    #[test]
+    fn reopening_restore_lists_the_backups_again() {
+        let mut app = App::new(None, Config::default());
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.module, Some(Module::Restore));
+        app.restore = Some(orphans::RestoreScreen::with_backups(Vec::new()));
+        assert!(
+            app.restore
+                .as_ref()
+                .is_some_and(orphans::RestoreScreen::has_list)
+        );
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            !app.restore
+                .as_ref()
+                .is_some_and(orphans::RestoreScreen::has_list)
+        );
     }
 
     #[test]

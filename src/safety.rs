@@ -3,9 +3,11 @@
 use std::fmt;
 use std::fs;
 use std::io;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
-/// Secrets and keys vole never removes by any means (relative to the home directory).
+/// Secrets and keys vole never removes by any means (relative to the home directory): keys,
+/// password stores and keyrings, credentials, and wallets.
 const SEALED: &[&str] = &[
     ".ssh",
     ".gnupg",
@@ -13,12 +15,29 @@ const SEALED: &[&str] = &[
     ".pki",
     ".local/share/keyrings",
     ".local/share/kwalletd",
+    ".netrc",
+    ".git-credentials",
+    ".pgpass",
+    ".my.cnf",
+    ".pypirc",
+    ".vault-token",
+    ".aws",
+    ".azure",
+    ".config/gcloud",
+    ".kube",
+    ".docker/config.json",
+    ".terraform.d",
+    ".bitcoin",
+    ".electrum",
+    ".ethereum",
+    ".monero",
 ];
 
-/// Paths no module proposes on its own (relative to the home directory): browser profiles and
-/// project folders. The user extends this with `protected_paths` in the config.
+/// Paths no module proposes on its own (relative to the home directory): browser and mail
+/// profiles, and project folders. The user extends this with `protected_paths` in the config.
 const PROTECTED: &[&str] = &[
     ".mozilla",
+    ".thunderbird",
     ".librewolf",
     ".config/google-chrome",
     ".config/chromium",
@@ -64,6 +83,8 @@ pub struct Rules {
     /// The home directory with every symlink resolved.
     real_home: PathBuf,
     allowed_roots: Vec<PathBuf>,
+    /// Whether the dotfiles directly in the home directory count as inside the Allowed Roots.
+    loose_dotfiles: bool,
     /// Each rule path both as written and as resolved on disk, so a symlink can't hide it.
     protected: Vec<PathBuf>,
     sealed: Vec<PathBuf>,
@@ -85,12 +106,20 @@ impl Rules {
             home: home.to_path_buf(),
             real_home,
             allowed_roots: in_home(allowed_roots),
+            loose_dotfiles: false,
             protected: Vec::new(),
             sealed: Vec::new(),
         };
         rules.protected = rules.with_resolved(protected);
         rules.sealed = rules.with_resolved(in_home(SEALED));
         Ok(rules)
+    }
+
+    /// Also allows the dotfiles and dotfolders directly in the home directory (`~/.foorc`), as
+    /// if each were an Allowed Root. The other rules still apply: `~/.ssh` stays sealed.
+    pub fn with_loose_dotfiles(mut self) -> Self {
+        self.loose_dotfiles = true;
+        self
     }
 
     fn with_resolved(&self, paths: Vec<PathBuf>) -> Vec<PathBuf> {
@@ -109,6 +138,16 @@ impl Rules {
     /// returns where it really is (see [`Rules::resolve`]). `path` itself may be a symlink:
     /// removing it only removes the link.
     pub fn check(&self, path: &Path) -> Result<PathBuf, Refusal> {
+        self.check_with(path, true)
+    }
+
+    /// Checks that something vole removed may be put back at `path`: like [`Rules::check`], but
+    /// the Protected List, which only keeps things from being proposed, doesn't stop it.
+    pub fn check_put_back(&self, path: &Path) -> Result<PathBuf, Refusal> {
+        self.check_with(path, false)
+    }
+
+    fn check_with(&self, path: &Path, protected: bool) -> Result<PathBuf, Refusal> {
         if !path.is_absolute()
             || path
                 .components()
@@ -119,17 +158,22 @@ impl Rules {
         if overlaps(path, &self.sealed) {
             return Err(Refusal::Sealed);
         }
-        if !self.allowed_roots.iter().any(|root| path.starts_with(root)) {
+        let loose_dotfile = self.loose_dotfiles
+            && path.parent() == Some(self.home.as_path())
+            && path
+                .file_name()
+                .is_some_and(|name| name.as_bytes().starts_with(b"."));
+        if !(loose_dotfile || self.allowed_roots.iter().any(|root| path.starts_with(root))) {
             return Err(Refusal::OutsideAllowedRoots);
         }
-        if overlaps(path, &self.protected) {
+        if protected && overlaps(path, &self.protected) {
             return Err(Refusal::Protected);
         }
         let real = self.resolve(path).ok_or(Refusal::Symlinked)?;
         if overlaps(&real, &self.sealed) {
             return Err(Refusal::Sealed);
         }
-        if overlaps(&real, &self.protected) {
+        if protected && overlaps(&real, &self.protected) {
             return Err(Refusal::Protected);
         }
         Ok(real)
@@ -210,6 +254,56 @@ mod tests {
     }
 
     #[test]
+    fn may_allow_dotfiles_directly_in_home() {
+        let home = TestDir::new();
+        let rules = rules(&home, &[]).with_loose_dotfiles();
+        let dotfile = home.file(".foorc", 1);
+        assert_eq!(rules.check(&dotfile), Ok(dotfile));
+        let dotfolder = home.dir(".foo");
+        assert_eq!(rules.check(&dotfolder), Ok(dotfolder.clone()));
+        // Only directly in home, and the other rules still apply.
+        assert_eq!(
+            rules.check(&home.file(".foo/bar", 1)),
+            Err(Refusal::OutsideAllowedRoots)
+        );
+        assert_eq!(
+            rules.check(&home.dir("Documents")),
+            Err(Refusal::OutsideAllowedRoots)
+        );
+        assert_eq!(rules.check(&home.dir(".ssh")), Err(Refusal::Sealed));
+        assert_eq!(
+            rules.check(&home.path().join(".local")),
+            Err(Refusal::Sealed)
+        );
+        // Without it, a dotfile is outside the roots.
+        assert_eq!(
+            Rules::new(home.path(), &[".cache"], &[])
+                .unwrap()
+                .check(&home.path().join(".foorc")),
+            Err(Refusal::OutsideAllowedRoots)
+        );
+    }
+
+    #[test]
+    fn credentials_and_wallets_are_sealed() {
+        let home = TestDir::new();
+        let rules = rules(&home, &[]).with_loose_dotfiles();
+        for path in [".pgpass", ".aws", ".bitcoin", ".netrc"] {
+            assert_eq!(
+                rules.check(&home.path().join(path)),
+                Err(Refusal::Sealed),
+                "{path}"
+            );
+        }
+        // A folder holding credentials goes with them.
+        home.file(".docker/config.json", 1);
+        assert_eq!(
+            rules.check(&home.path().join(".docker")),
+            Err(Refusal::Sealed)
+        );
+    }
+
+    #[test]
     fn refuses_sealed_paths_and_what_contains_them() {
         let home = TestDir::new();
         let keyrings = home.dir(".local/share/keyrings");
@@ -237,6 +331,20 @@ mod tests {
         );
         let other = home.dir(".cache/other");
         assert_eq!(rules.check(&other), Ok(other));
+    }
+
+    #[test]
+    fn putting_back_ignores_only_the_protected_list() {
+        let home = TestDir::new();
+        let kept = home.path().join(".cache/keep");
+        let rules = rules(&home, std::slice::from_ref(&kept));
+        home.dir(".cache");
+        assert_eq!(rules.check(&kept), Err(Refusal::Protected));
+        assert_eq!(rules.check_put_back(&kept), Ok(kept));
+        assert_eq!(
+            rules.check_put_back(&home.dir(".local/share/keyrings")),
+            Err(Refusal::Sealed)
+        );
     }
 
     #[test]

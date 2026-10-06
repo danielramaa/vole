@@ -422,7 +422,7 @@ impl ModuleScreen for Screen {
                 } else {
                     format!("Moving {now} to the trash…")
                 };
-                frame.render_widget(Paragraph::new(printable(&text)).block(block), area)
+                frame.render_widget(Paragraph::new(text).block(block), area)
             }
             State::Done {
                 outcomes, scroll, ..
@@ -467,7 +467,7 @@ fn draw_confirm(
     }
     lines.push(Line::default());
     for (_, item) in items {
-        let mut spans = vec![Span::raw(format!("  {}", printable(&item.label)))];
+        let mut spans = vec![Span::raw(format!("  {}", item.label))];
         if item.in_use {
             spans.push(Span::styled("  in use", bold));
         }
@@ -649,7 +649,8 @@ impl View {
             .map(|&id| {
                 let item = Picked {
                     path: self.tree.path(id),
-                    label: self.label(id),
+                    // Shown on the screens, where control characters would break the lines.
+                    label: printable(&self.label(id)),
                     size: self.tree.size(id),
                     in_use: false,
                 };
@@ -1407,6 +1408,22 @@ mod tests {
         press(&mut screen, KeyCode::Char('~'));
         let rows = render(&mut screen, 70, 8).join("\n");
         assert!(rows.contains(".ssh/  sealed"), "{rows}");
+    }
+
+    #[test]
+    fn labels_show_odd_names_on_one_line() {
+        let home = TestDir::new();
+        home.file("a\nb", 10);
+        let tree = scan::scan(
+            home.path(),
+            &MountTable::default(),
+            false,
+            &Progress::default(),
+        );
+        let picker = Picker::load(home.path(), &Config::default());
+        let mut screen = Screen::with_view(View::new(tree, home.path().into(), picker));
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(view(&screen).picked()[0].1.label, "~/a?b");
     }
 
     #[test]

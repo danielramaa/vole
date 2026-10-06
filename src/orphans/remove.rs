@@ -127,6 +127,10 @@ fn move_config(
     if home.join(BACKUPS).starts_with(path) {
         return refused("holds vole's Backups");
     }
+    // ~/.config/vole, ~/.local/state/vole (the Operation Log), …
+    if path.file_name().is_some_and(|name| name == "vole") {
+        return refused("is vole's own");
+    }
     let real = rules
         .check(path)
         .map_err(|refusal| format!("refused: {} is {refusal}", path.display()))?;
@@ -382,6 +386,9 @@ mod tests {
             home.dir.dir(".ssh"),
             // Holds the Backups.
             home.dir.path().join(".local/share/vole"),
+            // vole's own.
+            home.dir.dir(".config/vole"),
+            home.dir.dir(".local/state/vole"),
             home.dir
                 .symlink(".config/linked", &home.dir.dir("elsewhere")),
             mounted.clone(),

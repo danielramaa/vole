@@ -48,7 +48,12 @@ impl Screen {
     }
 
     #[cfg(test)]
-    fn with_backups(backups: Vec<Backup>) -> Self {
+    pub fn has_list(&self) -> bool {
+        matches!(self.state, State::Ready(_))
+    }
+
+    #[cfg(test)]
+    pub fn with_backups(backups: Vec<Backup>) -> Self {
         Self {
             config: Config::default(),
             state: State::Ready(View::new(backups)),

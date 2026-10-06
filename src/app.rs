@@ -77,6 +77,7 @@ pub struct App {
     clean: Option<clean::Screen>,
     /// The `orphans` screen once `orphans` has been opened, kept like `clean`'s.
     orphans: Option<orphans::Screen>,
+    /// The `restore` screen while `restore` is open; it lists the Backups again each time.
     restore: Option<orphans::RestoreScreen>,
     quit: bool,
 }
@@ -109,9 +110,9 @@ impl App {
                 self.orphans
                     .get_or_insert_with(|| orphans::Screen::new(&self.config));
             }
+            // Backups change as orphans moves configs: listed afresh each time.
             Some(Module::Restore) => {
-                self.restore
-                    .get_or_insert_with(|| orphans::RestoreScreen::new(&self.config));
+                self.restore = Some(orphans::RestoreScreen::new(&self.config));
             }
             Some(Module::Analyze | Module::Status) | None => {}
         }
@@ -350,6 +351,28 @@ mod tests {
             assert!(!app.quit, "{code:?}");
         }
         assert!(!footer(&mut app).contains("q quit"));
+    }
+
+    #[test]
+    fn reopening_restore_lists_the_backups_again() {
+        let mut app = App::new(None, Config::default());
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Char('j'));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.module, Some(Module::Restore));
+        app.restore = Some(orphans::RestoreScreen::with_backups(Vec::new()));
+        assert!(
+            app.restore
+                .as_ref()
+                .is_some_and(orphans::RestoreScreen::has_list)
+        );
+        press(&mut app, KeyCode::Char('q'));
+        press(&mut app, KeyCode::Enter);
+        assert!(
+            !app.restore
+                .as_ref()
+                .is_some_and(orphans::RestoreScreen::has_list)
+        );
     }
 
     #[test]

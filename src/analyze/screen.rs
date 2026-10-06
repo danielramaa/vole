@@ -789,11 +789,13 @@ impl View {
     fn line(&self, id: Id, total: u64, width: usize) -> Line<'static> {
         let tree = &self.tree;
         let path = tree.path(id);
-        let sealed = self
-            .picker
-            .as_ref()
-            .is_ok_and(|picker| picker.is_sealed(&path));
-        let check = if self.is_outside_home(&path) || sealed {
+        let outside = self.is_outside_home(&path);
+        let sealed = !outside
+            && self
+                .picker
+                .as_ref()
+                .is_ok_and(|picker| picker.is_sealed(&path));
+        let check = if outside || sealed {
             "    "
         } else if self.is_selected(id) {
             "[x] "
@@ -1381,6 +1383,27 @@ mod tests {
         go_to(&mut screen, ".ssh");
         let rows = render(&mut screen, 90, 9).join("\n");
         assert!(rows.contains("A Sealed Path, or holds one"), "{rows}");
+    }
+
+    #[test]
+    fn only_rows_in_home_say_they_are_sealed() {
+        let outer = TestDir::new();
+        let home = outer.dir("home/me");
+        outer.file("home/me/.ssh/id", 100);
+        let tree = scan::scan(
+            outer.path(),
+            &MountTable::default(),
+            false,
+            &Progress::default(),
+        );
+        let picker = Picker::load(&home, &Config::default());
+        let mut screen = Screen::with_view(View::new(tree, home, picker));
+        // The folder holding the home folder holds ~/.ssh, but nothing outside home is picked.
+        let rows = render(&mut screen, 70, 8).join("\n");
+        assert!(rows.contains("home/") && !rows.contains("sealed"), "{rows}");
+        press(&mut screen, KeyCode::Char('~'));
+        let rows = render(&mut screen, 70, 8).join("\n");
+        assert!(rows.contains(".ssh/  sealed"), "{rows}");
     }
 
     #[test]

@@ -28,9 +28,9 @@ const THREADS: usize = 16;
 
 const POISONED: &str = "a scanning thread panicked";
 
-/// Walks everything under `root` into a [`Tree`], going into the mounts on the same disk only.
-/// The folders vole may not read are left out.
-pub fn scan(root: &Path, mounts: &MountTable, progress: &Progress) -> Tree {
+/// Walks everything under `root` into a [`Tree`], going into the mounts on the same disk, and on
+/// `other_disks` too when asked. The folders vole may not read are left out.
+pub fn scan(root: &Path, mounts: &MountTable, other_disks: bool, progress: &Progress) -> Tree {
     let meta = fs::symlink_metadata(root).ok();
     let walk = Walk {
         tree: Mutex::new(Tree::new(
@@ -41,12 +41,15 @@ pub fn scan(root: &Path, mounts: &MountTable, progress: &Progress) -> Tree {
             waiting: vec![Folder {
                 path: root.to_path_buf(),
                 id: ROOT,
+                through: false,
             }],
             reading: 0,
         }),
         wake: Condvar::new(),
         counted: Counted::default(),
         mounts,
+        other_disks,
+        scanned: mounts.scanned(other_disks),
         progress,
     };
     if let Some(meta) = &meta {
@@ -70,6 +73,10 @@ struct Walk<'a> {
     wake: Condvar,
     counted: Counted,
     mounts: &'a MountTable,
+    /// Whether the mounts of other disks are scanned too.
+    other_disks: bool,
+    /// The mount points scanned.
+    scanned: Vec<PathBuf>,
     progress: &'a Progress,
 }
 
@@ -84,6 +91,8 @@ struct Queue {
 struct Folder {
     path: PathBuf,
     id: Id,
+    /// Only passed through, on the way to scanned mounts inside it.
+    through: bool,
 }
 
 /// The folders found in one that was read, queued when dropped: even when reading it panicked,
@@ -135,7 +144,8 @@ impl Walk<'_> {
         }
     }
 
-    /// Reads one folder into the tree, and returns the folders in it, to read next.
+    /// Reads one folder into the tree, and returns the folders in it, to read next. Of a folder
+    /// only passed through, only the folders on the way to scanned mounts are kept.
     fn read(&self, folder: &Folder) -> Vec<Folder> {
         let Ok(listing) = fs::read_dir(&folder.path) else {
             self.tree.lock().expect(POISONED).mark_unreadable(folder.id);
@@ -160,12 +170,30 @@ impl Walk<'_> {
                 .is_ok_and(|kind| kind.is_dir())
                 .then(|| folder.path.join(&name));
             let mount = path.as_ref().and_then(|path| self.mounts.get(path));
-            if let Some(mount) = mount.filter(|&mount| mount != Mount::SameDisk) {
+            let walked = match mount {
+                Some(mount) => mount.is_scanned(self.other_disks),
+                None => !folder.through,
+            };
+            if !walked {
+                // Passed through when scanned mounts are inside, but never a network share.
+                let through = mount != Some(Mount::Network)
+                    && path
+                        .as_ref()
+                        .is_some_and(|path| self.leads_to_scanned(path));
+                let unwalked = match (path, mount) {
+                    (Some(path), _) if through => {
+                        folders.push((entries.len(), path, true));
+                        Unwalked::Through
+                    }
+                    (_, Some(mount)) if !folder.through => Unwalked::Mount(mount),
+                    // Passing through, only the way to scanned mounts is kept.
+                    _ => continue,
+                };
                 entries.push(Entry {
                     name,
                     size: 0,
                     kind: Kind::Dir,
-                    unwalked: Some(Unwalked::Mount(mount)),
+                    unwalked: Some(unwalked),
                     linked: false,
                 });
                 continue;
@@ -194,7 +222,7 @@ impl Walk<'_> {
             }
             if kind == Kind::Dir && unwalked.is_none() {
                 let path = path.unwrap_or_else(|| folder.path.join(&name));
-                folders.push((entries.len(), path));
+                folders.push((entries.len(), path, false));
             }
             bytes += size;
             entries.push(Entry {
@@ -216,11 +244,19 @@ impl Walk<'_> {
         self.progress.bytes.fetch_add(bytes, Ordering::Relaxed);
         folders
             .into_iter()
-            .map(|(index, path)| Folder {
+            .map(|(index, path, through)| Folder {
                 path,
                 id: first + index as Id,
+                through,
             })
             .collect()
+    }
+
+    /// Whether a scanned mount is inside `path`.
+    fn leads_to_scanned(&self, path: &Path) -> bool {
+        self.scanned
+            .iter()
+            .any(|mount| mount != path && mount.starts_with(path))
     }
 }
 
@@ -259,7 +295,7 @@ mod tests {
     use std::os::unix::fs::PermissionsExt;
 
     fn scan_dir(dir: &TestDir, mounts: &MountTable) -> Tree {
-        scan(dir.path(), mounts, &Progress::default())
+        scan(dir.path(), mounts, false, &Progress::default())
     }
 
     /// The id of `relative` in `tree`, found by name from the root.
@@ -282,7 +318,7 @@ mod tests {
         dir.file("a/b/two", 100_000);
         dir.file("three", 1);
         let progress = Progress::default();
-        let tree = scan(dir.path(), &MountTable::default(), &progress);
+        let tree = scan(dir.path(), &MountTable::default(), false, &progress);
         let usage = |path: &Path| disk::disk_usage(path, &Mounts::default());
         assert_eq!(tree.size(ROOT), usage(dir.path()));
         assert_eq!(tree.size(find(&tree, "a")), usage(&dir.path().join("a")));
@@ -331,6 +367,53 @@ mod tests {
         assert_eq!(tree.size(usb), 0);
         assert!(tree.largest_first(usb).is_empty());
         assert!(tree.size(ROOT) < 100_000);
+    }
+
+    #[test]
+    fn goes_into_other_disks_when_asked_even_through_run() {
+        let dir = TestDir::new();
+        let run = dir.dir("run");
+        dir.file("run/lock", 100);
+        dir.file("run/user/1000/bus", 100);
+        let usb = dir.dir("run/media/me/STICK");
+        dir.file("run/media/me/STICK/photo.jpg", 50_000);
+        let data = dir.dir("mnt/data");
+        dir.file("mnt/data/big", 100_000);
+        let nas = dir.dir("mnt/nas");
+        let mounts = MountTable::from_mounts([
+            (run, Mount::NotADisk),
+            (usb, Mount::UsbDisk),
+            (data, Mount::OtherDisk),
+            (nas, Mount::Network),
+        ]);
+        let tree = scan(dir.path(), &mounts, true, &Progress::default());
+        assert!(tree.size(find(&tree, "mnt/data/big")) > 0);
+        assert!(tree.size(find(&tree, "run/media/me/STICK/photo.jpg")) > 0);
+        // /run is only passed through: none of its own files are in the tree.
+        let run = find(&tree, "run");
+        assert_eq!(tree.unwalked(run), Some(Unwalked::Through));
+        assert!(tree.can_open(run));
+        let names: Vec<_> = tree
+            .largest_first(run)
+            .into_iter()
+            .map(|id| tree.name(id))
+            .collect();
+        assert_eq!(names, ["media"]);
+        assert_eq!(tree.size(run), tree.size(find(&tree, "run/media/me/STICK")));
+        assert_eq!(
+            tree.unwalked(find(&tree, "mnt/nas")),
+            Some(Unwalked::Mount(Mount::Network))
+        );
+        // Without other disks, /run is left out whole.
+        let tree = scan(dir.path(), &mounts, false, &Progress::default());
+        assert_eq!(
+            tree.unwalked(find(&tree, "run")),
+            Some(Unwalked::Mount(Mount::NotADisk))
+        );
+        assert_eq!(
+            tree.unwalked(find(&tree, "mnt/data")),
+            Some(Unwalked::Mount(Mount::OtherDisk))
+        );
     }
 
     #[test]

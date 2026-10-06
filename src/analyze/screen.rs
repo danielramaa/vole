@@ -37,6 +37,8 @@ const BAR: usize = 10;
 
 pub struct Screen {
     config: Config,
+    /// Whether the mounts of other disks are scanned too.
+    other_disks: bool,
     state: State,
 }
 
@@ -90,6 +92,7 @@ impl Screen {
     pub fn new(config: &Config) -> Self {
         Self {
             config: config.clone(),
+            other_disks: false,
             state: State::NotStarted,
         }
     }
@@ -98,6 +101,7 @@ impl Screen {
     fn with_view(view: View) -> Self {
         Self {
             config: Config::default(),
+            other_disks: false,
             state: State::Ready(view),
         }
     }
@@ -114,11 +118,12 @@ impl Screen {
         let counting = Arc::clone(&progress);
         let config = self.config.clone();
         let picking = home.clone();
+        let other_disks = self.other_disks;
         thread::spawn(move || {
             // Without the mount points, the walk would go into other disks and into /proc.
             let scanned = MountTable::load()
                 .map(|mounts| {
-                    let tree = scan::scan(Path::new(SCANNED), &mounts, &counting);
+                    let tree = scan::scan(Path::new(SCANNED), &mounts, other_disks, &counting);
                     (tree, Picker::load(&picking, &config))
                 })
                 .map_err(|err| {
@@ -260,6 +265,12 @@ impl ModuleScreen for Screen {
         }
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
+            // Scanning again, with or without the other disks.
+            State::Ready(_) if key.code == KeyCode::Char('o') => {
+                self.other_disks = !self.other_disks;
+                (State::NotStarted, true)
+            }
+            State::Ready(_) if key.code == KeyCode::Char('r') => (State::NotStarted, true),
             State::Ready(mut view) if key.code == KeyCode::Char('t') => {
                 let mut items = view.picked();
                 if items.is_empty() {
@@ -343,7 +354,7 @@ impl ModuleScreen for Screen {
 
     fn hint(&self) -> &'static str {
         match self.state {
-            State::Ready(_) => "↑↓/jk move · l open · h up · space select · t trash…",
+            State::Ready(_) => "↑↓/jk move · l/h in/out · space select · t trash… · o other disks",
             State::Confirm { in_use: false, .. } => "↑↓ scroll · y move to the trash · n back",
             State::Confirm { in_use: true, .. } => "↑↓ scroll · Y move anyway · n back",
             State::Trashing { .. } => "esc stop after this Item",
@@ -374,7 +385,12 @@ impl ModuleScreen for Screen {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let block = Block::bordered().title(" analyze ");
+        let title = if self.other_disks {
+            " analyze, other disks too "
+        } else {
+            " analyze "
+        };
+        let block = Block::bordered().title(title);
         match &mut self.state {
             State::NotStarted => {
                 frame.render_widget(Paragraph::new("Scanning…").block(block), area)
@@ -542,7 +558,7 @@ impl View {
         !self.tips.contains_key(&id)
             && !matches!(
                 self.tree.unwalked(id),
-                Some(Unwalked::Mount(_) | Unwalked::Elsewhere)
+                Some(Unwalked::Mount(_) | Unwalked::Elsewhere | Unwalked::Through)
             )
             && self.is_outside_home(&path)
             && tip::known(&path, &self.home).is_none()
@@ -692,6 +708,12 @@ impl View {
                 }
                 return true;
             }
+            KeyCode::Char('~') => {
+                if let Some(home) = self.tree.find(&self.home) {
+                    self.open(home, None);
+                }
+                return true;
+            }
             _ => return false,
         };
         self.cursor = to.min(last);
@@ -828,6 +850,7 @@ impl View {
                 Mount::NotADisk => "not on a disk",
             }),
             Some(Unwalked::Elsewhere) => Some("counted elsewhere"),
+            Some(Unwalked::Through) => Some("not on a disk"),
             Some(Unwalked::Unreadable) => Some("can't read"),
             None if self.tree.linked(id) => Some("hard link"),
             None if self.tree.kind(id) == Kind::Symlink => Some("symlink"),
@@ -840,8 +863,10 @@ impl View {
     fn note(&self, id: Id) -> Option<&str> {
         let path = self.tree.path(id);
         let unwalked = self.tree.unwalked(id);
-        if !matches!(unwalked, Some(Unwalked::Mount(_) | Unwalked::Elsewhere))
-            && self.is_outside_home(&path)
+        if !matches!(
+            unwalked,
+            Some(Unwalked::Mount(_) | Unwalked::Elsewhere | Unwalked::Through)
+        ) && self.is_outside_home(&path)
         {
             return Some(match tip::known(&path, &self.home) {
                 Some(tip) => tip,
@@ -855,8 +880,8 @@ impl View {
             Some(Unwalked::Mount(mount)) => {
                 return Some(match mount {
                     Mount::SameDisk => "A mount point.",
-                    Mount::OtherDisk => "Another disk is mounted here; it isn't scanned.",
-                    Mount::UsbDisk => "A USB disk is mounted here; it isn't scanned.",
+                    Mount::OtherDisk => "Another disk is mounted here; o scans other disks too.",
+                    Mount::UsbDisk => "A USB disk is mounted here; o scans other disks too.",
                     Mount::Network => {
                         "A network share is mounted here; vole doesn't look into network shares."
                     }
@@ -870,6 +895,9 @@ impl View {
                 return Some(
                     "The same folder as one at another path (a bind mount), where it is counted.",
                 );
+            }
+            Some(Unwalked::Through) => {
+                return Some("Not on a disk: only the disks mounted in it are shown.");
             }
             Some(Unwalked::Unreadable) | None => {}
         }
@@ -1230,6 +1258,7 @@ mod tests {
         progress.bytes.store(2048, Ordering::Relaxed);
         let mut screen = Screen {
             config: Config::default(),
+            other_disks: false,
             state: State::Scanning {
                 receiver,
                 progress,
@@ -1264,7 +1293,12 @@ mod tests {
         home.file("Videos/new.mkv", 20_000);
         home.file(".ssh/id", 100);
         home.file("notes", 10);
-        let tree = scan::scan(home.path(), &MountTable::default(), &Progress::default());
+        let tree = scan::scan(
+            home.path(),
+            &MountTable::default(),
+            false,
+            &Progress::default(),
+        );
         let picker = Picker::load(home.path(), &Config::default());
         let view = View::new(tree, home.path().into(), picker);
         (home, Screen::with_view(view))
@@ -1488,5 +1522,33 @@ mod tests {
         screen.tick();
         press(&mut screen, KeyCode::Enter);
         assert_eq!(view(&screen).dir, ROOT);
+    }
+
+    #[test]
+    fn o_scans_again_with_other_disks_and_r_just_again() {
+        let mut screen = screen();
+        assert!(press(&mut screen, KeyCode::Char('o')));
+        assert!(screen.other_disks && matches!(screen.state, State::NotStarted));
+        let rows = render(&mut screen, 60, 6);
+        assert!(rows[0].contains(" analyze, other disks too "), "{rows:#?}");
+        let mut again = super::tests::screen();
+        assert!(press(&mut again, KeyCode::Char('r')));
+        assert!(!again.other_disks && matches!(again.state, State::NotStarted));
+    }
+
+    #[test]
+    fn tilde_goes_to_the_home_folder() {
+        let mut tree = Tree::new("/".into(), 0);
+        let first = tree.add(
+            ROOT,
+            vec![entry("usr", 10, Kind::Dir), entry("home", 0, Kind::Dir)],
+        );
+        let me = tree.add(first + 1, vec![entry("me", 0, Kind::Dir)]);
+        tree.add(me, vec![entry("notes", 1, Kind::File)]);
+        tree.finish();
+        let mut screen = screen_of(tree, "/home/me");
+        assert!(press(&mut screen, KeyCode::Char('~')));
+        assert_eq!(view(&screen).dir, me);
+        assert_eq!(rows(&screen).0, ["notes"]);
     }
 }

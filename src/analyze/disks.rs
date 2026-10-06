@@ -47,6 +47,17 @@ pub enum Mount {
     NotADisk,
 }
 
+impl Mount {
+    /// Whether the scan goes into the mount, when it scans `other_disks` too or not.
+    pub fn is_scanned(self, other_disks: bool) -> bool {
+        match self {
+            Mount::SameDisk => true,
+            Mount::OtherDisk | Mount::UsbDisk => other_disks,
+            Mount::Network | Mount::Automount | Mount::NotADisk => false,
+        }
+    }
+}
+
 /// Every mount point, and where its files are.
 #[derive(Debug, Default)]
 pub struct MountTable(HashMap<PathBuf, Mount>);
@@ -80,6 +91,15 @@ impl MountTable {
     /// What is mounted on `path`; `None` when it isn't a mount point.
     pub fn get(&self, path: &Path) -> Option<Mount> {
         self.0.get(path).copied()
+    }
+
+    /// The mount points the scan goes into, when it scans `other_disks` too or not.
+    pub fn scanned(&self, other_disks: bool) -> Vec<PathBuf> {
+        self.0
+            .iter()
+            .filter(|(_, mount)| mount.is_scanned(other_disks))
+            .map(|(path, _)| path.clone())
+            .collect()
     }
 
     #[cfg(test)]
@@ -262,6 +282,13 @@ mod tests {
         assert_eq!(at("/run"), Some(Mount::NotADisk));
         assert_eq!(at("/mnt/iso"), Some(Mount::NotADisk));
         assert_eq!(at("/mnt"), None);
+        let mut scanned = table.scanned(false);
+        scanned.sort();
+        assert_eq!(
+            scanned,
+            [Path::new("/"), Path::new("/boot"), Path::new("/home")]
+        );
+        assert_eq!(table.scanned(true).len(), 5);
     }
 
     #[test]

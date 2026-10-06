@@ -3,7 +3,7 @@
 
 use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use super::disks::Mount;
 
@@ -31,6 +31,9 @@ pub enum Unwalked {
     /// The same folder as one reached by another path (through a bind mount), and counted
     /// there.
     Elsewhere,
+    /// Not scanned, but scanned mounts are inside, as USB disks are in `/run/media`: only the
+    /// folders on the way to them are in the tree.
+    Through,
     /// vole may not read it.
     Unreadable,
 }
@@ -237,15 +240,28 @@ impl Tree {
 
     /// Whether `id` is a folder whose insides are in the tree.
     pub fn can_open(&self, id: Id) -> bool {
-        self.kind(id) == Kind::Dir && self.unwalked(id).is_none()
+        self.kind(id) == Kind::Dir && matches!(self.unwalked(id), None | Some(Unwalked::Through))
+    }
+
+    /// What is in the folder `id`.
+    fn children(&self, id: Id) -> impl Iterator<Item = Id> + '_ {
+        let node = &self.nodes[id as usize];
+        (node.first_child..node.first_child + node.children)
+            .filter(|&child| !self.nodes[child as usize].gone)
+    }
+
+    /// The entry at `path`, when it is in the tree.
+    pub fn find(&self, path: &Path) -> Option<Id> {
+        let mut id = ROOT;
+        for name in path.strip_prefix(&self.root).ok()? {
+            id = self.children(id).find(|&child| self.name(child) == name)?;
+        }
+        Some(id)
     }
 
     /// What is in the folder `id`, largest first, then by name.
     pub fn largest_first(&self, id: Id) -> Vec<Id> {
-        let node = &self.nodes[id as usize];
-        let mut children: Vec<Id> = (node.first_child..node.first_child + node.children)
-            .filter(|&child| !self.nodes[child as usize].gone)
-            .collect();
+        let mut children: Vec<Id> = self.children(id).collect();
         children.sort_by(|&a, &b| {
             self.size(b)
                 .cmp(&self.size(a))
@@ -258,7 +274,6 @@ impl Tree {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::path::Path;
 
     fn entry(name: &str, size: u64, kind: Kind) -> Entry {
         Entry {
@@ -312,6 +327,10 @@ mod tests {
         assert_eq!(tree.parent(big), Some(ROOT));
         assert_eq!(tree.parent(ROOT), None);
         assert_eq!(tree.path(ROOT), Path::new("/data"));
+        assert_eq!(tree.find(Path::new("/data/big/b")), Some(4));
+        assert_eq!(tree.find(Path::new("/data")), Some(ROOT));
+        assert_eq!(tree.find(Path::new("/data/big/c")), None);
+        assert_eq!(tree.find(Path::new("/elsewhere")), None);
     }
 
     #[test]

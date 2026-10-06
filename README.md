@@ -178,7 +178,7 @@ status_refresh_ms = 1000
 protected_paths = []
 ```
 
-Your **Known Owners** go in `~/.config/vole/known-owners.toml`: which folder belongs to what, for folders vole can't work out itself. A folder listed there is never an orphan, so like `protected_paths` the file can only keep things from being proposed.
+Your **Known Owners** go in `~/.config/vole/known-owners.toml`: which folder belongs to what, for folders vole can't work out itself. A folder listed there is never an orphan, and neither is a folder holding one or inside one, so like `protected_paths` the file can only keep things from being proposed.
 
 ```toml
 "~/.config/my-tool" = "my-tool, installed by hand in ~/apps"

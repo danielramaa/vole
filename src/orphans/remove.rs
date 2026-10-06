@@ -57,8 +57,8 @@ pub fn remove_home(
                     let to = to.display().to_string();
                     log.record_moved(label, CONFIG, size, &target, &to, Ok(()))
                 }
-                // Already gone: nothing left to keep.
-                Ok(None) => log.record(label, CONFIG, size, &target, Ok(())),
+                // Already gone: nothing left to keep, nor freed by vole.
+                Ok(None) => already_gone(log.record(label, CONFIG, 0, &target, Ok(()))),
                 Err(err) => log.record(label, CONFIG, size, &target, Err(err)),
             },
         );
@@ -70,10 +70,19 @@ pub fn remove_home(
         }
         progress(configs.len() + done, total, &old.label);
         let target = old.path.display().to_string();
-        let result = delete_backup(&old.path, home, rules, mounts);
-        outcomes.push(log.record(&old.label, BACKUP, old.size, &target, result));
+        outcomes.push(match delete_backup(&old.path, home, rules, mounts) {
+            Ok(true) => log.record(&old.label, BACKUP, old.size, &target, Ok(())),
+            Ok(false) => already_gone(log.record(&old.label, BACKUP, 0, &target, Ok(()))),
+            Err(err) => log.record(&old.label, BACKUP, old.size, &target, Err(err)),
+        });
     }
     outcomes
+}
+
+/// Says an Item was gone before vole got to it.
+fn already_gone(mut outcome: Outcome) -> Outcome {
+    outcome.label.push_str(" (already gone)");
+    outcome
 }
 
 /// The Outcome of an Item vole didn't try to remove, so there is nothing to log.
@@ -88,8 +97,9 @@ pub fn not_attempted(label: &str, size: u64) -> Outcome {
 }
 
 /// Deletes an old Backup for good, once it is still one: a folder (not a symlink) directly in
-/// the backups folder, which the path rules allow and which isn't a mount point.
-fn delete_backup(path: &Path, home: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), String> {
+/// the backups folder, which the path rules allow and which isn't a mount point. Returns whether
+/// it was still there.
+fn delete_backup(path: &Path, home: &Path, rules: &Rules, mounts: &Mounts) -> Result<bool, String> {
     let refused = |why: &str| Err(format!("refused: {} {why}", path.display()));
     if path.parent() != Some(home.join(BACKUPS).as_path()) {
         return refused("is not a Backup");
@@ -97,7 +107,7 @@ fn delete_backup(path: &Path, home: &Path, rules: &Rules, mounts: &Mounts) -> Re
     match fs::symlink_metadata(path) {
         Ok(meta) if meta.is_dir() => {}
         Ok(_) => return refused("is not a folder"),
-        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
         Err(err) => return Err(format!("{}: {err}", path.display())),
     }
     let real = rules
@@ -106,7 +116,9 @@ fn delete_backup(path: &Path, home: &Path, rules: &Rules, mounts: &Mounts) -> Re
     if mounts.contains(&real) {
         return refused("is a mount point");
     }
-    disk::remove_all(&real, mounts).map_err(|err| format!("{}: {err}", path.display()))
+    disk::remove_all(&real, mounts)
+        .map(|()| true)
+        .map_err(|err| format!("{}: {err}", path.display()))
 }
 
 /// Moves one config into `backup`, creating the Backup first when there is none yet. Returns
@@ -501,6 +513,9 @@ mod tests {
         let gone = home.dir.path().join(".config/gone");
         let outcomes = move_all(&home, vec![gone], &Mounts::default());
         assert!(outcomes[0].error.is_none() && !outcomes[0].moved);
+        // Nothing freed by vole.
+        assert_eq!(outcomes[0].size, 0);
+        assert!(outcomes[0].label.ends_with("(already gone)"));
         assert!(backups(&home).is_empty());
     }
 

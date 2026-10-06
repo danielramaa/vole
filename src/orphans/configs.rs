@@ -187,12 +187,15 @@ pub fn find(
 }
 
 /// Puts first the configs that packages just removed `left` behind (each path with who left
-/// it), as High: their owner is surely gone.
+/// it), as High since their owner is surely gone, unless they are dotfiles directly in ~, which
+/// are always Low.
 pub fn mark_left_behind(configs: &mut [OrphanedConfig], left: &[(PathBuf, String)]) {
     let left_by = |config: &OrphanedConfig| left.iter().find(|(path, _)| *path == config.path);
     for config in configs.iter_mut() {
         if let Some((_, packages)) = left_by(config) {
-            config.confidence = Confidence::High;
+            if config.confidence != Confidence::Low {
+                config.confidence = Confidence::High;
+            }
             config.reason = format!("left by {packages}");
         }
     }
@@ -441,12 +444,21 @@ mod tests {
         let mut configs = [
             config("/h/.config/big", Confidence::High, 100),
             config("/h/.config/htop", Confidence::Medium, 1),
+            config("/h/.htoprc", Confidence::Low, 1),
         ];
-        mark_left_behind(&mut configs, &[("/h/.config/htop".into(), "htop".into())]);
+        let left = [
+            ("/h/.config/htop".into(), "htop".into()),
+            ("/h/.htoprc".into(), "htop".into()),
+        ];
+        mark_left_behind(&mut configs, &left);
         assert_eq!(configs[0].label, "/h/.config/htop");
         assert_eq!(configs[0].confidence, Confidence::High);
         assert_eq!(configs[0].reason, "left by htop");
-        assert_eq!(configs[1].reason, "changed today");
+        // A dotfile directly in ~ stays Low, still first.
+        assert_eq!(configs[1].label, "/h/.htoprc");
+        assert_eq!(configs[1].confidence, Confidence::Low);
+        assert_eq!(configs[1].reason, "left by htop");
+        assert_eq!(configs[2].reason, "changed today");
     }
 
     #[test]

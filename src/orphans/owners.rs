@@ -511,7 +511,7 @@ impl Owners {
     /// Desktop entries: by their id (its last part for reverse-DNS ids), window class and
     /// program. One pacman didn't install, nor Flatpak, counts only while its program exists.
     fn add_desktop_entries(&mut self, entries: &[detect::DesktopEntry]) {
-        for entry in entries {
+        for entry in entries.iter().filter(|entry| !entry.hidden) {
             let owner = if let Some(package) = self.pacman_desktop.get(&entry.path) {
                 package.clone()
             } else if entry.path.to_string_lossy().contains("/flatpak/exports/") {
@@ -873,6 +873,7 @@ picom /etc/xdg/picom/
                 .into_owned(),
             wm_class: wm_class.map(String::from),
             program: Some(program.into()),
+            hidden: false,
         };
         let files = "visual-studio-code-bin /usr/share/applications/code.desktop\n";
         let mut owners =

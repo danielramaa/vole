@@ -4,8 +4,9 @@
 //! A Backup keeps each config where it was relative to the home directory (`~/.config/foo` is
 //! kept as `<backup>/.config/foo`), and lists them in `vole-backup.jsonl`, one JSON line each.
 
-use std::fs::{self, File, OpenOptions};
+use std::fs::{self, DirBuilder, File, OpenOptions};
 use std::io::{self, ErrorKind, Write};
+use std::os::unix::fs::DirBuilderExt;
 use std::path::{Component, Path, PathBuf};
 use std::time::SystemTime;
 
@@ -205,13 +206,19 @@ impl NewBackup {
     /// Creates a Backup named after `now` in the home directory's backups folder; a second one
     /// in the same second gets `-2` after the name, and so on.
     pub fn create(home: &Path, now: SystemTime) -> io::Result<Self> {
+        // Configs can hold private things: only the user may look inside.
+        let mut private = DirBuilder::new();
+        private.mode(0o700);
         let backups = home.join(BACKUPS);
-        fs::create_dir_all(&backups)?;
+        DirBuilder::new()
+            .mode(0o700)
+            .recursive(true)
+            .create(&backups)?;
         let stamp = date::stamp(now);
         let mut dir = backups.join(&stamp);
         let mut number = 2;
         loop {
-            match fs::create_dir(&dir) {
+            match private.create(&dir) {
                 Ok(()) => break,
                 Err(err) if err.kind() == ErrorKind::AlreadyExists => {
                     dir = backups.join(format!("{stamp}-{number}"));
@@ -234,8 +241,8 @@ impl NewBackup {
 
     /// Moves `path`, which is `relative` to the home directory, into the Backup at the same
     /// place, and returns where it went. It is listed first, so nothing is ever in a Backup
-    /// without being listed; if the move then fails, the list has a line for nothing, which is
-    /// harmless. The move is a rename: it fails rather than copy across filesystems.
+    /// without being listed, and unlisted again if the move fails. The move is a rename: it
+    /// fails rather than copy across filesystems.
     pub fn take(&mut self, path: &Path, relative: &Path, size: u64) -> io::Result<PathBuf> {
         let to = self.dir.join(relative);
         if let Some(parent) = to.parent() {
@@ -247,8 +254,13 @@ impl NewBackup {
         };
         let mut line = serde_json::to_string(&entry)?;
         line.push('\n');
+        let listed = self.manifest.metadata()?.len();
         self.manifest.write_all(line.as_bytes())?;
-        fs::rename(path, &to)?;
+        if let Err(err) = fs::rename(path, &to) {
+            // Appending goes on at the end, wherever that now is.
+            let _ = self.manifest.set_len(listed);
+            return Err(err);
+        }
         Ok(to)
     }
 }
@@ -448,5 +460,22 @@ mod tests {
                 .is_err()
         );
         assert!(!backup.dir().join(".config/missing").exists());
+        // Not listed either, and what moves next is.
+        assert!(entries(backup.dir()).is_empty());
+        let rc = home.file(".gonerc", 1);
+        backup.take(&rc, Path::new(".gonerc"), 1).unwrap();
+        assert_eq!(entries(backup.dir()).len(), 1);
+    }
+
+    #[test]
+    fn backups_are_private() {
+        use std::os::unix::fs::PermissionsExt;
+        let home = TestDir::new();
+        let now = UNIX_EPOCH + Duration::from_secs(1_791_207_000);
+        let backup = NewBackup::create(home.path(), now).unwrap();
+        for dir in [backup.dir(), &home.path().join(BACKUPS)] {
+            let mode = fs::metadata(dir).unwrap().permissions().mode();
+            assert_eq!(mode & 0o777, 0o700, "{}", dir.display());
+        }
     }
 }

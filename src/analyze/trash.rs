@@ -86,6 +86,10 @@ impl Picker {
         if self.mounts.contains(&real) {
             return Err("is a mount point".into());
         }
+        // The trash would take the mounted disk along, and emptying it would delete its files.
+        if self.mounts.any_inside(&real) {
+            return Err("holds a mount point".into());
+        }
         if real == self.trash {
             return Err("is the trash itself".into());
         }
@@ -299,11 +303,15 @@ mod tests {
     }
 
     #[test]
-    fn mount_points_are_not_picked() {
+    fn mount_points_and_what_holds_them_are_not_picked() {
         let home = home();
-        let mounted = home.dir.dir("mnt/usb");
+        let mounted = home.dir.dir("data/usb");
         let picker = home.picker(Mounts::from_paths([mounted.clone()]));
         assert_eq!(picker.check(&mounted).unwrap_err(), "is a mount point");
+        assert_eq!(
+            picker.check(&home.dir.path().join("data")).unwrap_err(),
+            "holds a mount point"
+        );
     }
 
     #[test]

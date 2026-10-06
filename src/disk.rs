@@ -38,6 +38,13 @@ impl Mounts {
         self.0.contains(path)
     }
 
+    /// Whether a mount point is somewhere inside `path`.
+    pub fn any_inside(&self, path: &Path) -> bool {
+        self.0
+            .iter()
+            .any(|mount| mount != path && mount.starts_with(path))
+    }
+
     #[cfg(test)]
     pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
         Self(paths.into_iter().collect())
@@ -278,6 +285,9 @@ mod tests {
         assert!(mounts.contains(Path::new("/home/me/.cache/my disk")));
         assert!(mounts.contains(Path::new("/home/me/.cache/bind")));
         assert!(!mounts.contains(Path::new("/home/me/.cache")));
+        assert!(mounts.any_inside(Path::new("/home/me/.cache")));
+        assert!(!mounts.any_inside(Path::new("/home/me/.cache/bind")));
+        assert!(!mounts.any_inside(Path::new("/home/me/.cach")));
     }
 
     #[test]

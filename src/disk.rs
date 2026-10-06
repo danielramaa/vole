@@ -150,6 +150,22 @@ pub fn usage_all(paths: &[PathBuf], mounts: &Mounts) -> Usage {
     }
 }
 
+/// Moves `from` to `to` unless something is at `to` already, checked and moved in one step
+/// (`RENAME_NOREPLACE`), so nothing made meanwhile is overwritten. On a filesystem without that,
+/// it checks first, then moves.
+pub fn rename_no_overwrite(from: &Path, to: &Path) -> io::Result<()> {
+    use rustix::fs::{CWD, RenameFlags, renameat_with};
+    match renameat_with(CWD, from, CWD, to, RenameFlags::NOREPLACE) {
+        Err(err) if err == rustix::io::Errno::INVAL || err == rustix::io::Errno::NOSYS => {}
+        result => return result.map_err(io::Error::from),
+    }
+    match fs::symlink_metadata(to) {
+        Ok(_) => Err(io::Error::from(io::ErrorKind::AlreadyExists)),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => fs::rename(from, to),
+        Err(err) => Err(err),
+    }
+}
+
 /// Removes `path` (a real path) without following symlinks and without entering other
 /// filesystems or mount points. Read-only folders, like Go's module cache, are made writable.
 /// Anything that disappears meanwhile (a program cleaning its own cache) counts as removed.
@@ -214,6 +230,23 @@ mod tests {
     use super::*;
     use crate::testdir::TestDir;
     use std::time::Duration;
+
+    #[test]
+    fn moves_without_overwriting() {
+        let dir = TestDir::new();
+        let from = dir.file("from", 1);
+        let taken = dir.file("taken", 2);
+        let err = rename_no_overwrite(&from, &taken).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(&taken).unwrap().len(), 2);
+        // Not even an empty folder is replaced.
+        let folder = dir.dir("folder");
+        let empty = dir.dir("empty");
+        assert!(rename_no_overwrite(&folder, &empty).is_err());
+        let free = dir.path().join("free");
+        rename_no_overwrite(&from, &free).unwrap();
+        assert!(free.exists() && !from.exists());
+    }
 
     #[test]
     fn usage_says_when_anything_inside_last_changed() {

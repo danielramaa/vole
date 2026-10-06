@@ -138,6 +138,16 @@ impl Rules {
     /// returns where it really is (see [`Rules::resolve`]). `path` itself may be a symlink:
     /// removing it only removes the link.
     pub fn check(&self, path: &Path) -> Result<PathBuf, Refusal> {
+        self.check_with(path, true)
+    }
+
+    /// Checks that something vole removed may be put back at `path`: like [`Rules::check`], but
+    /// the Protected List, which only keeps things from being proposed, doesn't stop it.
+    pub fn check_put_back(&self, path: &Path) -> Result<PathBuf, Refusal> {
+        self.check_with(path, false)
+    }
+
+    fn check_with(&self, path: &Path, protected: bool) -> Result<PathBuf, Refusal> {
         if !path.is_absolute()
             || path
                 .components()
@@ -156,14 +166,14 @@ impl Rules {
         if !(loose_dotfile || self.allowed_roots.iter().any(|root| path.starts_with(root))) {
             return Err(Refusal::OutsideAllowedRoots);
         }
-        if overlaps(path, &self.protected) {
+        if protected && overlaps(path, &self.protected) {
             return Err(Refusal::Protected);
         }
         let real = self.resolve(path).ok_or(Refusal::Symlinked)?;
         if overlaps(&real, &self.sealed) {
             return Err(Refusal::Sealed);
         }
-        if overlaps(&real, &self.protected) {
+        if protected && overlaps(&real, &self.protected) {
             return Err(Refusal::Protected);
         }
         Ok(real)
@@ -321,6 +331,20 @@ mod tests {
         );
         let other = home.dir(".cache/other");
         assert_eq!(rules.check(&other), Ok(other));
+    }
+
+    #[test]
+    fn putting_back_ignores_only_the_protected_list() {
+        let home = TestDir::new();
+        let kept = home.path().join(".cache/keep");
+        let rules = rules(&home, std::slice::from_ref(&kept));
+        home.dir(".cache");
+        assert_eq!(rules.check(&kept), Err(Refusal::Protected));
+        assert_eq!(rules.check_put_back(&kept), Ok(kept));
+        assert_eq!(
+            rules.check_put_back(&home.dir(".local/share/keyrings")),
+            Err(Refusal::Sealed)
+        );
     }
 
     #[test]

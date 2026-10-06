@@ -109,6 +109,8 @@ pub struct DesktopEntry {
     pub wm_class: Option<String>,
     /// The program its Exec line runs, as written there.
     pub program: Option<String>,
+    /// `Hidden=true`: the entry is deleted, so it says nothing is installed.
+    pub hidden: bool,
 }
 
 /// The desktop entries in the system's and the user's application folders, including the ones
@@ -147,6 +149,7 @@ pub fn parse_desktop_entry(path: PathBuf, text: &str) -> DesktopEntry {
         id,
         wm_class: None,
         program: None,
+        hidden: false,
     };
     let mut in_entry = false;
     for line in text.lines().map(str::trim) {
@@ -158,6 +161,8 @@ pub fn parse_desktop_entry(path: PathBuf, text: &str) -> DesktopEntry {
             entry.wm_class = Some(class.trim().to_string());
         } else if let Some(exec) = line.strip_prefix("Exec=") {
             entry.program = exec_program(exec);
+        } else if let Some(hidden) = line.strip_prefix("Hidden=") {
+            entry.hidden = hidden.trim() == "true";
         }
     }
     entry
@@ -165,9 +170,20 @@ pub fn parse_desktop_entry(path: PathBuf, text: &str) -> DesktopEntry {
 
 /// The program an Exec line runs: `env FOO=1 /opt/app/app --flag %U` → `/opt/app/app`.
 fn exec_program(exec: &str) -> Option<String> {
-    exec_words(exec)
-        .into_iter()
-        .find(|word| word != "env" && !word.contains('='))
+    let mut words = exec_words(exec).into_iter();
+    let mut word = words.next()?;
+    if word == "env" {
+        // env's own options and variables come first: env -u FOO BAR=1 app.
+        loop {
+            word = words.next()?;
+            if word == "-u" || word == "--unset" {
+                words.next()?;
+            } else if !(word.starts_with('-') || word.contains('=')) {
+                break;
+            }
+        }
+    }
+    Some(word)
 }
 
 /// The words of an Exec line, where double quotes keep spaces in a word.
@@ -300,6 +316,15 @@ StartupWMClass=Other
             Some("/opt/My App/app")
         );
         assert_eq!(exec_program("").as_deref(), None);
+        assert_eq!(
+            exec_program("env -u GTK_IM_MODULE -i LANG=C app %U").as_deref(),
+            Some("app")
+        );
+        let hidden = parse_desktop_entry(
+            "/home/me/.local/share/applications/gone.desktop".into(),
+            "[Desktop Entry]\nHidden=true\nExec=gone\n",
+        );
+        assert!(hidden.hidden);
     }
 
     #[test]

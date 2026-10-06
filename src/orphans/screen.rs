@@ -357,7 +357,7 @@ impl ModuleScreen for Screen {
 
     fn hint(&self) -> &'static str {
         match self.state {
-            State::Ready(_) => "↑↓/jk move · space select · a select all · enter remove…",
+            State::Ready(_) => "↑↓/jk move · space select · a select section · enter remove…",
             State::Confirm { in_use: false, .. } => "↑↓ scroll · y remove · n back",
             State::Confirm { in_use: true, .. } => "↑↓ scroll · Y remove anyway · n back",
             State::RemovingHome { .. } => "esc stop after this Item",

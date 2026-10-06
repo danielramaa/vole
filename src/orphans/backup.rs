@@ -113,13 +113,43 @@ pub fn put_back(home: &Path, rules: &Rules, dir: &Path, entry: &Entry) -> Result
     }
     // The folder it was in may be gone, like ~/.local/state.
     if let Some(parent) = target.parent() {
-        fs::create_dir_all(parent).map_err(|err| format!("{}: {err}", parent.display()))?;
+        make_real_dirs(home, parent).map_err(|err| format!("{}: {err}", parent.display()))?;
     }
     let real = rules
-        .check(&target)
+        .check_put_back(&target)
         .map_err(|refusal| format!("refused: {shown} is {refusal}"))?;
-    fs::rename(&source, &real).map_err(|err| format!("{shown}: {err}"))?;
-    Ok(real)
+    match disk::rename_no_overwrite(&source, &real) {
+        Ok(()) => Ok(real),
+        // Made between the check above and now.
+        Err(err) if err.kind() == ErrorKind::AlreadyExists => {
+            Err(format!("{shown} exists now; move it away to put this back"))
+        }
+        Err(err) => Err(format!("{shown}: {err}")),
+    }
+}
+
+/// Makes the folders from `home` down to `dir` that are missing, going only through real
+/// folders: never through a symlink, so nothing is made outside the home directory.
+fn make_real_dirs(home: &Path, dir: &Path) -> io::Result<()> {
+    let relative = dir
+        .strip_prefix(home)
+        .map_err(|_| io::Error::other("outside the home folder"))?;
+    let mut current = home.to_path_buf();
+    for component in relative.components() {
+        current.push(component);
+        match fs::symlink_metadata(&current) {
+            Ok(meta) if meta.is_dir() => {}
+            Ok(_) => {
+                return Err(io::Error::other(format!(
+                    "{} is not a folder",
+                    current.display()
+                )));
+            }
+            Err(err) if err.kind() == ErrorKind::NotFound => fs::create_dir(&current)?,
+            Err(err) => return Err(err),
+        }
+    }
+    Ok(())
 }
 
 /// Takes `restored` off the list of the Backup at `dir`. A Backup left listing nothing goes,
@@ -446,6 +476,44 @@ mod tests {
                 "{odd}: {err}"
             );
         }
+    }
+
+    #[test]
+    fn puts_back_without_making_folders_through_symlinks() {
+        let home = TestDir::new();
+        let elsewhere = TestDir::new();
+        home.file(".local/state/app/data", 1);
+        let now = UNIX_EPOCH + Duration::from_secs(1_791_207_000);
+        let mut backup = NewBackup::create(home.path(), now).unwrap();
+        let dir = backup.dir().to_path_buf();
+        backup
+            .take(
+                &home.path().join(".local/state/app"),
+                Path::new(".local/state/app"),
+                1,
+            )
+            .unwrap();
+        // ~/.local/state is gone: it is made again.
+        fs::remove_dir(home.path().join(".local/state")).unwrap();
+        let rules = rules(&home);
+        let entry = |path: &str| Entry {
+            path: path.into(),
+            size: 1,
+        };
+        put_back(home.path(), &rules, &dir, &entry(".local/state/app")).unwrap();
+        assert!(home.path().join(".local/state/app/data").exists());
+
+        // ~/.local became a symlink: nothing is made through it.
+        let mut backup = NewBackup::create(home.path(), now).unwrap();
+        let dir = backup.dir().to_path_buf();
+        home.file(".cache/app/data", 1);
+        backup
+            .take(&home.path().join(".cache/app"), Path::new(".cache/app"), 1)
+            .unwrap();
+        fs::remove_dir_all(home.path().join(".cache")).unwrap();
+        std::os::unix::fs::symlink(elsewhere.path(), home.path().join(".cache")).unwrap();
+        assert!(put_back(home.path(), &rules, &dir, &entry(".cache/app")).is_err());
+        assert!(fs::read_dir(elsewhere.path()).unwrap().next().is_none());
     }
 
     #[test]

@@ -615,6 +615,10 @@ impl View {
             return;
         }
         let path = self.tree.path(id);
+        if path == self.home {
+            self.flash = Some("Open your home folder to select what is in it.".into());
+            return;
+        }
         if self.is_outside_home(&path) {
             self.flash = Some(
                 "Outside your home folder vole only shows; the tip above says how to free the space."
@@ -713,8 +717,14 @@ impl View {
                 return true;
             }
             KeyCode::Char('~') => {
-                if let Some(home) = self.tree.find(&self.home) {
-                    self.open(home, None);
+                match self.tree.find(&self.home) {
+                    Some(home) if self.tree.can_open(home) => self.open(home, None),
+                    _ => {
+                        self.flash = Some(
+                            "Your home folder isn't in the scan; when it is on another disk, o scans that too."
+                                .into(),
+                        );
+                    }
                 }
                 return true;
             }
@@ -1594,5 +1604,22 @@ mod tests {
         assert!(press(&mut screen, KeyCode::Char('~')));
         assert_eq!(view(&screen).dir, me);
         assert_eq!(rows(&screen).0, ["notes"]);
+        // Not in the scan, as when it is on another disk.
+        let mut screen = screen_of(Tree::new("/".into(), 0), "/home/me");
+        press(&mut screen, KeyCode::Char('~'));
+        assert!(flash(&screen).starts_with("Your home folder isn't in the scan"));
+    }
+
+    #[test]
+    fn the_home_folder_itself_is_opened_not_selected() {
+        let mut tree = Tree::new("/home".into(), 0);
+        tree.add(ROOT, vec![entry("me", 0, Kind::Dir)]);
+        tree.finish();
+        let mut screen = screen_of(tree, "/home/me");
+        press(&mut screen, KeyCode::Char(' '));
+        assert_eq!(
+            flash(&screen),
+            "Open your home folder to select what is in it."
+        );
     }
 }

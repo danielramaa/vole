@@ -719,6 +719,11 @@ impl View {
         while dir != ROOT && self.tree.is_gone(dir) {
             dir = self.tree.parent(dir).unwrap_or(ROOT);
         }
+        if dir != self.dir {
+            // Where the cursor was is gone with the folder shown.
+            self.open(dir, None);
+            return;
+        }
         let (on, cursor) = (self.current(), self.cursor);
         self.open(dir, on.filter(|&id| !self.tree.is_gone(id)));
         if on.is_some_and(|id| self.tree.is_gone(id)) {
@@ -1723,6 +1728,7 @@ mod tests {
         screen.tick();
         press(&mut screen, KeyCode::Enter);
         assert_eq!(view(&screen).dir, ROOT);
+        assert_eq!(view(&screen).cursor, 0);
     }
 
     #[test]

@@ -5,57 +5,90 @@ use std::path::Path;
 
 use crate::pacman::{self, Info};
 
-/// Folders a tool of their own frees, or that are best left alone, relative to `/`. Anything in
-/// them gets their tip.
-const KNOWN: &[(&str, &str)] = &[
-    (
-        "var/cache/pacman/pkg",
-        "pacman's package cache: vole clean trims it.",
-    ),
-    (
-        "var/log/journal",
-        "The systemd journal: vole clean shrinks it.",
-    ),
-    (
-        "var/lib/pacman",
-        "pacman's record of what is installed: keep it.",
-    ),
-    (
-        "var/lib/docker",
-        "Docker's images and containers: docker system prune removes the unused ones.",
-    ),
-    (
-        "var/lib/containers",
-        "Podman's images and containers: podman system prune removes the unused ones.",
-    ),
-    (
-        "var/lib/flatpak",
-        "Flatpak's apps and runtimes: flatpak uninstall --unused removes the runtimes no app needs.",
-    ),
-    (
-        "var/lib/libvirt/images",
-        "Virtual machine disks: delete the machines you don't need in virt-manager.",
-    ),
-    (
-        "var/lib/systemd/coredump",
-        "Core dumps of programs that crashed: coredumpctl lists them, and systemd deletes them after a few days.",
-    ),
-    (
-        "var/tmp",
-        "Temporary files kept across reboots: systemd deletes the ones unused for 30 days.",
-    ),
-    (
-        "usr/lib/modules",
-        "Kernel modules: they come and go with the kernel packages.",
-    ),
-    (
-        "usr/lib/firmware",
-        "Firmware your devices load as they start: keep it.",
-    ),
-    (
-        "boot",
-        "The kernels and the boot loader: pacman and the boot loader look after them.",
-    ),
+/// A folder a tool of its own frees, or that is best left alone.
+struct Known {
+    /// Relative to `/`. Anything in it gets its tip.
+    folder: &'static str,
+    tip: &'static str,
+    /// The tip of the folder holding it, which it is most of.
+    holder: Option<&'static str>,
+}
+
+const KNOWN: &[Known] = &[
+    Known {
+        folder: "var/cache/pacman/pkg",
+        tip: "pacman's package cache: vole clean trims it.",
+        holder: Some("Holds pacman's package cache, which vole clean trims."),
+    },
+    Known {
+        folder: "var/log/journal",
+        tip: "The systemd journal: vole clean shrinks it.",
+        holder: Some("Holds the systemd journal, which vole clean shrinks."),
+    },
+    Known {
+        folder: "var/lib/pacman",
+        tip: "pacman's record of what is installed: keep it.",
+        holder: None,
+    },
+    Known {
+        folder: "var/lib/docker",
+        tip: "Docker's images and containers: docker system prune removes the unused ones.",
+        holder: None,
+    },
+    Known {
+        folder: "var/lib/containers",
+        tip: "Podman's images and containers: podman system prune removes the unused ones.",
+        holder: None,
+    },
+    Known {
+        folder: "var/lib/flatpak",
+        tip: "Flatpak's apps and runtimes: flatpak uninstall --unused removes the runtimes no app needs.",
+        holder: None,
+    },
+    Known {
+        folder: "var/lib/libvirt/images",
+        tip: "Virtual machine disks: delete the machines you don't need in virt-manager.",
+        holder: Some(
+            "Holds virtual machine disks: delete the machines you don't need in virt-manager.",
+        ),
+    },
+    Known {
+        folder: "var/lib/systemd/coredump",
+        tip: "Core dumps of programs that crashed: coredumpctl lists them, and systemd deletes them after a few days.",
+        holder: Some(
+            "Holds core dumps of programs that crashed, which systemd deletes after a few days.",
+        ),
+    },
+    Known {
+        folder: "var/lib/mysql",
+        tip: "MariaDB's or MySQL's databases: drop the ones you don't need from the database itself.",
+        holder: None,
+    },
+    Known {
+        folder: "var/lib/postgres",
+        tip: "PostgreSQL's databases: drop the ones you don't need from the database itself.",
+        holder: None,
+    },
+    Known {
+        folder: "var/tmp",
+        tip: "Temporary files kept across reboots: systemd deletes the ones unused for 30 days.",
+        holder: None,
+    },
+    Known {
+        folder: "usr/lib/modules",
+        tip: "Kernel modules: they come and go with the kernel packages.",
+        holder: None,
+    },
+    Known {
+        folder: "usr/lib/firmware",
+        tip: "Firmware your devices load as they start: keep it.",
+        holder: None,
+    },
+    Known {
+        folder: "boot",
+        tip: "The kernels and the boot loader: pacman and the boot loader look after them.",
+        holder: None,
+    },
 ];
 
 /// The tip for `path`, outside the home folder `home`, when no command has to run for it.
@@ -72,10 +105,18 @@ pub fn known(path: &Path, home: &Path) -> Option<&'static str> {
         return Some("Another user's home folder: only they, or root, can free this space.");
     }
     let relative = path.strip_prefix("/").ok()?;
+    if let Some(known) = KNOWN
+        .iter()
+        .find(|known| relative.starts_with(known.folder))
+    {
+        return Some(known.tip);
+    }
+    // What a folder holds may matter more than what it comes from: /var/cache/pacman is
+    // pacman's, but its size is the package cache.
     KNOWN
         .iter()
-        .find(|(folder, _)| relative.starts_with(folder))
-        .map(|(_, tip)| *tip)
+        .filter(|known| Path::new(known.folder).parent() == Some(relative))
+        .find_map(|known| known.holder)
 }
 
 /// How to free `path` (a folder when `folder`), from what pacman says about it. pacman takes a
@@ -93,8 +134,14 @@ pub fn from_pacman(path: &Path, folder: bool) -> String {
     }
 }
 
-/// The tip for a path the packages `owners` own, where `info` is about the only one.
+/// The tip for a path the packages `owners` own, where `info` is about the only one. Of a folder,
+/// pacman only tells who made it: what programs put in it later isn't the package's.
 fn package_tip(owners: &[String], info: Option<&Info>, folder: bool) -> String {
+    let from = if folder {
+        format!("The folder comes from the package {}", owners.join(", "))
+    } else {
+        format!("From the package {}", owners.join(", "))
+    };
     match owners {
         [] => "No package owns it: a program made it, or it was put there by hand.".into(),
         [owner] => match info {
@@ -104,18 +151,19 @@ fn package_tip(owners: &[String], info: Option<&Info>, folder: bool) -> String {
                     [one, two] => format!("{one} and {two} need"),
                     all => format!("{} installed packages need", all.len()),
                 };
-                format!("From the package {owner}, which {needed}.")
+                format!("{from}, which {needed}.")
             }
             // What vole orphans lists: installed as a dependency of something now gone.
             Some(info) if info.dependency && info.optional_for.is_empty() => {
-                format!(
-                    "From the package {owner}, which nothing installed needs: vole orphans removes it."
-                )
+                format!("{from}, which nothing installed needs: vole orphans removes it.")
             }
-            Some(_) => format!(
-                "From the package {owner}: if you don't need it, sudo pacman -Rns {owner} removes it."
+            Some(_) if folder => format!(
+                "{from}: if you don't need it, sudo pacman -Rns {owner} removes what it put here."
             ),
-            None => format!("From the package {owner}."),
+            Some(_) => {
+                format!("{from}: if you don't need it, sudo pacman -Rns {owner} removes it.")
+            }
+            None => format!("{from}."),
         },
         _ if folder => format!(
             "Holds files of {} packages: open it to see whose.",
@@ -153,6 +201,19 @@ mod tests {
         );
         assert_eq!(known_tip("/var/lib/dockerd"), None);
         assert_eq!(known_tip("/usr/lib/firefox"), None);
+        assert!(known_tip("/var/lib/mysql").unwrap().contains("databases"));
+    }
+
+    #[test]
+    fn says_what_a_folder_holds_before_whose_it_is() {
+        assert_eq!(
+            known_tip("/var/cache/pacman"),
+            Some("Holds pacman's package cache, which vole clean trims.")
+        );
+        assert!(known_tip("/var/log").unwrap().contains("journal"));
+        // Only what a folder is mostly made of: /var/cache holds much more.
+        assert_eq!(known_tip("/var/cache"), None);
+        assert_eq!(known_tip("/var/lib"), None);
     }
 
     #[test]
@@ -209,6 +270,16 @@ mod tests {
             "From the package foo: if you don't need it, sudo pacman -Rns foo removes it."
         );
         assert_eq!(package_tip(&foo, None, false), "From the package foo.");
+        // Of a folder, the package made the folder, not everything in it.
+        assert_eq!(
+            package_tip(&foo, Some(&package(&[], false, &[])), true),
+            "The folder comes from the package foo: if you don't need it, \
+             sudo pacman -Rns foo removes what it put here."
+        );
+        assert_eq!(
+            package_tip(&foo, Some(&package(&["bar"], false, &[])), true),
+            "The folder comes from the package foo, which bar needs."
+        );
     }
 
     #[test]

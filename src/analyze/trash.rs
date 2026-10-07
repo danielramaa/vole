@@ -280,17 +280,23 @@ impl Trash for Gio {
     }
 }
 
-/// gio's message, without the `gio: file:///…: ` in front.
+/// gio's message, without the `gio: file:///…: ` in front. GLib may warn about other things
+/// first, so the line gio wrote comes before any other.
 fn gio_error(stderr: &str) -> Option<String> {
-    let line = stderr
+    let lines: Vec<&str> = stderr
         .lines()
         .map(str::trim)
-        .find(|line| !line.is_empty())?;
+        .filter(|line| !line.is_empty())
+        .collect();
+    let line = lines
+        .iter()
+        .find(|line| line.starts_with("gio: "))
+        .or(lines.last())?;
     // The file's URI has its spaces escaped, so the first ": " after it ends it.
     let message = line
         .strip_prefix("gio: ")
         .and_then(|rest| rest.split_once(": "))
-        .map_or(line, |(_, message)| message);
+        .map_or(*line, |(_, message)| message);
     Some(message.to_string())
 }
 
@@ -621,5 +627,11 @@ mod tests {
             Some("something else")
         );
         assert_eq!(gio_error("\n"), None);
+        let warned = "(gio:1234): GLib-GIO-WARNING **: 10:00:00.000: No such VFS module\n\
+                      gio: file:///home/me/a: Unable to trash file /home/me/a: Read-only file system\n";
+        assert_eq!(
+            gio_error(warned).as_deref(),
+            Some("Unable to trash file /home/me/a: Read-only file system")
+        );
     }
 }

@@ -300,9 +300,13 @@ pub fn trash_all(
         let (label, size) = (&item.label, item.size);
         outcomes.push(match trash_one(&item.path, picker, trash) {
             Ok(true) => log.record_trashed(label, KIND, size, &target, Ok(())),
-            // Already gone: nothing was moved, nor freed by vole.
+            // Already gone: vole moved nothing, and freed nothing. The log says it wasn't
+            // trashed, and why; on screen, it went as asked.
             Ok(false) => {
-                let mut outcome = log.record(label, KIND, 0, &target, Ok(()));
+                let gone = Err("it was gone already".into());
+                let mut outcome = log.record_trashed(label, KIND, 0, &target, gone);
+                outcome.error = None;
+                outcome.moved = None;
                 outcome.label.push_str(" (already gone)");
                 outcome
             }
@@ -314,14 +318,16 @@ pub fn trash_all(
 
 /// Moves `path` to the trash after a last check. Returns whether it was still there.
 fn trash_one(path: &Path, picker: &Picker, trash: &dyn Trash) -> Result<bool, String> {
+    // Gone, maybe with the folder it was in (cargo clean takes target/ along): nothing to check.
+    match fs::symlink_metadata(path) {
+        Err(err) if err.kind() == ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(format!("{}: {err}", path.display())),
+        Ok(_) => {}
+    }
     let real = picker
         .check(path)
         .map_err(|why| format!("refused: {} {why}", path.display()))?;
-    match fs::symlink_metadata(&real) {
-        Ok(_) => trash.trash(&real).map(|()| true),
-        Err(err) if err.kind() == ErrorKind::NotFound => Ok(false),
-        Err(err) => Err(format!("{}: {err}", path.display())),
-    }
+    trash.trash(&real).map(|()| true)
 }
 
 #[cfg(test)]
@@ -509,7 +515,31 @@ mod tests {
         assert!(keys.exists());
         assert!(outcomes[1].error.is_none() && outcomes[1].label.ends_with("(already gone)"));
         assert_eq!(outcomes[1].size, 0);
-        assert_eq!(log_lines(&home.log)[0]["trashed"], false);
+        let log = log_lines(&home.log);
+        assert_eq!(log[0]["trashed"], false);
+        // Not moved by vole, but gone as asked.
+        assert_eq!(log[1]["trashed"], false);
+        assert_eq!(log[1]["error"], "it was gone already");
+        assert!(log[1].get("removed").is_none());
+    }
+
+    #[test]
+    fn an_item_whose_folder_went_is_already_gone() {
+        let home = home();
+        let debug = home.dir.dir("proj/target/debug");
+        fs::remove_dir_all(home.dir.path().join("proj/target")).unwrap();
+        let trash = FakeTrash(home.dir.path().join("trash"));
+        let mut log = Log::open(&home.log, "analyze").unwrap();
+        let outcomes = trash_all(
+            &[picked(debug)],
+            &home.picker(Mounts::default()),
+            &trash,
+            &mut log,
+            &mut |_, _, _| {},
+            &AtomicBool::new(false),
+        );
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0]);
+        assert!(outcomes[0].label.ends_with("(already gone)"));
     }
 
     #[test]

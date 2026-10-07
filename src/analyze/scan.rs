@@ -50,7 +50,7 @@ pub fn scan(
             waiting: vec![Folder {
                 path: root.to_path_buf(),
                 id: ROOT,
-                through: false,
+                through: None,
             }],
             reading: 0,
         }),
@@ -102,8 +102,8 @@ struct Queue {
 struct Folder {
     path: PathBuf,
     id: Id,
-    /// Only passed through, on the way to scanned mounts inside it.
-    through: bool,
+    /// In a mount of this kind that is only passed through, on the way to scanned mounts.
+    through: Option<Mount>,
 }
 
 /// The folders found in one that was read, queued when dropped: even when reading it panicked,
@@ -186,7 +186,7 @@ impl Walk<'_> {
                 Some(mount) => {
                     mount.is_scanned(self.other_disks) || (is_home && mount != Mount::Network)
                 }
-                None => !folder.through || is_home,
+                None => folder.through.is_none() || is_home,
             };
             if !walked {
                 // Passed through when scanned mounts are inside, but never a network share.
@@ -194,12 +194,13 @@ impl Walk<'_> {
                     && path
                         .as_ref()
                         .is_some_and(|path| self.leads_to_scanned(path));
-                let unwalked = match (path, mount) {
-                    (Some(path), _) if through => {
-                        folders.push((entries.len(), path, true));
-                        Unwalked::Through
+                // What is passed through: this mount, or the one it is in.
+                let unwalked = match (path, mount.or(folder.through)) {
+                    (Some(path), Some(kind)) if through => {
+                        folders.push((entries.len(), path, Some(kind)));
+                        Unwalked::Through(kind)
                     }
-                    (_, Some(mount)) if !folder.through => Unwalked::Mount(mount),
+                    (_, Some(mount)) if folder.through.is_none() => Unwalked::Mount(mount),
                     // Passing through, only the way to scanned mounts is kept.
                     _ => continue,
                 };
@@ -238,7 +239,7 @@ impl Walk<'_> {
                 size = 0;
             }
             if let Some(dir) = dir.filter(|_| unwalked.is_none()) {
-                folders.push((entries.len(), dir, false));
+                folders.push((entries.len(), dir, None));
             }
             bytes += size;
             entries.push(Entry {
@@ -451,7 +452,11 @@ mod tests {
         assert!(tree.size(find(&tree, "run/media/me/STICK/photo.jpg")) > 0);
         // /run is only passed through: none of its own files are in the tree.
         let run = find(&tree, "run");
-        assert_eq!(tree.unwalked(run), Some(Unwalked::Through));
+        assert_eq!(tree.unwalked(run), Some(Unwalked::Through(Mount::NotADisk)));
+        assert_eq!(
+            tree.unwalked(find(&tree, "run/media/me")),
+            Some(Unwalked::Through(Mount::NotADisk))
+        );
         assert!(tree.can_open(run));
         let names: Vec<_> = tree
             .largest_first(run)
@@ -488,6 +493,10 @@ mod tests {
         let tree = scan(dir.path(), &mounts, false, &me, &Progress::default());
         assert!(tree.size(find(&tree, "home/me/notes")) > 0);
         let homes = find(&tree, "home");
+        assert_eq!(
+            tree.unwalked(homes),
+            Some(Unwalked::Through(Mount::OtherDisk))
+        );
         let names: Vec<_> = tree
             .largest_first(homes)
             .into_iter()

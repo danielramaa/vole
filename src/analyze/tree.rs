@@ -31,9 +31,9 @@ pub enum Unwalked {
     /// The same folder as one reached by another path (through a bind mount), and counted
     /// there.
     Elsewhere,
-    /// Not scanned, but scanned mounts are inside, as USB disks are in `/run/media`: only the
-    /// folders on the way to them are in the tree.
-    Through,
+    /// In a mount that isn't scanned, whose kind it says, but on the way to scanned mounts, as
+    /// USB disks are in `/run/media`: only the folders on the way to them are in the tree.
+    Through(Mount),
     /// vole may not read it.
     Unreadable,
 }
@@ -240,7 +240,7 @@ impl Tree {
 
     /// Whether `id` is a folder whose insides are in the tree.
     pub fn can_open(&self, id: Id) -> bool {
-        self.kind(id) == Kind::Dir && matches!(self.unwalked(id), None | Some(Unwalked::Through))
+        self.kind(id) == Kind::Dir && matches!(self.unwalked(id), None | Some(Unwalked::Through(_)))
     }
 
     /// What is in the folder `id`.

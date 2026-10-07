@@ -565,7 +565,7 @@ impl View {
         !self.tips.contains_key(&id)
             && !matches!(
                 self.tree.unwalked(id),
-                Some(Unwalked::Mount(_) | Unwalked::Elsewhere | Unwalked::Through)
+                Some(Unwalked::Mount(_) | Unwalked::Elsewhere | Unwalked::Through(_))
             )
             && self.is_outside_home(&path)
             && tip::known(&path, &self.home).is_none()
@@ -874,7 +874,7 @@ impl View {
     /// A word or two after the name, saying what is special about `id`.
     fn mark(&self, id: Id) -> Option<&'static str> {
         match self.tree.unwalked(id) {
-            Some(Unwalked::Mount(mount)) => Some(match mount {
+            Some(Unwalked::Mount(mount) | Unwalked::Through(mount)) => Some(match mount {
                 Mount::SameDisk => "mount point",
                 Mount::OtherDisk => "other disk",
                 Mount::UsbDisk => "USB disk",
@@ -883,7 +883,6 @@ impl View {
                 Mount::NotADisk => "not on a disk",
             }),
             Some(Unwalked::Elsewhere) => Some("counted elsewhere"),
-            Some(Unwalked::Through) => Some("not on a disk"),
             Some(Unwalked::Unreadable) => Some("can't read"),
             None if self.tree.linked(id) => Some("hard link"),
             None if self.tree.kind(id) == Kind::Symlink => Some("symlink"),
@@ -898,7 +897,7 @@ impl View {
         let unwalked = self.tree.unwalked(id);
         if !matches!(
             unwalked,
-            Some(Unwalked::Mount(_) | Unwalked::Elsewhere | Unwalked::Through)
+            Some(Unwalked::Mount(_) | Unwalked::Elsewhere | Unwalked::Through(_))
         ) && self.is_outside_home(&path)
         {
             return Some(match tip::known(&path, &self.home) {
@@ -929,8 +928,16 @@ impl View {
                     "The same folder as one at another path (a bind mount), where it is counted.",
                 );
             }
-            Some(Unwalked::Through) => {
-                return Some("Not on a disk: only the disks mounted in it are shown.");
+            Some(Unwalked::Through(mount)) => {
+                return Some(match mount {
+                    Mount::NotADisk => "Not on a disk: only the disks mounted in it are shown.",
+                    Mount::OtherDisk | Mount::UsbDisk => {
+                        "On another disk, which o scans too; only what is mounted in it is shown now."
+                    }
+                    Mount::SameDisk | Mount::Network | Mount::Automount => {
+                        "Only what is mounted in it is shown."
+                    }
+                });
             }
             Some(Unwalked::Unreadable) | None => {}
         }

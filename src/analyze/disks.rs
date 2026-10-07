@@ -150,9 +150,11 @@ enum Disk {
 }
 
 impl Disk {
-    /// A loop device or the like: its files are in an image file kept on a disk.
+    /// A loop device, a RAM disk or the like: its files are in memory, or in an image file kept
+    /// on a disk. NVMe disks reached through several paths are under /sys/devices/virtual too,
+    /// but not under its block folder.
     fn is_virtual(&self) -> bool {
-        matches!(self, Disk::Block(sys) if sys.starts_with("/sys/devices/virtual"))
+        matches!(self, Disk::Block(sys) if sys.starts_with("/sys/devices/virtual/block"))
     }
 
     fn is_usb(&self) -> bool {
@@ -294,6 +296,17 @@ mod tests {
             [Path::new("/"), Path::new("/boot"), Path::new("/home")]
         );
         assert_eq!(table.scanned(true).len(), 5);
+    }
+
+    #[test]
+    fn nvme_disks_with_several_paths_are_disks() {
+        let mountinfo = "\
+41 1 259:2 / / rw - ext4 /dev/nvme0n1p2 rw
+56 41 259:1 / /boot rw - vfat /dev/nvme0n1p1 rw
+";
+        let head = "/sys/devices/virtual/nvme-subsystem/nvme-subsys0/nvme0n1";
+        let table = MountTable::parse(mountinfo, &|_: &Source| vec![Disk::Block(head.into())]);
+        assert_eq!(table.get(Path::new("/boot")), Some(Mount::SameDisk));
     }
 
     #[test]

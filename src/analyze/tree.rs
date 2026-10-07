@@ -231,6 +231,14 @@ impl Tree {
         }
     }
 
+    /// Adds `size` to the folder `id` and to those holding it, for what was moved into it.
+    pub fn grow(&mut self, id: Id, size: u64) {
+        let folders: Vec<Id> = std::iter::once(id).chain(self.above(id)).collect();
+        for folder in folders {
+            self.nodes[folder as usize].size += size;
+        }
+    }
+
     /// Whether `id`, or a folder holding it, has been taken out of the tree.
     pub fn is_gone(&self, id: Id) -> bool {
         std::iter::once(id)

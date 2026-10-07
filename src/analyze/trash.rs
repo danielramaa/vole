@@ -40,6 +40,8 @@ pub struct Picker {
     mounts: Mounts,
     /// The desktop trash, wherever the XDG variables put it.
     trashes: Vec<PathBuf>,
+    /// The trash gio moves what is on its filesystem into, where it really is.
+    home_trash: PathBuf,
     /// vole's own folders: its config, its Backups and its Operation Log.
     own: Vec<PathBuf>,
 }
@@ -122,16 +124,21 @@ impl Picker {
             .map_err(|err| format!("resolving {}: {err}", home.display()))?;
         let mounts = Mounts::load()
             .map_err(|err| format!("reading the mount points from /proc/self/mountinfo: {err}"))?;
-        Ok(Self::new(home, rules, mounts))
+        // GLib's data folder, as dirs works it out.
+        let home_trash = dirs::data_dir()
+            .and_then(|dir| fs::canonicalize(dir).ok())
+            .map_or_else(|| home.join(TRASH), |dir| dir.join("Trash"));
+        Ok(Self::new(home, rules, mounts, home_trash))
     }
 
     /// What may be picked in `home`, with `mounts` for the mount points.
     #[cfg(test)]
     pub fn with_mounts(home: &Path, mounts: Mounts) -> Self {
-        Self::new(home, Rules::new(home, &[], &[]).unwrap(), mounts)
+        let rules = Rules::new(home, &[], &[]).unwrap();
+        Self::new(home, rules, mounts, home.join(TRASH))
     }
 
-    fn new(home: &Path, rules: Rules, mounts: Mounts) -> Self {
+    fn new(home: &Path, rules: Rules, mounts: Mounts, home_trash: PathBuf) -> Self {
         let mut own: Vec<PathBuf> = [".config", ".local/share", ".local/state"]
             .iter()
             .map(|dir| home.join(dir).join("vole"))
@@ -149,8 +156,22 @@ impl Picker {
             rules,
             mounts,
             trashes: with_resolved(trashes),
+            home_trash,
             own: with_resolved(own),
         }
+    }
+
+    /// Where gio moves `path`: into the home folder's trash when it is on the same filesystem,
+    /// else into the trash folder at the top of the one `path` is on.
+    pub fn trash_for(&self, path: &Path) -> PathBuf {
+        let mount = self.mounts.containing(path);
+        if mount == self.mounts.containing(&self.home_trash) {
+            return self.home_trash.clone();
+        }
+        let uid = rustix::process::getuid().as_raw();
+        mount
+            .unwrap_or(Path::new("/"))
+            .join(format!(".Trash-{uid}"))
     }
 
     /// Checks that `path` may be picked and moved to the trash, and returns where it really is.
@@ -351,8 +372,7 @@ mod tests {
 
     impl Home {
         fn picker(&self, mounts: Mounts) -> Picker {
-            let rules = Rules::new(self.dir.path(), &[], &[]).unwrap();
-            Picker::new(self.dir.path(), rules, mounts)
+            Picker::with_mounts(self.dir.path(), mounts)
         }
 
         fn why(&self, relative: &str) -> Option<String> {
@@ -441,6 +461,22 @@ mod tests {
         assert_eq!(home.why("data"), None);
         assert_eq!(home.why(".config/vole").as_deref(), Some("is vole's own"));
         assert_eq!(home.why("dotfiles/vole").as_deref(), Some("is vole's own"));
+    }
+
+    #[test]
+    fn knows_which_trash_gio_uses() {
+        let home = home();
+        let data = home.dir.path().join("data");
+        let picker = home.picker(Mounts::from_paths([data.clone()]));
+        assert_eq!(
+            picker.trash_for(&home.dir.path().join("Videos/a.mkv")),
+            home.dir.path().join(TRASH)
+        );
+        let uid = rustix::process::getuid().as_raw();
+        assert_eq!(
+            picker.trash_for(&data.join("a.iso")),
+            data.join(format!(".Trash-{uid}"))
+        );
     }
 
     #[test]

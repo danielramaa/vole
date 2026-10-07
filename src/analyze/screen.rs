@@ -698,9 +698,20 @@ impl View {
     /// Takes what went to the trash, or was gone already, out of the tree, and clears the
     /// selection. When the folder shown went too, the nearest one above that is left is shown.
     fn forget(&mut self, items: &[(Id, Picked)], outcomes: &[Outcome]) {
-        for ((id, _), outcome) in items.iter().zip(outcomes) {
-            if outcome.error.is_none() {
-                self.tree.remove(*id);
+        for ((id, item), outcome) in items.iter().zip(outcomes) {
+            if outcome.error.is_some() {
+                continue;
+            }
+            let size = self.tree.size(*id);
+            self.tree.remove(*id);
+            // Moved, not freed: it takes its space in the trash now, as far as the tree holds it.
+            if outcome.moved.is_some()
+                && let Ok(picker) = &self.picker
+            {
+                let trash = picker.trash_for(&item.path);
+                if let Some(folder) = trash.ancestors().find_map(|folder| self.tree.find(folder)) {
+                    self.tree.grow(folder, size);
+                }
             }
         }
         self.selected.clear();
@@ -1342,7 +1353,10 @@ mod tests {
             home.path(),
             &Progress::default(),
         );
-        let picker = Picker::load(home.path(), &Config::default());
+        let picker = Ok(Picker::with_mounts(
+            home.path(),
+            crate::disk::Mounts::default(),
+        ));
         let view = View::new(tree, home.path().into(), picker);
         (home, Screen::with_view(view))
     }
@@ -1438,7 +1452,7 @@ mod tests {
             &home,
             &Progress::default(),
         );
-        let picker = Picker::load(&home, &Config::default());
+        let picker = Ok(Picker::with_mounts(&home, crate::disk::Mounts::default()));
         let mut screen = Screen::with_view(View::new(tree, home, picker));
         // The folder holding the home folder holds ~/.ssh, but nothing outside home is picked.
         let rows = render(&mut screen, 70, 8).join("\n");
@@ -1459,7 +1473,10 @@ mod tests {
             home.path(),
             &Progress::default(),
         );
-        let picker = Picker::load(home.path(), &Config::default());
+        let picker = Ok(Picker::with_mounts(
+            home.path(),
+            crate::disk::Mounts::default(),
+        ));
         let mut screen = Screen::with_view(View::new(tree, home.path().into(), picker));
         press(&mut screen, KeyCode::Char(' '));
         // Exact for the Operation Log, cleaned up on screen.
@@ -1510,7 +1527,10 @@ mod tests {
             home.path(),
             &Progress::default(),
         );
-        let picker = Picker::load(home.path(), &Config::default());
+        let picker = Ok(Picker::with_mounts(
+            home.path(),
+            crate::disk::Mounts::default(),
+        ));
         let mut view = View::new(tree, home.path().into(), picker);
         let share = view.tree.find(&home.path().join(".local/share")).unwrap();
         view.open(share, None);
@@ -1622,10 +1642,8 @@ mod tests {
     #[test]
     fn what_went_leaves_the_list() {
         let (_home, mut screen, sender) = trashing(&["Videos", "notes"]);
-        let (before, videos) = match &screen.state {
-            State::Trashing { view, items, .. } => {
-                (view.tree.size(ROOT), view.tree.size(items[0].0))
-            }
+        let before = match &screen.state {
+            State::Trashing { view, .. } => view.tree.size(ROOT),
             _ => panic!("not trashing"),
         };
         // Largest first: Videos, then notes, which failed.
@@ -1645,7 +1663,51 @@ mod tests {
         assert!(!names.contains(&"Videos".to_string()), "{names:?}");
         assert!(names.contains(&"notes".to_string()));
         assert!(view(&screen).selected.is_empty());
-        assert_eq!(view(&screen).tree.size(ROOT), before - videos);
+        // Moved, not freed: the home folder holds it still, in the trash.
+        assert_eq!(view(&screen).tree.size(ROOT), before);
+    }
+
+    #[test]
+    fn what_went_to_the_trash_grows_it() {
+        let (home, mut screen) = home_screen_with_trash();
+        let trash = view(&screen)
+            .tree
+            .find(&home.path().join(".local/share/Trash"))
+            .unwrap();
+        let before = view(&screen).tree.size(trash);
+        go_to(&mut screen, "Videos");
+        press(&mut screen, KeyCode::Char(' '));
+        press(&mut screen, KeyCode::Char('t'));
+        let State::Confirm {
+            mut view, items, ..
+        } = std::mem::replace(&mut screen.state, State::NotStarted)
+        else {
+            panic!("not confirming");
+        };
+        let videos = view.tree.size(items[0].0);
+        view.forget(&items, &[outcome("~/Videos", None)]);
+        assert_eq!(view.tree.size(trash), before + videos);
+        assert!(view.tree.find(&home.path().join("Videos")).is_none());
+    }
+
+    /// [`home_screen`], with a trash folder that holds something already.
+    fn home_screen_with_trash() -> (TestDir, Screen) {
+        let home = TestDir::new();
+        home.file("Videos/old.mkv", 30_000);
+        home.file(".local/share/Trash/files/old.txt", 10);
+        let tree = scan::scan(
+            home.path(),
+            &MountTable::default(),
+            false,
+            home.path(),
+            &Progress::default(),
+        );
+        let picker = Ok(Picker::with_mounts(
+            home.path(),
+            crate::disk::Mounts::default(),
+        ));
+        let view = View::new(tree, home.path().into(), picker);
+        (home, Screen::with_view(view))
     }
 
     #[test]

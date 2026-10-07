@@ -64,6 +64,15 @@ impl Mounts {
         self.points.contains(path)
     }
 
+    /// The mount point of the filesystem `path` is on, as far as the mount points tell.
+    pub fn containing(&self, path: &Path) -> Option<&Path> {
+        self.points
+            .iter()
+            .filter(|point| path.starts_with(point))
+            .max_by_key(|point| point.components().count())
+            .map(PathBuf::as_path)
+    }
+
     /// Whether a bind mount shows `path` at another path too.
     pub fn is_bound(&self, path: &Path) -> bool {
         self.bound.iter().any(|bound| bound == path)
@@ -322,6 +331,11 @@ mod tests {
         assert!(mounts.contains(Path::new("/home/me/.cache/bind")));
         assert!(!mounts.contains(Path::new("/home/me/.cache")));
         assert!(mounts.any_inside(Path::new("/home/me/.cache")));
+        assert_eq!(
+            mounts.containing(Path::new("/home/me/.cache/bind/x")),
+            Some(Path::new("/home/me/.cache/bind"))
+        );
+        assert_eq!(mounts.containing(Path::new("/home/me")), None);
         assert!(!mounts.any_inside(Path::new("/home/me/.cache/bind")));
         assert!(!mounts.any_inside(Path::new("/home/me/.cach")));
     }

@@ -461,9 +461,7 @@ fn draw_confirm(
         lines.push(Line::from(
             "They stay in the trash, where your file manager can put them back.",
         ));
-        lines.push(Line::from(
-            "The space is freed when the trash is emptied; vole clean empties it.",
-        ));
+        lines.push(Line::from("The space is freed when the trash is emptied."));
     }
     lines.push(Line::default());
     for (_, item) in items {
@@ -1504,7 +1502,7 @@ mod tests {
         assert!(!screen.can_leave());
         let rows = render(&mut screen, 80, 10).join("\n");
         assert!(rows.contains("Move this Item ("), "{rows}");
-        assert!(rows.contains("vole clean empties it."), "{rows}");
+        assert!(rows.contains("freed when the trash is emptied."), "{rows}");
         assert!(rows.contains(") to the trash?"), "{rows}");
         assert!(rows.contains("~/Videos"), "{rows}");
         // Back keeps the selection.

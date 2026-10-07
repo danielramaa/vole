@@ -28,10 +28,19 @@ const THREADS: usize = 16;
 
 const POISONED: &str = "a scanning thread panicked";
 
-/// Walks everything under `root` into a [`Tree`], going into the mounts on the same disk, and on
-/// `other_disks` too when asked. The folders vole may not read are left out.
-pub fn scan(root: &Path, mounts: &MountTable, other_disks: bool, progress: &Progress) -> Tree {
+/// Walks everything under `root` into a [`Tree`], going into the mounts on the same disk, on
+/// `other_disks` too when asked, and always into the `home` folder, wherever it is mounted from,
+/// unless that is a network share. The folders vole may not read are left out.
+pub fn scan(
+    root: &Path,
+    mounts: &MountTable,
+    other_disks: bool,
+    home: &Path,
+    progress: &Progress,
+) -> Tree {
     let meta = fs::symlink_metadata(root).ok();
+    let mut scanned = mounts.scanned(other_disks);
+    scanned.push(home.to_path_buf());
     let walk = Walk {
         tree: Mutex::new(Tree::new(
             root.to_path_buf(),
@@ -46,10 +55,11 @@ pub fn scan(root: &Path, mounts: &MountTable, other_disks: bool, progress: &Prog
             reading: 0,
         }),
         wake: Condvar::new(),
-        counted: Counted::default(),
+        counted: Counted::new(home),
         mounts,
         other_disks,
-        scanned: mounts.scanned(other_disks),
+        home: home.to_path_buf(),
+        scanned,
         progress,
     };
     if let Some(meta) = &meta {
@@ -75,7 +85,8 @@ struct Walk<'a> {
     mounts: &'a MountTable,
     /// Whether the mounts of other disks are scanned too.
     other_disks: bool,
-    /// The mount points scanned.
+    home: PathBuf,
+    /// The mount points scanned, and the home folder.
     scanned: Vec<PathBuf>,
     progress: &'a Progress,
 }
@@ -170,9 +181,12 @@ impl Walk<'_> {
                 .is_ok_and(|kind| kind.is_dir())
                 .then(|| folder.path.join(&name));
             let mount = path.as_ref().and_then(|path| self.mounts.get(path));
+            let is_home = path.as_deref() == Some(self.home.as_path());
             let walked = match mount {
-                Some(mount) => mount.is_scanned(self.other_disks),
-                None => !folder.through,
+                Some(mount) => {
+                    mount.is_scanned(self.other_disks) || (is_home && mount != Mount::Network)
+                }
+                None => !folder.through || is_home,
             };
             if !walked {
                 // Passed through when scanned mounts are inside, but never a network share.
@@ -212,17 +226,19 @@ impl Walk<'_> {
             let mut size = meta.blocks() * 512;
             let mut unwalked = None;
             let mut linked = false;
-            // Counted where the walk reaches it first.
-            if kind == Kind::Dir && !self.counted.first_time(&meta) {
+            let dir = (kind == Kind::Dir).then(|| path.unwrap_or_else(|| folder.path.join(&name)));
+            // Counted where the walk reaches it first, and the home folder at its own path.
+            if let Some(dir) = &dir
+                && (self.counted.is_home_elsewhere(&meta, dir) || !self.counted.first_time(&meta))
+            {
                 unwalked = Some(Unwalked::Elsewhere);
                 size = 0;
             } else if kind != Kind::Dir && meta.nlink() > 1 && !self.counted.first_time(&meta) {
                 linked = true;
                 size = 0;
             }
-            if kind == Kind::Dir && unwalked.is_none() {
-                let path = path.unwrap_or_else(|| folder.path.join(&name));
-                folders.push((entries.len(), path, false));
+            if let Some(dir) = dir.filter(|_| unwalked.is_none()) {
+                folders.push((entries.len(), dir, false));
             }
             bytes += size;
             entries.push(Entry {
@@ -263,13 +279,36 @@ impl Walk<'_> {
 /// The folders, and the files with several hard links, the walk has counted: by device and inode,
 /// since a bind mount shows a folder at a second path, and a hard link shows a file.
 #[derive(Default)]
-struct Counted(Mutex<HashSet<(u64, u64)>>);
+struct Counted {
+    seen: Mutex<HashSet<(u64, u64)>>,
+    /// The home folder's device and inode, and its path: it is counted there, whatever path the
+    /// walk reaches first, as when systemd-homed bind-mounts /home/me.homedir at /home/me.
+    home: Option<((u64, u64), PathBuf)>,
+}
 
 impl Counted {
+    fn new(home: &Path) -> Self {
+        let home = fs::symlink_metadata(home)
+            .ok()
+            .map(|meta| ((meta.dev(), meta.ino()), home.to_path_buf()));
+        Self {
+            seen: Mutex::default(),
+            home,
+        }
+    }
+
     /// Whether this is the first time the walk reaches what `meta` is about.
     fn first_time(&self, meta: &Metadata) -> bool {
-        let mut counted = self.0.lock().expect(POISONED);
-        counted.insert((meta.dev(), meta.ino()))
+        let mut seen = self.seen.lock().expect(POISONED);
+        seen.insert((meta.dev(), meta.ino()))
+    }
+
+    /// Whether the folder at `path`, which `meta` is about, is the home folder reached at another
+    /// path.
+    fn is_home_elsewhere(&self, meta: &Metadata, path: &Path) -> bool {
+        self.home
+            .as_ref()
+            .is_some_and(|(home, at)| *home == (meta.dev(), meta.ino()) && path != at)
     }
 }
 
@@ -294,8 +333,17 @@ mod tests {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 
+    /// Where tests that don't need a home folder have it: nowhere.
+    const NO_HOME: &str = "/nonexistent-home";
+
     fn scan_dir(dir: &TestDir, mounts: &MountTable) -> Tree {
-        scan(dir.path(), mounts, false, &Progress::default())
+        scan(
+            dir.path(),
+            mounts,
+            false,
+            Path::new(NO_HOME),
+            &Progress::default(),
+        )
     }
 
     /// The id of `relative` in `tree`, found by name from the root.
@@ -318,7 +366,13 @@ mod tests {
         dir.file("a/b/two", 100_000);
         dir.file("three", 1);
         let progress = Progress::default();
-        let tree = scan(dir.path(), &MountTable::default(), false, &progress);
+        let tree = scan(
+            dir.path(),
+            &MountTable::default(),
+            false,
+            Path::new(NO_HOME),
+            &progress,
+        );
         let usage = |path: &Path| disk::disk_usage(path, &Mounts::default());
         assert_eq!(tree.size(ROOT), usage(dir.path()));
         assert_eq!(tree.size(find(&tree, "a")), usage(&dir.path().join("a")));
@@ -386,7 +440,13 @@ mod tests {
             (data, Mount::OtherDisk),
             (nas, Mount::Network),
         ]);
-        let tree = scan(dir.path(), &mounts, true, &Progress::default());
+        let tree = scan(
+            dir.path(),
+            &mounts,
+            true,
+            Path::new(NO_HOME),
+            &Progress::default(),
+        );
         assert!(tree.size(find(&tree, "mnt/data/big")) > 0);
         assert!(tree.size(find(&tree, "run/media/me/STICK/photo.jpg")) > 0);
         // /run is only passed through: none of its own files are in the tree.
@@ -405,7 +465,7 @@ mod tests {
             Some(Unwalked::Mount(Mount::Network))
         );
         // Without other disks, /run is left out whole.
-        let tree = scan(dir.path(), &mounts, false, &Progress::default());
+        let tree = scan_dir(&dir, &mounts);
         assert_eq!(
             tree.unwalked(find(&tree, "run")),
             Some(Unwalked::Mount(Mount::NotADisk))
@@ -417,6 +477,36 @@ mod tests {
     }
 
     #[test]
+    fn always_scans_the_home_folder_but_not_on_a_network_share() {
+        let dir = TestDir::new();
+        // /home on a second disk, with two users' folders.
+        let homes = dir.dir("home");
+        let me = dir.dir("home/me");
+        dir.file("home/me/notes", 100);
+        dir.file("home/other/big", 100_000);
+        let mounts = MountTable::from_mounts([(homes, Mount::OtherDisk)]);
+        let tree = scan(dir.path(), &mounts, false, &me, &Progress::default());
+        assert!(tree.size(find(&tree, "home/me/notes")) > 0);
+        let homes = find(&tree, "home");
+        let names: Vec<_> = tree
+            .largest_first(homes)
+            .into_iter()
+            .map(|id| tree.name(id))
+            .collect();
+        assert_eq!(names, ["me"]);
+        // A home folder that isn't on a disk of its own, as systemd-homed's LUKS image, but not
+        // one on a network share.
+        for (mount, scanned) in [(Mount::NotADisk, true), (Mount::Network, false)] {
+            let dir = TestDir::new();
+            let me = dir.dir("me");
+            dir.file("me/notes", 100);
+            let mounts = MountTable::from_mounts([(me.clone(), mount)]);
+            let tree = scan(dir.path(), &mounts, false, &me, &Progress::default());
+            assert_eq!(tree.can_open(find(&tree, "me")), scanned, "{mount:?}");
+        }
+    }
+
+    #[test]
     fn counts_a_folder_reached_twice_once() {
         let dir = TestDir::new();
         let meta = fs::symlink_metadata(dir.dir("a")).unwrap();
@@ -424,6 +514,11 @@ mod tests {
         let counted = Counted::default();
         assert!(counted.first_time(&meta));
         assert!(!counted.first_time(&meta));
+        // The home folder is counted at its own path, whichever comes first.
+        let home = dir.path().join("a");
+        let counted = Counted::new(&home);
+        assert!(counted.is_home_elsewhere(&meta, &dir.path().join("a.homedir")));
+        assert!(!counted.is_home_elsewhere(&meta, &home));
         let tree = scan_dir(&dir, &MountTable::default());
         assert_eq!(tree.unwalked(find(&tree, "a")), None);
     }

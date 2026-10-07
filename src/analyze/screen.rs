@@ -123,7 +123,13 @@ impl Screen {
             // Without the mount points, the walk would go into other disks and into /proc.
             let scanned = MountTable::load()
                 .map(|mounts| {
-                    let tree = scan::scan(Path::new(SCANNED), &mounts, other_disks, &counting);
+                    let tree = scan::scan(
+                        Path::new(SCANNED),
+                        &mounts,
+                        other_disks,
+                        &picking,
+                        &counting,
+                    );
                     (tree, Picker::load(&picking, &config))
                 })
                 .map_err(|err| {
@@ -597,6 +603,22 @@ impl View {
             .any(|id| self.selected.contains(&id))
     }
 
+    /// Why the home folder can't be opened, when the scan found it as `home` or not at all.
+    fn why_not_home(&self, home: Option<Id>) -> &'static str {
+        // What the walk stopped at, on the way to it.
+        let stop = home.or_else(|| {
+            let mut above = self.home.ancestors().skip(1);
+            above.find_map(|folder| self.tree.find(folder))
+        });
+        match stop.and_then(|id| self.tree.unwalked(id)) {
+            Some(Unwalked::Mount(Mount::Network)) => {
+                "Your home folder is on a network share, which vole doesn't look into."
+            }
+            Some(Unwalked::Unreadable) => "vole may not read your home folder.",
+            _ => "Your home folder isn't in the scan.",
+        }
+    }
+
     /// Selects or deselects `id`, when it may be picked; else says why not.
     fn toggle(&mut self, id: Id) {
         if let Some(index) = self.selected.iter().position(|&selected| selected == id) {
@@ -717,12 +739,7 @@ impl View {
             KeyCode::Char('~') => {
                 match self.tree.find(&self.home) {
                     Some(home) if self.tree.can_open(home) => self.open(home, None),
-                    _ => {
-                        self.flash = Some(
-                            "Your home folder isn't in the scan; when it is on another disk, o scans that too."
-                                .into(),
-                        );
-                    }
+                    home => self.flash = Some(self.why_not_home(home).into()),
                 }
                 return true;
             }
@@ -1313,6 +1330,7 @@ mod tests {
             home.path(),
             &MountTable::default(),
             false,
+            home.path(),
             &Progress::default(),
         );
         let picker = Picker::load(home.path(), &Config::default());
@@ -1408,6 +1426,7 @@ mod tests {
             outer.path(),
             &MountTable::default(),
             false,
+            &home,
             &Progress::default(),
         );
         let picker = Picker::load(&home, &Config::default());
@@ -1428,6 +1447,7 @@ mod tests {
             home.path(),
             &MountTable::default(),
             false,
+            home.path(),
             &Progress::default(),
         );
         let picker = Picker::load(home.path(), &Config::default());
@@ -1443,7 +1463,13 @@ mod tests {
         home.file("data/usb/photo.jpg", 100);
         home.file("notes", 10);
         let table = MountTable::from_mounts([(usb.clone(), Mount::UsbDisk)]);
-        let tree = scan::scan(home.path(), &table, false, &Progress::default());
+        let tree = scan::scan(
+            home.path(),
+            &table,
+            false,
+            home.path(),
+            &Progress::default(),
+        );
         let picker = Picker::with_mounts(home.path(), crate::disk::Mounts::from_paths([usb]));
         let view = View::new(tree, home.path().into(), Ok(picker));
         let mut screen = Screen::with_view(view);
@@ -1468,6 +1494,7 @@ mod tests {
             home.path(),
             &MountTable::default(),
             false,
+            home.path(),
             &Progress::default(),
         );
         let picker = Picker::load(home.path(), &Config::default());
@@ -1649,10 +1676,22 @@ mod tests {
         assert!(press(&mut screen, KeyCode::Char('~')));
         assert_eq!(view(&screen).dir, me);
         assert_eq!(rows(&screen).0, ["notes"]);
-        // Not in the scan, as when it is on another disk.
+        // Not in the scan.
         let mut screen = screen_of(Tree::new("/".into(), 0), "/home/me");
         press(&mut screen, KeyCode::Char('~'));
-        assert!(flash(&screen).starts_with("Your home folder isn't in the scan"));
+        assert_eq!(flash(&screen), "Your home folder isn't in the scan.");
+        // On a network share.
+        let mut tree = Tree::new("/".into(), 0);
+        let mut nfs = entry("home", 0, Kind::Dir);
+        nfs.unwalked = Some(Unwalked::Mount(Mount::Network));
+        tree.add(ROOT, vec![nfs]);
+        let mut screen = screen_of(tree, "/home/me");
+        press(&mut screen, KeyCode::Char('~'));
+        assert!(
+            flash(&screen).contains("network share"),
+            "{}",
+            flash(&screen)
+        );
     }
 
     #[test]

@@ -1,5 +1,7 @@
 //! The path rules every module obeys: Allowed Roots, the Protected List and Sealed Paths.
 
+use std::env;
+use std::ffi::OsString;
 use std::fmt;
 use std::fs;
 use std::io;
@@ -27,10 +29,34 @@ const SEALED: &[&str] = &[
     ".kube",
     ".docker/config.json",
     ".terraform.d",
+    ".cargo/credentials",
+    ".cargo/credentials.toml",
+    ".config/gh/hosts.yml",
+    ".config/hub",
+    ".config/rclone/rclone.conf",
+    ".npmrc",
+    ".gem/credentials",
     ".bitcoin",
     ".electrum",
     ".ethereum",
     ".monero",
+];
+
+/// Where environment variables keep secrets instead: the variable, and the secret in the folder
+/// it names (empty for the folder itself).
+const SEALED_ELSEWHERE: &[(&str, &str)] = &[
+    ("GNUPGHOME", ""),
+    ("PASSWORD_STORE_DIR", ""),
+    ("XDG_DATA_HOME", "keyrings"),
+    ("XDG_DATA_HOME", "kwalletd"),
+    ("XDG_CONFIG_HOME", "gcloud"),
+    ("XDG_CONFIG_HOME", "gh/hosts.yml"),
+    ("XDG_CONFIG_HOME", "hub"),
+    ("XDG_CONFIG_HOME", "rclone/rclone.conf"),
+    ("GH_CONFIG_DIR", "hosts.yml"),
+    ("CARGO_HOME", "credentials"),
+    ("CARGO_HOME", "credentials.toml"),
+    ("DOCKER_CONFIG", "config.json"),
 ];
 
 /// Paths no module proposes on its own (relative to the home directory): browser and mail
@@ -114,7 +140,9 @@ impl Rules {
             sealed: Vec::new(),
         };
         rules.protected = rules.with_resolved(protected);
-        rules.sealed = rules.with_resolved(in_home(SEALED));
+        let mut sealed = in_home(SEALED);
+        sealed.extend(sealed_elsewhere(&|name| env::var_os(name)));
+        rules.sealed = rules.with_resolved(sealed);
         Ok(rules)
     }
 
@@ -218,6 +246,23 @@ impl Rules {
         }
         Some(expected.join(path.file_name()?))
     }
+}
+
+/// The secrets environment variables keep elsewhere, as `env` says (see [`SEALED_ELSEWHERE`]).
+/// Only absolute paths count.
+fn sealed_elsewhere(env: &dyn Fn(&str) -> Option<OsString>) -> Vec<PathBuf> {
+    SEALED_ELSEWHERE
+        .iter()
+        .filter_map(|&(name, secret)| {
+            let folder = PathBuf::from(env(name)?);
+            let path = if secret.is_empty() {
+                folder
+            } else {
+                folder.join(secret)
+            };
+            path.is_absolute().then_some(path)
+        })
+        .collect()
 }
 
 /// What a path is checked for.
@@ -340,6 +385,47 @@ mod tests {
         assert_eq!(
             rules.check(&home.path().join(".docker")),
             Err(Refusal::Sealed)
+        );
+    }
+
+    #[test]
+    fn tokens_of_developer_tools_are_sealed() {
+        let home = TestDir::new();
+        let rules = rules(&home, &[]).with_loose_dotfiles();
+        for path in [".npmrc", ".cargo/credentials.toml", ".config/gh/hosts.yml"] {
+            assert_eq!(
+                rules.check_picked(&home.path().join(path)),
+                Err(Refusal::Sealed),
+                "{path}"
+            );
+        }
+        // Their folders go with them; the rest of the cargo folder stays a cache.
+        assert_eq!(
+            rules.check_picked(&home.path().join(".config/gh")),
+            Err(Refusal::Sealed)
+        );
+        let registry = home.dir(".cargo/registry");
+        assert_eq!(rules.check_picked(&registry), Ok(registry));
+    }
+
+    #[test]
+    fn seals_secrets_where_the_environment_keeps_them() {
+        let env = |name: &str| -> Option<OsString> {
+            match name {
+                "GNUPGHOME" => Some("/h/.local/share/gnupg".into()),
+                "XDG_DATA_HOME" => Some("/h/.data".into()),
+                "CARGO_HOME" => Some("relative/cargo".into()),
+                _ => None,
+            }
+        };
+        let sealed = sealed_elsewhere(&env);
+        assert_eq!(
+            sealed,
+            [
+                PathBuf::from("/h/.local/share/gnupg"),
+                PathBuf::from("/h/.data/keyrings"),
+                PathBuf::from("/h/.data/kwalletd"),
+            ]
         );
     }
 

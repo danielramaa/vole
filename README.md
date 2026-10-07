@@ -86,7 +86,7 @@ vole deletes files, so safety comes first.
 - **Three layers of path rules:**
   - **Allowed Roots**: the only places modules look for things to propose.
   - **Protected List**: paths no module will ever propose, such as browser and mail profiles and your project folders. You can add your own.
-  - **Sealed Paths**: SSH and GPG keys, password stores and keyrings, credentials (`.netrc`, `.pgpass`, cloud and Kubernetes credentials, …) and crypto wallets. vole never removes these, not even by hand.
+  - **Sealed Paths**: SSH and GPG keys, password stores and keyrings, credentials (`.netrc`, `.pgpass`, cloud and Kubernetes credentials, the tokens of cargo, gh and npm, …) and crypto wallets, also where `GNUPGHOME`, `PASSWORD_STORE_DIR` or the XDG variables put them. vole never removes these, not even by hand.
 - **Everything is logged.** Every removed item is recorded in `~/.local/state/vole/log.jsonl`.
 - **Your projects are left alone.** vole has no module that deletes `node_modules` or `target/` automatically ([why](docs/adr/0002-no-purge-module.md)).
 

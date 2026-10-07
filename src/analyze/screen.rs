@@ -271,6 +271,14 @@ impl ModuleScreen for Screen {
         }
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
+            // Starting over, as when a disk that doesn't answer holds the scan up.
+            State::Scanning { progress, .. } if matches!(key.code, KeyCode::Char('o' | 'r')) => {
+                progress.stop.store(true, Ordering::Relaxed);
+                if key.code == KeyCode::Char('o') {
+                    self.other_disks = !self.other_disks;
+                }
+                (State::NotStarted, true)
+            }
             // Scanning again, with or without the other disks.
             State::Ready(_) if key.code == KeyCode::Char('o') => {
                 self.other_disks = !self.other_disks;
@@ -366,7 +374,8 @@ impl ModuleScreen for Screen {
             State::Trashing { .. } => "esc stop after this Item",
             State::Done { .. } => "↑↓ scroll · enter back to the list",
             State::Failed(_) => "enter scan again",
-            State::NotStarted | State::Scanning { .. } | State::Confirmed { .. } => "",
+            State::Scanning { .. } => "o other disks · r start over",
+            State::NotStarted | State::Confirmed { .. } => "",
         }
     }
 
@@ -1667,6 +1676,25 @@ mod tests {
         let mut again = super::tests::screen();
         assert!(press(&mut again, KeyCode::Char('r')));
         assert!(!again.other_disks && matches!(again.state, State::NotStarted));
+    }
+
+    #[test]
+    fn a_running_scan_starts_over() {
+        let (_sender, receiver) = mpsc::channel();
+        let progress = Arc::new(Progress::default());
+        let mut screen = Screen {
+            config: Config::default(),
+            other_disks: true,
+            state: State::Scanning {
+                receiver,
+                progress: Arc::clone(&progress),
+                home: "/home/me".into(),
+            },
+        };
+        assert_eq!(screen.hint(), "o other disks · r start over");
+        assert!(press(&mut screen, KeyCode::Char('o')));
+        assert!(progress.stop.load(Ordering::Relaxed));
+        assert!(!screen.other_disks && matches!(screen.state, State::NotStarted));
     }
 
     #[test]

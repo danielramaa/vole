@@ -177,8 +177,8 @@ In `analyze`:
 | `~` | Go to your home folder |
 | `Space` | Select or deselect the file or folder, inside your home folder. A folder takes what is in it along. |
 | `t` | Review the selection, then `y` to move it to the trash or `n` to go back. If something is in use by a running program, it takes `Y` (shift+y) on a second screen. While moving, `Esc` stops after the current one. |
-| `o` | Scan again with other disks too, or without them |
-| `r` | Scan again |
+| `o` | Scan again with other disks too, or without them, even while scanning (a disk that doesn't answer can hold a scan up) |
+| `r` | Scan again, or start over while scanning |
 
 ## Configuration
 

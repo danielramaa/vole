@@ -6,20 +6,22 @@ use std::fs::{self, Metadata};
 use std::io;
 use std::os::unix::fs::MetadataExt;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 
 use super::disks::{Mount, MountTable};
 use super::tree::{Entry, Id, Kind, ROOT, Tree, Unwalked};
 
-/// How far a scan has got, for the screen to show while it runs.
+/// How far a scan has got, for the screen to show while it runs, and how to stop it.
 #[derive(Debug, Default)]
 pub struct Progress {
     /// Files and folders found so far.
     pub found: AtomicU64,
     /// The space they use.
     pub bytes: AtomicU64,
+    /// Set to stop the scan: the folders not read yet are left alone.
+    pub stop: AtomicBool,
 }
 
 /// Folders read at once, at most. Reading mostly waits on the disk, which can take many requests
@@ -119,11 +121,12 @@ impl Drop for Read<'_, '_> {
             return;
         };
         queue.reading -= 1;
-        let last = queue.reading == 0 && queue.waiting.is_empty() && self.found.is_empty();
-        let found = !self.found.is_empty();
+        // With none left reading, the others either have folders to read, or are done; and once
+        // the scan is stopping, folders are left waiting.
+        let wake = !self.found.is_empty() || queue.reading == 0;
         queue.waiting.append(&mut self.found);
         drop(queue);
-        if found || last {
+        if wake {
             self.walk.wake.notify_all();
         }
     }
@@ -140,10 +143,13 @@ impl Walk<'_> {
         }
     }
 
-    /// The next folder to read; `None` once all are read.
+    /// The next folder to read; `None` once all are read, or when the scan is to stop.
     fn next(&self) -> Option<Folder> {
         let mut queue = self.queue.lock().expect(POISONED);
         loop {
+            if self.progress.stop.load(Ordering::Relaxed) {
+                return None;
+            }
             if let Some(folder) = queue.waiting.pop() {
                 queue.reading += 1;
                 return Some(folder);
@@ -384,6 +390,22 @@ mod tests {
         assert_eq!(tree.path(find(&tree, "a/b")), dir.path().join("a/b"));
         assert_eq!(tree.len(), 6);
         assert_eq!(progress.found.load(Ordering::Relaxed), 5);
+    }
+
+    #[test]
+    fn stops_when_asked() {
+        let dir = TestDir::new();
+        dir.file("a/b/c", 10);
+        let progress = Progress::default();
+        progress.stop.store(true, Ordering::Relaxed);
+        let tree = scan(
+            dir.path(),
+            &MountTable::default(),
+            false,
+            Path::new(NO_HOME),
+            &progress,
+        );
+        assert_eq!(tree.len(), 1);
     }
 
     #[test]

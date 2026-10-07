@@ -1,7 +1,9 @@
 //! How to free the space outside the home folder, where vole only shows what uses it: the tool
 //! that frees a known folder, or the package a path comes from.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 use crate::pacman::{self, Info};
 
@@ -93,16 +95,16 @@ const KNOWN: &[Known] = &[
 
 /// The tip for `path`, outside the home folder `home`, when no command has to run for it.
 pub fn known(path: &Path, home: &Path) -> Option<&'static str> {
+    known_with(path, home, other_homes())
+}
+
+/// [`known`], where `others` are the home folders of the system's other people.
+fn known_with(path: &Path, home: &Path, others: &[PathBuf]) -> Option<&'static str> {
     if path == home {
         return Some("Your home folder: open it to select what to move to the trash.");
     }
     if home.starts_with(path) {
         return Some("Your home folder is in here; ~ goes straight to it.");
-    }
-    if let Some(homes) = home.parent().filter(|homes| *homes != Path::new("/"))
-        && path.starts_with(homes)
-    {
-        return Some("Another user's home folder: only they, or root, can free this space.");
     }
     let relative = path.strip_prefix("/").ok()?;
     if let Some(known) = KNOWN
@@ -113,10 +115,42 @@ pub fn known(path: &Path, home: &Path) -> Option<&'static str> {
     }
     // What a folder holds may matter more than what it comes from: /var/cache/pacman is
     // pacman's, but its size is the package cache.
-    KNOWN
+    if let Some(holder) = KNOWN
         .iter()
         .filter(|known| Path::new(known.folder).parent() == Some(relative))
         .find_map(|known| known.holder)
+    {
+        return Some(holder);
+    }
+    others
+        .iter()
+        .any(|other| path.starts_with(other))
+        .then_some("Another user's home folder: only they, or root, can free this space.")
+}
+
+/// The home folders of the system's other people, and root's, from /etc/passwd, read once.
+fn other_homes() -> &'static [PathBuf] {
+    static HOMES: OnceLock<Vec<PathBuf>> = OnceLock::new();
+    HOMES.get_or_init(|| {
+        let passwd = fs::read_to_string("/etc/passwd").unwrap_or_default();
+        people_homes(&passwd, rustix::process::getuid().as_raw())
+    })
+}
+
+/// The home folders `passwd` gives root and the people other than the user `me`. System users
+/// are left out: their homes are often their programs' folders, like /var/lib/colord.
+fn people_homes(passwd: &str, me: u32) -> Vec<PathBuf> {
+    passwd
+        .lines()
+        .filter_map(|line| {
+            let fields: Vec<&str> = line.split(':').collect();
+            let uid: u32 = fields.get(2)?.parse().ok()?;
+            let home = Path::new(fields.get(5)?);
+            let person = uid == 0 || (1000..=60000).contains(&uid);
+            (person && uid != me && home.is_absolute() && home != Path::new("/"))
+                .then(|| home.to_path_buf())
+        })
+        .collect()
 }
 
 /// How to free `path` (a folder when `folder`), from what pacman says about it. pacman takes a
@@ -180,7 +214,11 @@ mod tests {
     const HOME: &str = "/home/me";
 
     fn known_tip(path: &str) -> Option<&'static str> {
-        known(Path::new(path), Path::new(HOME))
+        known_with(
+            Path::new(path),
+            Path::new(HOME),
+            &[PathBuf::from("/home/other")],
+        )
     }
 
     #[test]
@@ -233,8 +271,24 @@ mod tests {
                 .unwrap()
                 .starts_with("Another user's")
         );
-        // With the home folder right in /, nothing else in / is someone else's.
-        assert_eq!(known(Path::new("/opt"), Path::new("/me")), None);
+        // Not everything next to the home folder is someone else's.
+        assert_eq!(known_tip("/home/lost+found"), None);
+        assert_eq!(known_tip("/home/me.homedir"), None);
+    }
+
+    #[test]
+    fn reads_who_else_has_a_home_folder() {
+        let passwd = "\
+root:x:0:0::/root:/usr/bin/bash
+nobody:x:65534:65534:Kernel Overflow User:/:/usr/bin/nologin
+colord:x:977:977:Color management daemon:/var/lib/colord:/usr/bin/nologin
+me:x:1000:1000::/home/me:/usr/bin/zsh
+other:x:1001:1001::/data/other:/usr/bin/bash
+";
+        assert_eq!(
+            people_homes(passwd, 1000),
+            [PathBuf::from("/root"), PathBuf::from("/data/other")]
+        );
     }
 
     fn package(required_by: &[&str], dependency: bool, optional_for: &[&str]) -> Info {

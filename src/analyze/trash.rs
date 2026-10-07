@@ -3,6 +3,7 @@
 
 use std::fs;
 use std::io::ErrorKind;
+use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -37,14 +38,79 @@ pub struct Picked {
 pub struct Picker {
     rules: Rules,
     mounts: Mounts,
-    trash: PathBuf,
+    /// The desktop trash, wherever the XDG variables put it.
+    trashes: Vec<PathBuf>,
     /// vole's own folders: its config, its Backups and its Operation Log.
     own: Vec<PathBuf>,
+}
+
+/// Why an entry can never be picked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Kept {
+    /// A Sealed Path, or holds one.
+    Sealed,
+    Mount,
+    /// Holds a mount point: the trash would take the mounted disk along, and emptying it would
+    /// delete its files.
+    HoldsMount,
+    /// A trash folder: the desktop trash, or the one gio makes on another filesystem.
+    Trash,
+    InTrash,
+    /// One of vole's own folders, or in one.
+    Own,
+    HoldsOwn,
+}
+
+impl Kept {
+    /// Why it can't be picked, as words following its path.
+    pub fn why(self) -> &'static str {
+        match self {
+            Kept::Sealed => "is a sealed path",
+            Kept::Mount => "is a mount point",
+            Kept::HoldsMount => "holds a mount point",
+            Kept::Trash => "is a trash folder",
+            Kept::InTrash => "is in the trash already",
+            Kept::Own => "is vole's own",
+            Kept::HoldsOwn => "holds vole's own files",
+        }
+    }
+
+    /// A word or two for its row.
+    pub fn mark(self) -> &'static str {
+        match self {
+            Kept::Sealed => "sealed",
+            Kept::Mount => "mount point",
+            Kept::HoldsMount => "holds a mount point",
+            Kept::Trash => "trash",
+            Kept::InTrash => "in the trash",
+            Kept::Own => "vole's own",
+            Kept::HoldsOwn => "holds vole's own",
+        }
+    }
+
+    /// What to know about it, under the list.
+    pub fn note(self) -> &'static str {
+        match self {
+            Kept::Sealed => "A Sealed Path, or holds one: vole never removes it, even by hand.",
+            Kept::Mount => "A mount point: what is mounted doesn't go to the trash.",
+            Kept::HoldsMount => "Holds a mount point: the trash would take what is mounted along.",
+            Kept::Trash => "A trash folder: emptying it frees the space.",
+            Kept::InTrash => "In the trash already: emptying the trash frees the space.",
+            Kept::Own => "vole's own: its config, its Backups or its Operation Log.",
+            Kept::HoldsOwn => {
+                "Holds vole's own files: its config, its Backups or its Operation Log."
+            }
+        }
+    }
 }
 
 impl Picker {
     /// What may be picked in `home` (where it really is), with the mount points as they are now.
     pub fn load(home: &Path, config: &Config) -> Result<Self, String> {
+        // Everything would be in it.
+        if home.parent().is_none() {
+            return Err("the home folder is /".into());
+        }
         let rules = Rules::new(home, &[], &config.protected_paths(home))
             .map_err(|err| format!("resolving {}: {err}", home.display()))?;
         let mounts = Mounts::load()
@@ -70,15 +136,13 @@ impl Picker {
                 .flatten()
                 .map(|dir| dir.join("vole")),
         );
-        let own = own
-            .into_iter()
-            .map(|dir| fs::canonicalize(&dir).unwrap_or(dir))
-            .collect();
+        let mut trashes = vec![home.join(TRASH)];
+        trashes.extend(dirs::data_dir().map(|dir| dir.join("Trash")));
         Self {
             rules,
             mounts,
-            trash: home.join(TRASH),
-            own,
+            trashes: with_resolved(trashes),
+            own: with_resolved(own),
         }
     }
 
@@ -89,44 +153,69 @@ impl Picker {
             .rules
             .check_picked(path)
             .map_err(|refusal| format!("is {refusal}"))?;
-        if self.mounts.contains(&real) {
-            return Err("is a mount point".into());
+        match self.kept(&real) {
+            Some(kept) => Err(kept.why().into()),
+            None => Ok(real),
         }
-        // The trash would take the mounted disk along, and emptying it would delete its files.
-        if self.mounts.any_inside(&real) {
-            return Err("holds a mount point".into());
-        }
-        if real == self.trash {
-            return Err("is the trash itself".into());
-        }
-        if real.starts_with(&self.trash) {
-            return Err("is in the trash already".into());
-        }
-        if self.own.iter().any(|own| real.starts_with(own)) {
-            return Err("is vole's own".into());
-        }
-        if self.own.iter().any(|own| own.starts_with(&real)) {
-            return Err("holds vole's own files".into());
-        }
-        Ok(real)
     }
 
-    /// Whether moving `path` would move a Sealed Path.
-    pub fn is_sealed(&self, path: &Path) -> bool {
-        self.rules.is_sealed(path)
+    /// Why `path`, where it really is, can never be picked; `None` when it may be, as far as that
+    /// shows without looking at the disk.
+    pub fn kept(&self, path: &Path) -> Option<Kept> {
+        if self.rules.is_sealed(path) {
+            Some(Kept::Sealed)
+        } else if self.mounts.contains(path) {
+            Some(Kept::Mount)
+        } else if self.mounts.any_inside(path) {
+            Some(Kept::HoldsMount)
+        } else if let Some(trash) = self.trash_of(path) {
+            Some(if trash == path {
+                Kept::Trash
+            } else {
+                Kept::InTrash
+            })
+        } else if self.own.iter().any(|own| path.starts_with(own)) {
+            Some(Kept::Own)
+        } else if self.own.iter().any(|own| own.starts_with(path)) {
+            Some(Kept::HoldsOwn)
+        } else {
+            None
+        }
     }
 
-    pub fn is_mount(&self, path: &Path) -> bool {
-        self.mounts.contains(path)
-    }
-
-    pub fn holds_mount(&self, path: &Path) -> bool {
-        self.mounts.any_inside(path)
+    /// The trash folder `path` is in, or is: the desktop trash, or a `.Trash` or `.Trash-<uid>`
+    /// folder gio made at the top of another filesystem.
+    fn trash_of<'a>(&'a self, path: &'a Path) -> Option<&'a Path> {
+        if let Some(trash) = self.trashes.iter().find(|trash| path.starts_with(trash)) {
+            return Some(trash);
+        }
+        path.ancestors()
+            .filter(|folder| {
+                folder.file_name().is_some_and(|name| {
+                    let name = name.as_bytes();
+                    name == b".Trash" || name.starts_with(b".Trash-")
+                })
+            })
+            .last()
     }
 
     pub fn is_protected(&self, path: &Path) -> bool {
         self.rules.is_protected(path)
     }
+}
+
+/// `paths` both as written and where they really are, so a symlink can't hide one.
+fn with_resolved(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut all = Vec::new();
+    for path in paths {
+        if let Ok(real) = fs::canonicalize(&path)
+            && real != path
+        {
+            all.push(real);
+        }
+        all.push(path);
+    }
+    all
 }
 
 /// Flags the Items held by running programs now; flags set already stay.
@@ -300,7 +389,7 @@ mod tests {
         assert_eq!(home.why(".ssh").as_deref(), Some("is a sealed path"));
         assert_eq!(
             home.why(".local/share/Trash").as_deref(),
-            Some("is the trash itself")
+            Some("is a trash folder")
         );
         assert_eq!(
             home.why(".local/share/Trash/files/a").as_deref(),
@@ -312,8 +401,36 @@ mod tests {
             Some("holds vole's own files")
         );
         let picker = home.picker(Mounts::default());
-        assert!(picker.is_sealed(&home.dir.path().join(".ssh")));
+        assert_eq!(
+            picker.kept(&home.dir.path().join(".ssh")),
+            Some(Kept::Sealed)
+        );
         assert!(picker.is_protected(&home.dir.path().join("projects/app")));
+    }
+
+    #[test]
+    fn knows_the_trash_of_other_filesystems_and_linked_vole_folders() {
+        let home = home();
+        home.dir.file("data/.Trash-1000/files/old.iso", 1);
+        // A vole config folder kept with the user's other dotfiles, and linked into place.
+        let dotfiles = home.dir.dir("dotfiles/vole");
+        home.dir.symlink(".config/vole", &dotfiles);
+        assert_eq!(
+            home.why("data/.Trash-1000").as_deref(),
+            Some("is a trash folder")
+        );
+        assert_eq!(
+            home.why("data/.Trash-1000/files/old.iso").as_deref(),
+            Some("is in the trash already")
+        );
+        assert_eq!(home.why("data"), None);
+        assert_eq!(home.why(".config/vole").as_deref(), Some("is vole's own"));
+        assert_eq!(home.why("dotfiles/vole").as_deref(), Some("is vole's own"));
+    }
+
+    #[test]
+    fn nothing_is_picked_when_home_is_root() {
+        assert!(Picker::load(Path::new("/"), &Config::default()).is_err());
     }
 
     #[test]

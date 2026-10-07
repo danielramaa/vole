@@ -21,7 +21,7 @@ use ratatui::widgets::{Block, List, ListState, Paragraph};
 use super::disks::{Mount, MountTable};
 use super::scan::{self, Progress};
 use super::tip;
-use super::trash::{self, GIO, Gio, Picked, Picker};
+use super::trash::{self, GIO, Gio, Kept, Picked, Picker};
 use super::tree::{Id, Kind, ROOT, Tree, Unwalked};
 use crate::app::ModuleScreen;
 use crate::config::Config;
@@ -803,7 +803,7 @@ impl View {
         let path = tree.path(id);
         let outside = self.is_outside_home(&path);
         let kept = if outside { None } else { self.kept(&path) };
-        let check = if outside || kept.is_some() {
+        let check = if outside || kept.is_some() || self.picker.is_err() {
             "    "
         } else if self.is_selected(id) {
             "[x] "
@@ -821,13 +821,10 @@ impl View {
         if tree.kind(id) == Kind::Dir {
             name.push('/');
         }
+        // That it is sealed comes first.
         let mark = match kept {
-            Some(Kept::Sealed) => Some("sealed"),
-            kept => self.mark(id).or(kept.map(|kept| match kept {
-                Kept::Sealed => "sealed",
-                Kept::Mount => "mount point",
-                Kept::HoldsMount => "holds a mount point",
-            })),
+            Some(Kept::Sealed) => Some(Kept::Sealed.mark()),
+            kept => self.mark(id).or(kept.map(Kept::mark)),
         };
         let mark = mark.map(|mark| format!("  {mark}"));
         // Long names are cut, so the size always shows.
@@ -844,16 +841,7 @@ impl View {
     /// Why `path`, in the home folder, can never be picked, when that shows without looking at
     /// the disk.
     fn kept(&self, path: &Path) -> Option<Kept> {
-        let picker = self.picker.as_ref().ok()?;
-        if picker.is_sealed(path) {
-            Some(Kept::Sealed)
-        } else if picker.is_mount(path) {
-            Some(Kept::Mount)
-        } else if picker.holds_mount(path) {
-            Some(Kept::HoldsMount)
-        } else {
-            None
-        }
+        self.picker.as_ref().ok()?.kept(path)
     }
 
     /// `id`'s size, as "at least" when something in it couldn't be read.
@@ -930,21 +918,8 @@ impl View {
             Some(Unwalked::Unreadable) | None => {}
         }
         if let Ok(picker) = &self.picker {
-            match self.kept(&path) {
-                Some(Kept::Sealed) => {
-                    return Some(
-                        "A Sealed Path, or holds one: vole never removes it, even by hand.",
-                    );
-                }
-                Some(Kept::Mount) => {
-                    return Some("A mount point: what is mounted doesn't go to the trash.");
-                }
-                Some(Kept::HoldsMount) => {
-                    return Some(
-                        "Holds a mount point: the trash would take what is mounted along.",
-                    );
-                }
-                None => {}
+            if let Some(kept) = picker.kept(&path) {
+                return Some(kept.note());
             }
             if picker.is_protected(&path) {
                 return Some(
@@ -964,14 +939,6 @@ impl View {
         (self.tree.kind(id) == Kind::Symlink)
             .then_some("A symlink: what it points to is counted where it is.")
     }
-}
-
-/// Why an entry in the home folder can never be picked.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Kept {
-    Sealed,
-    Mount,
-    HoldsMount,
 }
 
 /// `part`'s share of `whole`, out of `scale`.
@@ -1489,6 +1456,29 @@ mod tests {
         press(&mut screen, KeyCode::Char('l'));
         let rows = render(&mut screen, 80, 8).join("\n");
         assert!(rows.contains("    usb/  USB disk"), "{rows}");
+    }
+
+    #[test]
+    fn the_trash_and_voles_folders_have_no_box() {
+        let home = TestDir::new();
+        home.file(".local/share/Trash/files/old.iso", 10);
+        home.file(".local/share/vole/backups/x", 10);
+        home.file(".local/share/app/data", 10);
+        let tree = scan::scan(
+            home.path(),
+            &MountTable::default(),
+            false,
+            &Progress::default(),
+        );
+        let picker = Picker::load(home.path(), &Config::default());
+        let mut view = View::new(tree, home.path().into(), picker);
+        let share = view.tree.find(&home.path().join(".local/share")).unwrap();
+        view.open(share, None);
+        let mut screen = Screen::with_view(view);
+        let rows = render(&mut screen, 80, 8).join("\n");
+        assert!(rows.contains("    Trash/  trash"), "{rows}");
+        assert!(rows.contains("    vole/  vole's own"), "{rows}");
+        assert!(rows.contains("[ ] app/"), "{rows}");
     }
 
     #[test]

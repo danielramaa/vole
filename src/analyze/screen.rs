@@ -316,7 +316,10 @@ impl ModuleScreen for Screen {
                 in_use,
                 ..
             } if key.code == KeyCode::Char(if in_use { 'Y' } else { 'y' }) => {
-                trash::mark_in_use(items.iter_mut().map(|(_, item)| item));
+                // Once In Use Items are confirmed with Y, there is nothing more to ask.
+                if !in_use {
+                    trash::mark_in_use(items.iter_mut().map(|(_, item)| item));
+                }
                 if !in_use && items.iter().any(|(_, item)| item.in_use) {
                     let confirm = State::Confirm {
                         view,

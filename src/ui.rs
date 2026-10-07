@@ -10,6 +10,14 @@ use ratatui::widgets::{Block, Paragraph};
 use crate::log::{MovedTo, Outcome};
 use crate::size;
 
+/// `text` with control characters, which would break a line, shown as `?`: file names may hold
+/// them.
+pub fn printable(text: &str) -> String {
+    text.chars()
+        .map(|c| if c.is_control() { '?' } else { c })
+        .collect()
+}
+
 /// `spans` on the left, `right` at the right edge of `width`.
 pub fn right_aligned(mut spans: Vec<Span<'static>>, right: String, width: usize) -> Line<'static> {
     // Terminal columns, not chars: wide characters take two.
@@ -99,15 +107,16 @@ pub fn outcome_lines(outcomes: &[Outcome], width: usize) -> Vec<Line<'static>> {
                     Some(MovedTo::Trash) => " → trash",
                     None => "",
                 };
+                let label = printable(&outcome.label);
                 lines.push(right_aligned(
-                    vec![Span::raw(format!("  ✓ {}{to}", outcome.label))],
+                    vec![Span::raw(format!("  ✓ {label}{to}"))],
                     size::format(outcome.size),
                     width,
                 ))
             }
             Some(err) => {
-                lines.push(Line::from(format!("  ✗ {}", outcome.label)));
-                lines.push(Line::styled(format!("      {err}"), dim));
+                lines.push(Line::from(format!("  ✗ {}", printable(&outcome.label))));
+                lines.push(Line::styled(format!("      {}", printable(err)), dim));
             }
         }
         if let Some(err) = &outcome.log_error {
@@ -166,6 +175,13 @@ mod tests {
         let text = render(&[outcome("~/a.iso", 2048, None, Some(MovedTo::Trash))]);
         assert!(text.contains("Moved 2.0 KiB to the trash"), "{text}");
         assert!(text.contains("✓ ~/a.iso → trash"));
+    }
+
+    #[test]
+    fn odd_names_stay_on_one_line() {
+        let text = render(&[outcome("~/a\nb", 1, Some("~/a\nb: gone"), None)]);
+        assert!(text.contains("✗ ~/a?b"), "{text}");
+        assert!(text.contains("~/a?b: gone"), "{text}");
     }
 
     #[test]

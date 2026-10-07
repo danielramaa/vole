@@ -26,8 +26,9 @@ use super::tree::{Id, Kind, ROOT, Tree, Unwalked};
 use crate::app::ModuleScreen;
 use crate::config::Config;
 use crate::log::{Log, Outcome};
+use crate::size;
 use crate::term::RunRoot;
-use crate::{size, ui};
+use crate::ui::{self, printable};
 
 /// Where the scan starts: the whole filesystem.
 const SCANNED: &str = "/";
@@ -432,6 +433,7 @@ impl ModuleScreen for Screen {
                 frame.render_widget(Paragraph::new("Moving to the trash…").block(block), area)
             }
             State::Trashing { now, stop, .. } => {
+                let now = printable(now);
                 let text = if stop.load(Ordering::Relaxed) {
                     format!("Stopping after {now}…")
                 } else {
@@ -480,7 +482,7 @@ fn draw_confirm(
     }
     lines.push(Line::default());
     for (_, item) in items {
-        let mut spans = vec![Span::raw(format!("  {}", item.label))];
+        let mut spans = vec![Span::raw(format!("  {}", printable(&item.label)))];
         if item.in_use {
             spans.push(Span::styled("  in use", bold));
         }
@@ -682,8 +684,7 @@ impl View {
             .map(|&id| {
                 let item = Picked {
                     path: self.tree.path(id),
-                    // Shown on the screens, where control characters would break the lines.
-                    label: printable(&self.label(id)),
+                    label: self.label(id),
                     size: self.tree.size(id),
                     in_use: false,
                 };
@@ -992,13 +993,6 @@ fn bar(size: u64, total: u64) -> String {
     let cells = eighths.div_ceil(8);
     bar.push_str(&" ".repeat(BAR - cells));
     bar
-}
-
-/// `name` with control characters, which would break the row, shown as `?`.
-fn printable(name: &str) -> String {
-    name.chars()
-        .map(|c| if c.is_control() { '?' } else { c })
-        .collect()
 }
 
 /// `text` cut to `width` columns, ending with … where it was cut.
@@ -1327,7 +1321,6 @@ mod tests {
         assert_eq!(fit("abcdef", 4), "abc…");
         assert_eq!(fit("日本語", 4), "日…");
         assert_eq!(fit_start("/home/me/Videos", 8), "…/Videos");
-        assert_eq!(printable("a\nb"), "a?b");
         assert_eq!(count(999), "999");
         assert_eq!(count(1000), "1,000");
         assert_eq!(bar(1, 1), "█".repeat(BAR));
@@ -1469,7 +1462,11 @@ mod tests {
         let picker = Picker::load(home.path(), &Config::default());
         let mut screen = Screen::with_view(View::new(tree, home.path().into(), picker));
         press(&mut screen, KeyCode::Char(' '));
-        assert_eq!(view(&screen).picked()[0].1.label, "~/a?b");
+        // Exact for the Operation Log, cleaned up on screen.
+        assert_eq!(view(&screen).picked()[0].1.label, "~/a\nb");
+        press(&mut screen, KeyCode::Char('t'));
+        let rows = render(&mut screen, 70, 8).join("\n");
+        assert!(rows.contains("  ~/a?b "), "{rows}");
     }
 
     #[test]

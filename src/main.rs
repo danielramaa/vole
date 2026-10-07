@@ -1,3 +1,4 @@
+mod analyze;
 mod app;
 mod clean;
 mod config;
@@ -6,6 +7,7 @@ mod disk;
 mod in_use;
 mod log;
 mod orphans;
+mod pacman;
 mod safety;
 mod size;
 mod term;

@@ -19,13 +19,13 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::backup::{BACKUPS, OLD_DAYS, OldBackup};
 use super::configs::{Confidence, OrphanedConfig, PackageOwned};
-use super::pacman::{ConfigFile, FileState};
 use super::plan::{Package, Plan};
 use super::{build_plan, refresh_in_use, remove, rules};
 use crate::app::ModuleScreen;
 use crate::config::Config;
 use crate::disk::Mounts;
 use crate::log::{Log, Outcome};
+use crate::pacman::{ConfigFile, FileState};
 use crate::safety::Rules;
 use crate::term::RunRoot;
 use crate::{size, ui};
@@ -1239,7 +1239,7 @@ mod tests {
             size: 1,
             error: error.map(String::from),
             log_error: None,
-            moved: false,
+            moved: None,
         };
         let removed = [outcome("htop", None), outcome("failed", Some("no"))];
         let leftovers = left_behind(&plan, &removed);

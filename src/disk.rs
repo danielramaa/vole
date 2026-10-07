@@ -15,9 +15,14 @@ pub fn is_real_dir(path: &Path) -> bool {
     fs::symlink_metadata(path).is_ok_and(|meta| meta.is_dir())
 }
 
-/// Every mount point, bind mounts included, from `/proc/self/mountinfo`.
+/// Every mount point, bind mounts included, from `/proc/self/mountinfo`, and the folders bind
+/// mounts show elsewhere.
 #[derive(Default)]
-pub struct Mounts(HashSet<PathBuf>);
+pub struct Mounts {
+    points: HashSet<PathBuf>,
+    /// Folders a bind mount shows at another path too.
+    bound: Vec<PathBuf>,
+}
 
 impl Mounts {
     pub fn load() -> io::Result<Self> {
@@ -25,27 +30,74 @@ impl Mounts {
     }
 
     fn parse(mountinfo: &str) -> Self {
-        Self(
-            mountinfo
-                .lines()
-                .filter_map(|line| line.split(' ').nth(4))
-                .map(unescape_octal)
-                .collect(),
-        )
+        // (device, the folder of its filesystem shown, mount point)
+        let mounts: Vec<(&str, PathBuf, PathBuf)> = mountinfo
+            .lines()
+            .filter_map(|line| {
+                let mut fields = line.split(' ').skip(2);
+                let device = fields.next()?;
+                let root = unescape_octal(fields.next()?);
+                let point = unescape_octal(fields.next()?);
+                Some((device, root, point))
+            })
+            .collect();
+        // A bind mount shows a folder of a filesystem mounted elsewhere too: where that mount
+        // shows it is the folder it comes from.
+        let mut bound = Vec::new();
+        for (device, root, _) in &mounts {
+            for (other_device, other_root, other_point) in &mounts {
+                if other_device == device
+                    && let Ok(rest) = root.strip_prefix(other_root)
+                    && !rest.as_os_str().is_empty()
+                {
+                    bound.push(other_point.join(rest));
+                }
+            }
+        }
+        Self {
+            points: mounts.into_iter().map(|(_, _, point)| point).collect(),
+            bound,
+        }
     }
 
     pub fn contains(&self, path: &Path) -> bool {
-        self.0.contains(path)
+        self.points.contains(path)
+    }
+
+    /// The mount point of the filesystem `path` is on, as far as the mount points tell.
+    pub fn containing(&self, path: &Path) -> Option<&Path> {
+        self.points
+            .iter()
+            .filter(|point| path.starts_with(point))
+            .max_by_key(|point| point.components().count())
+            .map(PathBuf::as_path)
+    }
+
+    /// Whether a bind mount shows `path` at another path too.
+    pub fn is_bound(&self, path: &Path) -> bool {
+        self.bound.iter().any(|bound| bound == path)
+    }
+
+    /// Whether a mount point, or a folder a bind mount shows elsewhere, is somewhere inside
+    /// `path`.
+    pub fn any_inside(&self, path: &Path) -> bool {
+        self.points
+            .iter()
+            .chain(&self.bound)
+            .any(|mount| mount != path && mount.starts_with(path))
     }
 
     #[cfg(test)]
     pub fn from_paths(paths: impl IntoIterator<Item = PathBuf>) -> Self {
-        Self(paths.into_iter().collect())
+        Self {
+            points: paths.into_iter().collect(),
+            bound: Vec::new(),
+        }
     }
 }
 
 /// Decodes the `\040`-style escapes mountinfo uses for spaces and other special bytes.
-fn unescape_octal(field: &str) -> PathBuf {
+pub fn unescape_octal(field: &str) -> PathBuf {
     let bytes = field.as_bytes();
     let mut out = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -278,6 +330,29 @@ mod tests {
         assert!(mounts.contains(Path::new("/home/me/.cache/my disk")));
         assert!(mounts.contains(Path::new("/home/me/.cache/bind")));
         assert!(!mounts.contains(Path::new("/home/me/.cache")));
+        assert!(mounts.any_inside(Path::new("/home/me/.cache")));
+        assert_eq!(
+            mounts.containing(Path::new("/home/me/.cache/bind/x")),
+            Some(Path::new("/home/me/.cache/bind"))
+        );
+        assert_eq!(mounts.containing(Path::new("/home/me")), None);
+        assert!(!mounts.any_inside(Path::new("/home/me/.cache/bind")));
+        assert!(!mounts.any_inside(Path::new("/home/me/.cach")));
+    }
+
+    #[test]
+    fn knows_the_folders_bind_mounts_show_elsewhere() {
+        let mounts = Mounts::parse(
+            "41 1 259:2 / / rw - ext4 /dev/nvme0n1p2 rw\n\
+             60 41 259:2 /home/me/Music /srv/music rw - ext4 /dev/nvme0n1p2 rw\n\
+             61 41 0:52 /@ /mnt/root rw - btrfs /dev/sda1 rw\n\
+             62 41 0:52 /@home /mnt/home rw - btrfs /dev/sda1 rw\n",
+        );
+        assert!(mounts.is_bound(Path::new("/home/me/Music")));
+        assert!(mounts.any_inside(Path::new("/home/me")));
+        assert!(!mounts.is_bound(Path::new("/srv/music")));
+        // Subvolumes of one btrfs are mounted from different folders, not one inside another.
+        assert!(!mounts.any_inside(Path::new("/mnt/root")));
     }
 
     #[test]

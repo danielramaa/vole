@@ -2,6 +2,8 @@
 //! through the official tools (ADR 0001).
 
 use std::collections::{BTreeSet, HashSet};
+use std::ffi::OsStr;
+use std::path::Path;
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
@@ -80,6 +82,52 @@ pub fn files() -> Result<String> {
     Ok(String::from_utf8_lossy(&output.stdout).into_owned())
 }
 
+/// What `pacman -Qi` says about the installed package `name`.
+pub fn package_info(name: &str) -> Result<Info> {
+    let output = query(&["-Qi", "--", name])?;
+    check(&output)?;
+    parse_info(&String::from_utf8_lossy(&output.stdout))
+        .into_iter()
+        .next()
+        .with_context(|| format!("pacman -Qi said nothing about {name}"))
+}
+
+/// The installed packages that own `path` (`pacman -Qo`); none when no package does.
+pub fn owners(path: &Path) -> Result<Vec<String>> {
+    owner_names(&query(&[
+        OsStr::new("-Qo"),
+        OsStr::new("--"),
+        path.as_os_str(),
+    ])?)
+}
+
+fn owner_names(output: &Output) -> Result<Vec<String>> {
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let none = !output.status.success()
+        && errors(&stderr).next().is_some()
+        && errors(&stderr).all(|error| error.starts_with("No package owns"));
+    if none {
+        return Ok(Vec::new());
+    }
+    check(output)?;
+    Ok(String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .filter_map(owner)
+        .collect())
+}
+
+/// The package a line of `pacman -Qo` names, e.g. `/usr/bin/ls is owned by coreutils 9.5-1`.
+fn owner(line: &str) -> Option<String> {
+    // The path may hold spaces; the name and version can't.
+    let mut words = line.rsplitn(3, ' ');
+    let _version = words.next()?;
+    let name = words.next()?;
+    words
+        .next()?
+        .ends_with(" is owned by")
+        .then(|| name.to_string())
+}
+
 /// The config files of the packages `names` (`pacman -Qii`).
 pub fn config_files(names: &[&str]) -> Result<Vec<Info>> {
     let mut args = vec!["-Qii", "--"];
@@ -126,7 +174,7 @@ fn words(stdout: &[u8]) -> Vec<String> {
 
 /// Runs a read-only pacman command as the user: in the C locale and without a terminal width,
 /// so its output can be parsed.
-fn query(args: &[&str]) -> Result<Output> {
+fn query<S: AsRef<OsStr>>(args: &[S]) -> Result<Output> {
     Command::new(PACMAN)
         .args(["--color", "never"])
         .args(args)
@@ -344,6 +392,26 @@ Backup Files    : None
             orphan_names(&failed).unwrap_err().to_string(),
             "pacman: could not open database"
         );
+    }
+
+    #[test]
+    fn reads_who_owns_a_path() {
+        let owned = output(
+            0,
+            "/usr/share/icons/ is owned by adwaita-icon-theme 50.0-1\n\
+             /usr/share/icons/ is owned by breeze 6.7.5-1.1\n",
+            "",
+        );
+        assert_eq!(
+            owner_names(&owned).unwrap(),
+            ["adwaita-icon-theme", "breeze"]
+        );
+        let spaced = output(0, "/opt/My App/run is owned by my-app 1.0-1\n", "");
+        assert_eq!(owner_names(&spaced).unwrap(), ["my-app"]);
+        let none = output(1, "", "error: No package owns /var/lib/docker\n");
+        assert!(owner_names(&none).unwrap().is_empty());
+        let failed = output(1, "", "error: could not open database\n");
+        assert!(owner_names(&failed).is_err());
     }
 
     #[test]

@@ -63,9 +63,18 @@ pub enum Kind {
     /// Recreated on demand, like a cache. Deleted permanently.
     Regenerable(PathBuf),
     /// The user's trash folder; emptying it is its own Item.
-    Trash(PathBuf),
+    Trash(Trashed),
     /// Root-owned; measured and removed only through an official tool.
     Root(RootCommand),
+}
+
+/// The trash, with what was in it when the Plan was built: emptying it removes only that, so what
+/// is trashed afterwards stays, and the size shown is what is freed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Trashed {
+    pub path: PathBuf,
+    /// What was in its `files` and `expunged` folders.
+    pub entries: Vec<PathBuf>,
 }
 
 #[derive(Debug, Clone)]
@@ -92,7 +101,8 @@ impl Item {
 
     pub fn path(&self) -> Option<&Path> {
         match &self.kind {
-            Kind::Regenerable(path) | Kind::Trash(path) => Some(path),
+            Kind::Regenerable(path) => Some(path),
+            Kind::Trash(trash) => Some(&trash.path),
             Kind::Root(_) => None,
         }
     }
@@ -196,7 +206,14 @@ mod tests {
         let mut category = Category::new("Test");
         category.items = vec![
             Item::new("a", Kind::Regenerable("/a".into()), 10),
-            Item::new("b", Kind::Trash("/b".into()), 5),
+            Item::new(
+                "b",
+                Kind::Trash(Trashed {
+                    path: "/b".into(),
+                    entries: Vec::new(),
+                }),
+                5,
+            ),
         ];
         category
     }

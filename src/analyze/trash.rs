@@ -50,8 +50,10 @@ pub enum Kept {
     /// A Sealed Path, or holds one.
     Sealed,
     Mount,
-    /// Holds a mount point: the trash would take the mounted disk along, and emptying it would
-    /// delete its files.
+    /// A folder a bind mount shows at another path too, which would show it in the trash.
+    Bound,
+    /// Holds a mount point or a bound folder: the trash would take what is mounted along, and
+    /// emptying it would delete its files.
     HoldsMount,
     /// A trash folder: the desktop trash, or the one gio makes on another filesystem.
     Trash,
@@ -67,7 +69,8 @@ impl Kept {
         match self {
             Kept::Sealed => "is a sealed path",
             Kept::Mount => "is a mount point",
-            Kept::HoldsMount => "holds a mount point",
+            Kept::Bound => "is mounted at another path too",
+            Kept::HoldsMount => "holds something mounted",
             Kept::Trash => "is a trash folder",
             Kept::InTrash => "is in the trash already",
             Kept::Own => "is vole's own",
@@ -80,7 +83,8 @@ impl Kept {
         match self {
             Kept::Sealed => "sealed",
             Kept::Mount => "mount point",
-            Kept::HoldsMount => "holds a mount point",
+            Kept::Bound => "mounted elsewhere",
+            Kept::HoldsMount => "holds a mount",
             Kept::Trash => "trash",
             Kept::InTrash => "in the trash",
             Kept::Own => "vole's own",
@@ -93,7 +97,10 @@ impl Kept {
         match self {
             Kept::Sealed => "A Sealed Path, or holds one: vole never removes it, even by hand.",
             Kept::Mount => "A mount point: what is mounted doesn't go to the trash.",
-            Kept::HoldsMount => "Holds a mount point: the trash would take what is mounted along.",
+            Kept::Bound => "Mounted at another path too: it doesn't go to the trash.",
+            Kept::HoldsMount => {
+                "Holds something mounted, here or elsewhere: the trash would take it along."
+            }
             Kept::Trash => "A trash folder: emptying it frees the space.",
             Kept::InTrash => "In the trash already: emptying the trash frees the space.",
             Kept::Own => "vole's own: its config, its Backups or its Operation Log.",
@@ -166,6 +173,8 @@ impl Picker {
             Some(Kept::Sealed)
         } else if self.mounts.contains(path) {
             Some(Kept::Mount)
+        } else if self.mounts.is_bound(path) {
+            Some(Kept::Bound)
         } else if self.mounts.any_inside(path) {
             Some(Kept::HoldsMount)
         } else if let Some(trash) = self.trash_of(path) {
@@ -441,7 +450,7 @@ mod tests {
         assert_eq!(picker.check(&mounted).unwrap_err(), "is a mount point");
         assert_eq!(
             picker.check(&home.dir.path().join("data")).unwrap_err(),
-            "holds a mount point"
+            "holds something mounted"
         );
     }
 

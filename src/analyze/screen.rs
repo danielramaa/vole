@@ -1448,11 +1448,11 @@ mod tests {
         let view = View::new(tree, home.path().into(), Ok(picker));
         let mut screen = Screen::with_view(view);
         let rows = render(&mut screen, 80, 8).join("\n");
-        assert!(rows.contains("    data/  holds a mount point"), "{rows}");
+        assert!(rows.contains("    data/  holds a mount"), "{rows}");
         assert!(rows.contains("[ ] notes"), "{rows}");
         go_to(&mut screen, "data");
         let rows = render(&mut screen, 80, 8).join("\n");
-        assert!(rows.contains("Holds a mount point"), "{rows}");
+        assert!(rows.contains("Holds something mounted"), "{rows}");
         press(&mut screen, KeyCode::Char('l'));
         let rows = render(&mut screen, 80, 8).join("\n");
         assert!(rows.contains("    usb/  USB disk"), "{rows}");

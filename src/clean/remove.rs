@@ -8,7 +8,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, Ordering};
 
-use super::plan::{Item, Kind, Plan, RootCommand};
+use super::plan::{Item, Kind, Plan, RootCommand, Trashed};
 use super::scan::trash_parts;
 use crate::disk::{self, Mounts, is_real_dir};
 use crate::log::{Log, Outcome};
@@ -39,7 +39,7 @@ pub fn remove_home(
         progress(done, items.len(), &item.label);
         let result = match &item.kind {
             Kind::Regenerable(path) => remove_regenerable(path, rules, mounts),
-            Kind::Trash(path) => empty_trash(path, rules, mounts),
+            Kind::Trash(trash) => empty_trash(trash, rules, mounts),
             Kind::Root(_) => continue,
         };
         let target = item.path().unwrap_or(Path::new("")).display().to_string();
@@ -125,8 +125,9 @@ fn remove_regenerable(path: &Path, rules: &Rules, mounts: &Mounts) -> Result<(),
     disk::remove_all(&real, mounts).map_err(|err| format!("{}: {err}", path.display()))
 }
 
-/// Removes what is inside the trash, not the trash folder itself.
-fn empty_trash(trash: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), String> {
+/// Removes what was inside the trash when the Plan was built, not the trash folder itself.
+fn empty_trash(trashed: &Trashed, rules: &Rules, mounts: &Mounts) -> Result<(), String> {
+    let trash = trashed.path.as_path();
     final_check(trash, rules, mounts)?;
     if !is_real_dir(trash) {
         return Err(format!("refused: {} is not a folder", trash.display()));
@@ -162,8 +163,12 @@ fn empty_trash(trash: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), Strin
     // Each trashed file, then its .trashinfo, which is kept when the file couldn't go so the
     // desktop trash still lists it.
     if usable.contains(&files) {
-        for entry in read_entries(&files, &mut note) {
-            let removed = remove_regenerable(&entry, rules, mounts);
+        for entry in trashed
+            .entries
+            .iter()
+            .filter(|entry| entry.parent() == Some(&files))
+        {
+            let removed = remove_regenerable(entry, rules, mounts);
             if removed.is_ok() && usable.contains(&info) {
                 let mut name = entry.file_name().unwrap_or_default().to_os_string();
                 name.push(".trashinfo");
@@ -188,8 +193,9 @@ fn empty_trash(trash: &Path, rules: &Rules, mounts: &Mounts) -> Result<(), Strin
         }
     }
     if usable.contains(&expunged) {
-        for entry in read_entries(&expunged, &mut note) {
-            note(remove_regenerable(&entry, rules, mounts));
+        let parts = trashed.entries.iter();
+        for entry in parts.filter(|entry| entry.parent() == Some(&expunged)) {
+            note(remove_regenerable(entry, rules, mounts));
         }
     }
     first_error.map_or(Ok(()), Err)
@@ -241,6 +247,24 @@ mod tests {
             rules,
             log_path,
         }
+    }
+
+    /// The trash at `path` as a scan now would put it in the Plan.
+    fn trash(path: &Path) -> Kind {
+        let entries = ["files", "expunged"]
+            .iter()
+            .flat_map(|part| {
+                fs::read_dir(path.join(part))
+                    .into_iter()
+                    .flatten()
+                    .flatten()
+            })
+            .map(|entry| entry.path())
+            .collect();
+        Kind::Trash(Trashed {
+            path: path.to_path_buf(),
+            entries,
+        })
     }
 
     fn selected(kind: Kind) -> Item {
@@ -442,11 +466,7 @@ mod tests {
         s.home.file(".local/share/Trash/files/dir/a", 10);
         s.home.file(".local/share/Trash/info/old.txt.trashinfo", 10);
         let trash = s.home.path().join(".local/share/Trash");
-        let outcomes = apply_items(
-            &s,
-            vec![selected(Kind::Trash(trash.clone()))],
-            &Mounts::default(),
-        );
+        let outcomes = apply_items(&s, vec![selected(self::trash(&trash))], &Mounts::default());
         assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0]);
         assert_eq!(fs::read_dir(trash.join("files")).unwrap().count(), 0);
         assert_eq!(fs::read_dir(trash.join("info")).unwrap().count(), 0);
@@ -465,7 +485,7 @@ mod tests {
             .file(".local/share/Trash/info/gone.txt.trashinfo", 10);
         let orphan_info = s.home.file(".local/share/Trash/info/orphan.trashinfo", 10);
         let mounts = Mounts::from_paths([stuck.parent().unwrap().to_path_buf()]);
-        let outcomes = apply_items(&s, vec![selected(Kind::Trash(trash))], &mounts);
+        let outcomes = apply_items(&s, vec![selected(self::trash(&trash))], &mounts);
         assert!(outcomes[0].error.is_some());
         assert!(stuck.exists() && stuck_info.exists());
         assert!(!gone_info.exists() && !orphan_info.exists());
@@ -478,7 +498,7 @@ mod tests {
         s.home.file(".local/share/Trash/info/old.trashinfo", 10);
         let trash = s.home.path().join(".local/share/Trash");
         let mounts = Mounts::from_paths([trash.join("files")]);
-        let outcomes = apply_items(&s, vec![selected(Kind::Trash(trash.clone()))], &mounts);
+        let outcomes = apply_items(&s, vec![selected(self::trash(&trash))], &mounts);
         assert!(outcomes[0].error.as_ref().unwrap().contains("mount point"));
         assert!(mounted.exists());
     }
@@ -491,8 +511,25 @@ mod tests {
             .symlink(".local/share/Trash/files", keys.parent().unwrap());
         s.home.file(".local/share/Trash/info/x.trashinfo", 10);
         let trash = s.home.path().join(".local/share/Trash");
-        apply_items(&s, vec![selected(Kind::Trash(trash))], &Mounts::default());
+        apply_items(&s, vec![selected(self::trash(&trash))], &Mounts::default());
         assert!(keys.exists());
+    }
+
+    #[test]
+    fn keeps_what_was_trashed_after_the_scan() {
+        let s = setup(TestDir::new());
+        s.home.file(".local/share/Trash/files/old.txt", 10);
+        s.home.file(".local/share/Trash/info/old.txt.trashinfo", 10);
+        let trash = s.home.path().join(".local/share/Trash");
+        let planned = self::trash(&trash);
+        // Moved to the trash after the scan, as vole analyze does.
+        let new = s.home.file(".local/share/Trash/files/new.iso", 10);
+        let new_info = s.home.file(".local/share/Trash/info/new.iso.trashinfo", 10);
+        let outcomes = apply_items(&s, vec![selected(planned)], &Mounts::default());
+        assert!(outcomes[0].error.is_none(), "{:?}", outcomes[0]);
+        assert!(!trash.join("files/old.txt").exists());
+        assert!(!trash.join("info/old.txt.trashinfo").exists());
+        assert!(new.exists() && new_info.exists());
     }
 
     #[test]

@@ -3,7 +3,7 @@
 use std::fs;
 use std::path::{Path, PathBuf};
 
-use super::plan::{Category, Item, Kind};
+use super::plan::{Category, Item, Kind, Trashed};
 use crate::disk::{Mounts, disk_usage, disk_usage_all, is_real_dir};
 use crate::safety::Rules;
 
@@ -174,7 +174,14 @@ impl<'a> Builder<'a> {
             .collect();
         // One walk over every entry, so a file linked from two entries counts once.
         let size = disk_usage_all(&entries, self.mounts);
-        self.push("empty the trash".into(), Kind::Trash(path), size);
+        // Each trashed file's .trashinfo goes with it.
+        let info = path.join("info");
+        let entries = entries
+            .into_iter()
+            .filter(|entry| !entry.starts_with(&info))
+            .collect();
+        let trash = Trashed { path, entries };
+        self.push("empty the trash".into(), Kind::Trash(trash), size);
     }
 
     fn push(&mut self, label: String, kind: Kind, size: u64) {

@@ -573,7 +573,7 @@ impl PlanView {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::clean::plan::{Category, Item, Kind};
+    use crate::clean::plan::{Category, Item, Kind, Trashed};
 
     fn screen() -> Screen {
         let mut first = Category::new("First");
@@ -582,7 +582,11 @@ mod tests {
             Item::new("b", Kind::Regenerable("/b".into()), 20),
         ];
         let mut second = Category::new("Second");
-        second.items = vec![Item::new("c", Kind::Trash("/c".into()), 40)];
+        let trash = Trashed {
+            path: "/c".into(),
+            entries: Vec::new(),
+        };
+        second.items = vec![Item::new("c", Kind::Trash(trash), 40)];
         Screen::with_plan(Plan {
             categories: vec![first, second],
         })

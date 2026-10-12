@@ -24,6 +24,9 @@ use crate::{size, ui};
 /// is taken, so the rates show up quickly.
 const SOON: Duration = Duration::from_millis(250);
 
+/// The intervals `+` and `-` step through, in milliseconds: as configurable, from 250 ms to 5 s.
+const INTERVALS: [u64; 5] = [250, 500, 1000, 2000, 5000];
+
 /// How many readings the graphs keep: more than a terminal is wide.
 const HISTORY: usize = 1024;
 
@@ -69,6 +72,12 @@ impl Screen {
             sent_graph: History::default(),
             failed: None,
         }
+    }
+
+    /// Reads every `interval` from now on; the next reading comes no later than that from now.
+    fn set_interval(&mut self, interval: Duration) {
+        self.interval = interval;
+        self.due = self.due.min(Instant::now() + interval);
     }
 
     /// Shows `reading`, which came `now`.
@@ -320,6 +329,8 @@ impl ModuleScreen for Screen {
 
     fn on_key(&mut self, key: KeyEvent) -> bool {
         match key.code {
+            KeyCode::Char('+') => self.set_interval(longer(self.interval)),
+            KeyCode::Char('-') => self.set_interval(shorter(self.interval)),
             KeyCode::Char('s') => self.by_memory = !self.by_memory,
             _ => return false,
         }
@@ -328,9 +339,9 @@ impl ModuleScreen for Screen {
 
     fn hint(&self) -> &'static str {
         if self.by_memory {
-            "s sort by CPU"
+            "+/- refresh interval · s sort by CPU"
         } else {
-            "s sort by memory"
+            "+/- refresh interval · s sort by memory"
         }
     }
 
@@ -545,6 +556,23 @@ fn hours_and_minutes(duration: Duration) -> String {
         (0, minutes) => format!("{minutes} min"),
         (hours, minutes) => format!("{hours} h {minutes} min"),
     }
+}
+
+/// The next interval of [`INTERVALS`] after `interval`, or the longest.
+fn longer(interval: Duration) -> Duration {
+    let next = INTERVALS
+        .iter()
+        .find(|&&ms| Duration::from_millis(ms) > interval);
+    Duration::from_millis(*next.unwrap_or(&INTERVALS[INTERVALS.len() - 1]))
+}
+
+/// The interval of [`INTERVALS`] before `interval`, or the shortest.
+fn shorter(interval: Duration) -> Duration {
+    let next = INTERVALS
+        .iter()
+        .rev()
+        .find(|&&ms| Duration::from_millis(ms) < interval);
+    Duration::from_millis(*next.unwrap_or(&INTERVALS[0]))
 }
 
 /// `interval` as the title says it, e.g. `250 ms` or `1.5 s`.
@@ -770,7 +798,7 @@ mod tests {
             "{rows}"
         );
         assert!(rows.contains("98.7%   400.0 MiB"), "{rows}");
-        assert_eq!(screen.hint(), "s sort by memory");
+        assert!(screen.hint().ends_with("s sort by memory"));
         assert!(screen.on_key(KeyEvent::from(KeyCode::Char('s'))));
         assert_eq!(names(&mut screen), ["firefox", "cc1plus", "systemd"]);
         assert!(render(&mut screen, 80, 16).join("\n").contains("by memory"));
@@ -810,6 +838,38 @@ mod tests {
         screen.due = now + Duration::from_secs(1);
         screen.show(Reading::default(), now);
         assert_eq!(screen.due, now + SOON);
+    }
+
+    #[test]
+    fn plus_and_minus_change_how_often_it_reads() {
+        let mut screen = Screen::new(&Config {
+            status_refresh_ms: 1200,
+            ..Config::default()
+        });
+        let press = |screen: &mut Screen, c| screen.on_key(KeyEvent::from(KeyCode::Char(c)));
+        let ms = |screen: &Screen| screen.interval.as_millis();
+        assert!(press(&mut screen, '+'));
+        assert_eq!(ms(&screen), 2000);
+        press(&mut screen, '+');
+        press(&mut screen, '+');
+        assert_eq!(ms(&screen), 5000);
+        assert!(render(&mut screen, 80, 4)[0].contains("every 5 s"));
+        for _ in 0..5 {
+            press(&mut screen, '-');
+        }
+        assert_eq!(ms(&screen), 250);
+        // From 1.2 s, - goes to 1 s.
+        screen.interval = Duration::from_millis(1200);
+        press(&mut screen, '-');
+        assert_eq!(ms(&screen), 1000);
+    }
+
+    #[test]
+    fn a_shorter_interval_brings_the_next_reading_closer() {
+        let mut screen = Screen::new(&Config::default());
+        screen.due = Instant::now() + Duration::from_secs(5);
+        screen.set_interval(Duration::from_millis(250));
+        assert!(screen.due <= Instant::now() + Duration::from_millis(250));
     }
 
     #[test]

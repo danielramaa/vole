@@ -2,8 +2,9 @@
 //! through the official tools (ADR 0001).
 
 use std::collections::{BTreeSet, HashSet};
-use std::ffi::OsStr;
-use std::path::Path;
+use std::ffi::{OsStr, OsString};
+use std::os::unix::ffi::OsStringExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 
 use anyhow::{Context, Result, bail};
@@ -11,6 +12,7 @@ use anyhow::{Context, Result, bail};
 use crate::size;
 
 pub const PACMAN: &str = "/usr/bin/pacman";
+const PACMAN_CONF: &str = "/usr/bin/pacman-conf";
 
 /// What `pacman -Qi` says about one installed package.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -153,6 +155,21 @@ pub fn installed_names() -> Result<HashSet<String>> {
     let output = query(&["-Qq"])?;
     check(&output)?;
     Ok(words(&output.stdout).into_iter().collect())
+}
+
+/// The folders pacman keeps the packages it downloads in (`pacman-conf CacheDir`).
+pub fn cache_dirs() -> Result<Vec<PathBuf>> {
+    let output = Command::new(PACMAN_CONF)
+        .arg("CacheDir")
+        .env("LC_ALL", "C")
+        .output()
+        .with_context(|| format!("running {PACMAN_CONF}"))?;
+    check(&output)?;
+    let lines = output.stdout.split(|&b| b == b'\n');
+    let dirs = lines
+        .filter(|line| !line.is_empty())
+        .map(|line| PathBuf::from(OsString::from_vec(line.to_vec())));
+    Ok(dirs.collect())
 }
 
 /// Whether `name` is a valid package name: alphanumerics and `@._+-`, not starting with `-` or

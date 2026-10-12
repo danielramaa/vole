@@ -4,6 +4,7 @@
 mod battery;
 mod cpu;
 mod disks;
+mod health;
 mod memory;
 mod network;
 mod processes;

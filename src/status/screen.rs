@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, RenderDirection, Sparkline};
 
 use super::battery::State;
 use super::cpu::Times;
+use super::health::{Check, Health};
 use super::processes::Process;
 use super::reading::{Reader, Reading};
 use crate::app::ModuleScreen;
@@ -52,6 +53,8 @@ pub struct Screen {
     cpu_graph: History,
     /// Whether the busiest processes are those holding the most memory, not CPU.
     by_memory: bool,
+    /// What vole can clean up, measured when the dashboard opens.
+    health: Health,
     /// The memory used, as of each reading so far.
     memory_graph: History,
     /// What the network received and sent each second, as of each reading so far.
@@ -71,6 +74,7 @@ impl Screen {
             reading: Reading::default(),
             cpu_graph: History::default(),
             by_memory: false,
+            health: Health::default(),
             memory_graph: History::default(),
             received_graph: History::default(),
             sent_graph: History::default(),
@@ -228,6 +232,26 @@ impl Screen {
         }
     }
 
+    /// The health panel's lines: what each check measured, or why it couldn't, at the right.
+    fn health_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = usize::from(width);
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let label = Check::ALL.iter().map(|check| check.label().len()).max();
+        let label = label.unwrap_or(0);
+        let lines = Check::ALL.iter().map(|&check| {
+            let name = vec![Span::raw(format!("{:<label$}", check.label()))];
+            match self.health.row(check) {
+                Some(Ok(value)) => ui::right_aligned(name, value.clone(), width),
+                Some(Err(why)) => {
+                    let why = ui::fit(&ui::printable(why), width.saturating_sub(label + 2));
+                    Line::from(vec![name[0].clone(), Span::styled(format!("  {why}"), dim)])
+                }
+                None => Line::from(vec![name[0].clone(), Span::styled("  measuring…", dim)]),
+            }
+        });
+        lines.collect()
+    }
+
     /// The temperatures panel's lines: what each sensor chip measures first, in bold when it is
     /// too hot.
     fn temperature_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -308,6 +332,10 @@ impl ModuleScreen for Screen {
             return;
         }
         let now = Instant::now();
+        if self.reader.is_none() {
+            self.health.measure();
+        }
+        self.health.update();
         match self.reader.get_or_insert_with(Reader::start).take() {
             Ok(Some(reading)) => {
                 self.waiting = false;
@@ -381,13 +409,16 @@ impl ModuleScreen for Screen {
         let cores = core_lines(cores.unwrap_or_default(), left.width);
         // The graph grows with the screen, slower than the list of processes.
         let graph = (left.height.saturating_sub(21) / 4 + 2).min(10);
-        let [cpu, processes] = Layout::vertical([
+        let health = self.health_lines(left.width);
+        let [cpu, processes, health_area] = Layout::vertical([
             Constraint::Length(1 + graph + height(&cores)),
             Constraint::Fill(1),
+            Constraint::Length(panel_height(&health)),
         ])
         .areas(left);
         self.draw_cpu(frame, cpu, cores);
         self.draw_processes(frame, processes);
+        draw_lines(frame, health_area, panel("Health", String::new()), health);
         let disks = self.disk_lines(right.width);
         let temperatures = self.temperature_lines(right.width);
         let batteries = self.battery_lines(right.width);
@@ -818,6 +849,26 @@ mod tests {
         assert_eq!(names(&mut screen), ["firefox", "cc1plus", "systemd"]);
         assert!(render(&mut screen, 80, 16).join("\n").contains("by memory"));
         assert!(!screen.on_key(KeyEvent::from(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn says_what_vole_can_clean_up_or_why_it_cannot() {
+        let mut screen = screen();
+        let lines = |screen: &Screen| -> Vec<String> {
+            let lines = screen.health_lines(38);
+            lines.iter().map(|line| line.to_string()).collect()
+        };
+        assert_eq!(lines(&screen)[0], "Pacman cache  measuring…");
+        screen.health = Health::with(&[
+            (Check::PacmanCache, Ok("14.2 GiB".into())),
+            (
+                Check::Journal,
+                Err("journalctl failed: no such\nfile".into()),
+            ),
+        ]);
+        let lines = lines(&screen);
+        assert_eq!(lines[0], format!("Pacman cache{}14.2 GiB", " ".repeat(18)));
+        assert_eq!(lines[1], "Journal       journalctl failed: no s…");
     }
 
     #[test]

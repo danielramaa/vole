@@ -100,23 +100,48 @@ impl Screen {
         let mut rows = Vec::new();
         if let Some(memory) = &self.reading.memory {
             let used = memory.used();
-            rows.push(("Used", used, memory.total, part_of(used, memory.total)));
+            let detail = part_of(used, memory.total);
+            rows.push(("Used".into(), used, memory.total, detail));
             if memory.swap_total > 0 {
                 let swap = memory.swap_used();
-                rows.push((
-                    "Swap",
-                    swap,
-                    memory.swap_total,
-                    part_of(swap, memory.swap_total),
-                ));
+                let detail = part_of(swap, memory.swap_total);
+                rows.push(("Swap".into(), swap, memory.swap_total, detail));
             }
         }
         let lines = meters(&rows, inner.width);
-        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let [meters, graph] =
-            Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(inner);
+            Layout::vertical([Constraint::Length(height(&lines)), Constraint::Fill(1)])
+                .areas(inner);
         frame.render_widget(Paragraph::new(lines), meters);
         self.memory_graph.draw(frame, graph, 1000);
+    }
+
+    /// The disks panel's lines: how full each filesystem on a disk is, then what the disks read
+    /// and write.
+    fn disk_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let reading = &self.reading;
+        let rows: Vec<Meter> = reading
+            .filesystems
+            .iter()
+            .map(|filesystem| {
+                let path = ui::printable(&filesystem.path.to_string_lossy());
+                let free = format!("{} free", size::format(filesystem.free));
+                let whole = filesystem.used + filesystem.free;
+                (path, filesystem.used, whole, free)
+            })
+            .collect();
+        let mut lines = meters(&rows, width);
+        // All disks together: a disk's own would take more than 80 columns.
+        if let Some(io) = &reading.disk_io {
+            let read = io.iter().map(|disk| disk.read).sum();
+            let written = io.iter().map(|disk| disk.written).sum();
+            lines.push(Line::from(format!(
+                "read {}  write {}",
+                rate(read),
+                rate(written)
+            )));
+        }
+        lines
     }
 }
 
@@ -187,7 +212,12 @@ impl ModuleScreen for Screen {
             .spacing(GAP)
             .areas(inner);
         self.draw_cpu(frame, left);
-        self.draw_memory(frame, right);
+        let disks = self.disk_lines(right.width);
+        let [memory, disks_area] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(height(&disks) + 1)])
+                .areas(right);
+        self.draw_memory(frame, memory);
+        draw_lines(frame, disks_area, panel("Disks", String::new()), disks);
     }
 }
 
@@ -238,10 +268,28 @@ fn panel(title: &str, value: String) -> Block<'_> {
     block
 }
 
+/// Draws a panel holding `lines`.
+fn draw_lines(frame: &mut Frame, area: Rect, block: Block, lines: Vec<Line>) {
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// How many rows `lines` take.
+fn height(lines: &[Line]) -> u16 {
+    u16::try_from(lines.len()).unwrap_or(u16::MAX)
+}
+
+/// A rate in bytes per second, e.g. `1.2 MiB/s`.
+fn rate(bytes: u64) -> String {
+    format!("{}/s", size::format(bytes))
+}
+
+/// A part of a whole to show as a bar: its label, the part, the whole, and a detail.
+type Meter = (String, u64, u64, String);
+
 /// Lines showing parts of wholes as bars, lined up: each row's label, its bar, its percentage
 /// and its detail at the right edge of `width`, e.g. `Swap  ██▌        12%  1.0 of 8.0 GiB`.
-fn meters(rows: &[(&str, u64, u64, String)], width: u16) -> Vec<Line<'static>> {
-    let label = rows.iter().map(|row| Span::raw(row.0).width());
+fn meters(rows: &[Meter], width: u16) -> Vec<Line<'static>> {
+    let label = rows.iter().map(|row| Span::raw(row.0.as_str()).width());
     let label = label.max().unwrap_or(0);
     let detail = rows.iter().map(|row| Span::raw(row.3.as_str()).width());
     let detail = detail.max().unwrap_or(0);
@@ -315,6 +363,7 @@ fn interval_text(interval: Duration) -> String {
 mod tests {
     use super::*;
     use crate::status::cpu::Cpu;
+    use crate::status::disks::{DiskIo, Filesystem};
     use crate::status::memory::Memory;
 
     const GIB: u64 = 1024 * size::MIB;
@@ -384,6 +433,33 @@ mod tests {
             "{rows}"
         );
         assert!(!rows.contains("Swap"), "{rows}");
+    }
+
+    #[test]
+    fn shows_how_full_the_disks_are_and_what_they_read_and_write() {
+        let mut screen = screen();
+        let disk = |name: &str, read| DiskIo {
+            name: name.into(),
+            read,
+            written: 0,
+        };
+        let reading = Reading {
+            filesystems: vec![Filesystem {
+                path: "/home".into(),
+                used: 3 * GIB,
+                free: GIB,
+            }],
+            disk_io: Some(vec![disk("nvme0n1", 1024), disk("sda", 1024)]),
+            ..Reading::default()
+        };
+        screen.show(reading, Instant::now());
+        let rows = render(&mut screen, 80, 12).join("\n");
+        assert!(rows.contains("Disks"), "{rows}");
+        assert!(
+            rows.contains("/home") && rows.contains("75%  1.0 GiB free"),
+            "{rows}"
+        );
+        assert!(rows.contains("read 2.0 KiB/s  write 0 B/s"), "{rows}");
     }
 
     #[test]

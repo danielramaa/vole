@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::cpu::Cpu;
+use super::disks::{self, DiskIo, Filesystem};
 use super::memory::Memory;
 
 /// Readings further apart than this tell nothing about now: the dashboard wasn't on screen in
@@ -18,6 +19,9 @@ pub struct Reading {
     /// The time the CPUs spent since the reading before; `None` without one close enough before.
     pub cpu: Option<Cpu>,
     pub memory: Option<Memory>,
+    pub filesystems: Vec<Filesystem>,
+    /// What each disk read and wrote each second since the reading before.
+    pub disk_io: Option<Vec<DiskIo>>,
 }
 
 /// The thread taking readings. It ends with its `Reader`.
@@ -61,6 +65,7 @@ impl Reader {
 struct Counters {
     at: Instant,
     cpu: Option<Cpu>,
+    disk_io: Vec<DiskIo>,
 }
 
 /// Takes a reading `at` now, telling what changed since the reading `before`, which it then
@@ -69,6 +74,7 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
     let now = Counters {
         at,
         cpu: Cpu::read(),
+        disk_io: disks::io(),
     };
     let earlier = before
         .take()
@@ -78,11 +84,29 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
         (Some(now), Some(earlier)) => Some(now.since(earlier)),
         _ => None,
     };
+    let disk_io = earlier.map(|earlier| {
+        DiskIo::rates(
+            &now.disk_io,
+            &earlier.disk_io,
+            at.duration_since(earlier.at),
+        )
+    });
     *before = Some(now);
     Reading {
         cpu,
         memory: Memory::read(),
+        filesystems: disks::filesystems(),
+        disk_io,
     }
+}
+
+/// How much a count grew each second, from `earlier` to `now`, `elapsed` apart.
+pub fn per_second(now: u64, earlier: u64, elapsed: Duration) -> u64 {
+    let seconds = elapsed.as_secs_f64();
+    if seconds <= 0.0 {
+        return 0;
+    }
+    (now.saturating_sub(earlier) as f64 / seconds).round() as u64
 }
 
 #[cfg(test)]
@@ -101,6 +125,15 @@ mod tests {
         );
         // Long after, as when the dashboard was left and opened again.
         assert!(read(&mut before, start + GAP * 3).cpu.is_none());
+    }
+
+    #[test]
+    fn counts_grow_per_second() {
+        let half = Duration::from_millis(500);
+        assert_eq!(per_second(3000, 1000, half), 4000);
+        // A count that went back, as when a disk was swapped for another of the same name.
+        assert_eq!(per_second(1000, 3000, half), 0);
+        assert_eq!(per_second(3000, 1000, Duration::ZERO), 0);
     }
 
     #[test]

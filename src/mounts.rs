@@ -1,5 +1,5 @@
-//! Which disk each mount is on, read from `/proc/self/mountinfo` and `/sys`, so the scan stays
-//! on the disk `/` is on.
+//! Which disk each mount is on, read from `/proc/self/mountinfo` and `/sys`: analyze scans the
+//! disk `/` is on, and status shows how full each filesystem on a disk is.
 
 use std::collections::HashMap;
 use std::fs;
@@ -60,7 +60,11 @@ impl Mount {
 
 /// Every mount point, and where its files are.
 #[derive(Debug, Default)]
-pub struct MountTable(HashMap<PathBuf, Mount>);
+pub struct MountTable {
+    mounts: HashMap<PathBuf, Mount>,
+    /// One mount point for each filesystem on a disk.
+    filesystems: Vec<PathBuf>,
+}
 
 impl MountTable {
     pub fn load() -> io::Result<Self> {
@@ -78,33 +82,59 @@ impl MountTable {
             .find(|(path, _)| path == Path::new("/"))
             .map(|(_, source)| disks(source))
             .unwrap_or_default();
-        let mounts = mounts
-            .into_iter()
-            .map(|(path, source)| {
-                let mount = classify(&source, &disks(&source), &root);
-                (path, mount)
-            })
-            .collect();
-        Self(mounts)
+        let mut shown = HashMap::new();
+        for (path, source) in mounts {
+            let mount = classify(&source, &disks(&source), &root);
+            shown.insert(path, (mount, source.source));
+        }
+        // A filesystem mounted at several paths, as btrfs subvolumes and bind mounts are, is the
+        // same space: it goes by the shortest, `/` rather than `/home`.
+        let mut filesystems: HashMap<&str, &PathBuf> = HashMap::new();
+        for (path, (mount, source)) in &shown {
+            if matches!(mount, Mount::SameDisk | Mount::OtherDisk | Mount::UsbDisk) {
+                let kept = filesystems.entry(source).or_insert(path);
+                let shorter = |path: &PathBuf| (path.components().count(), path.clone());
+                if shorter(path) < shorter(kept) {
+                    *kept = path;
+                }
+            }
+        }
+        let mut filesystems: Vec<PathBuf> = filesystems.into_values().cloned().collect();
+        filesystems.sort();
+        Self {
+            mounts: shown
+                .into_iter()
+                .map(|(path, (mount, _))| (path, mount))
+                .collect(),
+            filesystems,
+        }
     }
 
     /// What is mounted on `path`; `None` when it isn't a mount point.
     pub fn get(&self, path: &Path) -> Option<Mount> {
-        self.0.get(path).copied()
+        self.mounts.get(path).copied()
     }
 
     /// The mount points the scan goes into, when it scans `other_disks` too or not.
     pub fn scanned(&self, other_disks: bool) -> Vec<PathBuf> {
-        self.0
+        self.mounts
             .iter()
             .filter(|(_, mount)| mount.is_scanned(other_disks))
             .map(|(path, _)| path.clone())
             .collect()
     }
 
+    /// One mount point for each filesystem on a disk, in order.
+    pub fn filesystems(&self) -> &[PathBuf] {
+        &self.filesystems
+    }
+
     #[cfg(test)]
     pub fn from_mounts(mounts: impl IntoIterator<Item = (PathBuf, Mount)>) -> Self {
-        Self(mounts.into_iter().collect())
+        Self {
+            mounts: mounts.into_iter().collect(),
+            filesystems: Vec::new(),
+        }
     }
 }
 
@@ -296,6 +326,23 @@ mod tests {
             [Path::new("/"), Path::new("/boot"), Path::new("/home")]
         );
         assert_eq!(table.scanned(true).len(), 5);
+        // Each filesystem on a disk: /home's btrfs is on a partition of its own.
+        assert_eq!(
+            table.filesystems(),
+            ["/", "/boot", "/home", "/mnt/my data", "/run/media/me/STICK"].map(PathBuf::from)
+        );
+    }
+
+    #[test]
+    fn a_filesystem_mounted_twice_goes_by_its_shortest_path() {
+        let mountinfo = "\
+41 1 0:30 /@ / rw - btrfs /dev/nvme0n1p2 rw
+42 41 0:31 /@home /home rw - btrfs /dev/nvme0n1p2 rw
+60 41 0:30 /@/srv/music /home/me/Music rw - btrfs /dev/nvme0n1p2 rw
+";
+        let disk = |_: &Source| vec![Disk::Block("/sys/devices/pci/nvme0n1".into())];
+        let table = MountTable::parse(mountinfo, &disk);
+        assert_eq!(table.filesystems(), [PathBuf::from("/")]);
     }
 
     #[test]

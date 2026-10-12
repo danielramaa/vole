@@ -22,7 +22,7 @@ use super::scan::{self, Progress};
 use super::tip;
 use super::trash::{self, GIO, Gio, Kept, Picked, Picker};
 use super::tree::{Id, Kind, ROOT, Tree, Unwalked};
-use crate::app::ModuleScreen;
+use crate::app::{Module, ModuleScreen};
 use crate::config::Config;
 use crate::log::{Log, Outcome};
 use crate::mounts::{Mount, MountTable};
@@ -393,6 +393,10 @@ impl ModuleScreen for Screen {
             | State::Failed(_) => true,
             State::Confirm { .. } | State::Confirmed { .. } | State::Trashing { .. } => false,
         }
+    }
+
+    fn take_open(&mut self) -> Option<Module> {
+        None
     }
 
     fn needs_terminal(&self) -> bool {

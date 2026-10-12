@@ -16,7 +16,7 @@ use super::cpu::Times;
 use super::health::{Check, Health};
 use super::processes::Process;
 use super::reading::{Reader, Reading};
-use crate::app::ModuleScreen;
+use crate::app::{Module, ModuleScreen};
 use crate::config::Config;
 use crate::term::RunRoot;
 use crate::{size, ui};
@@ -57,6 +57,8 @@ pub struct Screen {
     health: Health,
     /// Whether the health panel is to be measured on the next tick.
     measure_health: bool,
+    /// The module a shortcut asked to open, until the App takes it.
+    open: Option<Module>,
     /// The memory used, as of each reading so far.
     memory_graph: History,
     /// What the network received and sent each second, as of each reading so far.
@@ -78,6 +80,7 @@ impl Screen {
             by_memory: false,
             health: Health::default(),
             measure_health: true,
+            open: None,
             memory_graph: History::default(),
             received_graph: History::default(),
             sent_graph: History::default(),
@@ -375,6 +378,8 @@ impl ModuleScreen for Screen {
             KeyCode::Char('+') => self.set_interval(longer(self.interval)),
             KeyCode::Char('-') => self.set_interval(shorter(self.interval)),
             KeyCode::Char('s') => self.by_memory = !self.by_memory,
+            KeyCode::Char('c') => self.open = Some(Module::Clean),
+            KeyCode::Char('o') => self.open = Some(Module::Orphans),
             _ => return false,
         }
         true
@@ -382,14 +387,18 @@ impl ModuleScreen for Screen {
 
     fn hint(&self) -> &'static str {
         if self.by_memory {
-            "+/- refresh interval · s sort by CPU"
+            "+/- refresh interval · s sort by CPU · c clean · o orphans"
         } else {
-            "+/- refresh interval · s sort by memory"
+            "+/- refresh interval · s sort by memory · c clean · o orphans"
         }
     }
 
     fn can_leave(&self) -> bool {
         true
+    }
+
+    fn take_open(&mut self) -> Option<Module> {
+        self.open.take()
     }
 
     fn needs_terminal(&self) -> bool {
@@ -427,7 +436,8 @@ impl ModuleScreen for Screen {
         .areas(left);
         self.draw_cpu(frame, cpu, cores);
         self.draw_processes(frame, processes);
-        draw_lines(frame, health_area, panel("Health", String::new()), health);
+        let block = panel("Health", "c clean · o orphans".into());
+        draw_lines(frame, health_area, block, health);
         let disks = self.disk_lines(right.width);
         let temperatures = self.temperature_lines(right.width);
         let batteries = self.battery_lines(right.width);
@@ -853,7 +863,7 @@ mod tests {
             "{rows}"
         );
         assert!(rows.contains("98.7%   400.0 MiB"), "{rows}");
-        assert!(screen.hint().ends_with("s sort by memory"));
+        assert!(screen.hint().contains("s sort by memory"));
         assert!(screen.on_key(KeyEvent::from(KeyCode::Char('s'))));
         assert_eq!(names(&mut screen), ["firefox", "cc1plus", "systemd"]);
         assert!(render(&mut screen, 80, 16).join("\n").contains("by memory"));
@@ -878,6 +888,21 @@ mod tests {
         let lines = lines(&screen);
         assert_eq!(lines[0], format!("Pacman cache{}14.2 GiB", " ".repeat(18)));
         assert_eq!(lines[1], "Journal            journalctl failed:…");
+    }
+
+    #[test]
+    fn c_and_o_open_clean_and_orphans() {
+        let mut screen = screen();
+        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('c'))));
+        assert_eq!(screen.take_open(), Some(Module::Clean));
+        assert_eq!(screen.take_open(), None);
+        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('o'))));
+        assert_eq!(screen.take_open(), Some(Module::Orphans));
+        assert!(
+            render(&mut screen, 80, 24)
+                .join("\n")
+                .contains("c clean · o orphans")
+        );
     }
 
     #[test]

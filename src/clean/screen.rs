@@ -17,7 +17,7 @@ use super::plan::{Item, Plan};
 use super::remove;
 use super::scan::ALLOWED_ROOTS;
 use super::{build_plan, refresh_in_use};
-use crate::app::ModuleScreen;
+use crate::app::{Module, ModuleScreen};
 use crate::config::Config;
 use crate::disk::Mounts;
 use crate::log::{Log, Outcome};
@@ -335,6 +335,10 @@ impl ModuleScreen for Screen {
             | State::RemovingHome { .. }
             | State::RootPending { .. } => false,
         }
+    }
+
+    fn take_open(&mut self) -> Option<Module> {
+        None
     }
 
     /// Whether the root commands are waiting for [`Screen::run_root`].

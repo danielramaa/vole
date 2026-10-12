@@ -59,6 +59,9 @@ pub trait ModuleScreen {
     fn hint(&self) -> &'static str;
     /// Whether the keys that leave a module (q, Esc, h, ←) leave it now.
     fn can_leave(&self) -> bool;
+    /// The module a key asked to open instead, like the dashboard's shortcut to `clean`; taken
+    /// once.
+    fn take_open(&mut self) -> Option<Module>;
     /// Whether root commands wait for [`ModuleScreen::run_root`].
     fn needs_terminal(&self) -> bool;
     /// Runs the waiting root commands; `run_root` runs them with the TUI paused.
@@ -70,6 +73,8 @@ pub struct App {
     module: Option<Module>,
     /// Whether vole was opened on the menu; leaving a module then goes back instead of quitting.
     started_on_menu: bool,
+    /// The module leaving the open one goes back to: the dashboard, after one of its shortcuts.
+    back_to: Option<Module>,
     menu: ListState,
     config: Config,
     /// The `clean` screen once `clean` has been opened. It is kept when leaving, so opening
@@ -91,6 +96,7 @@ impl App {
         let mut app = Self {
             module: None,
             started_on_menu: module.is_none(),
+            back_to: None,
             menu: ListState::default().with_selected(Some(0)),
             config,
             clean: None,
@@ -182,11 +188,14 @@ impl App {
             Some(module) => {
                 // The module gets the key first, so it can use h/l, Esc, etc. for its own
                 // navigation; only keys it doesn't use leave it, and only where it allows.
-                let (used, can_leave) = match self.screen(module) {
-                    Some(screen) => (screen.on_key(key), screen.can_leave()),
-                    None => (false, true),
+                let (used, can_leave, open) = match self.screen(module) {
+                    Some(screen) => (screen.on_key(key), screen.can_leave(), screen.take_open()),
+                    None => (false, true, None),
                 };
-                if !used && can_leave {
+                if let Some(open) = open {
+                    self.back_to = Some(module);
+                    self.open(Some(open));
+                } else if !used && can_leave {
                     self.on_leave_key(key);
                 }
             }
@@ -212,7 +221,9 @@ impl App {
             key.code,
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h')
         ) {
-            if self.started_on_menu {
+            if let Some(back) = self.back_to.take() {
+                self.open(Some(back));
+            } else if self.started_on_menu {
                 self.open(None);
             } else {
                 self.quit = true;
@@ -247,7 +258,7 @@ impl App {
                     can_leave = screen.can_leave();
                 }
                 if can_leave {
-                    hints.push(if self.started_on_menu {
+                    hints.push(if self.started_on_menu || self.back_to.is_some() {
                         "q/h back"
                     } else {
                         "q quit"
@@ -394,6 +405,33 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.module, Some(Module::Clean));
         assert!(app.clean.as_ref().is_some_and(clean::Screen::has_plan));
+    }
+
+    #[test]
+    fn the_dashboard_s_shortcuts_come_back_to_it() {
+        for (started, key, module) in [
+            (Some(Module::Status), 'c', Module::Clean),
+            (None, 'o', Module::Orphans),
+        ] {
+            let mut app = App::new(started, Config::default());
+            if started.is_none() {
+                app.open(Some(Module::Status));
+            }
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(app.module, Some(module));
+            assert!(footer(&mut app).contains("q/h back"));
+            press(&mut app, KeyCode::Char('q'));
+            assert_eq!(app.module, Some(Module::Status));
+            assert!(!app.quit);
+            // From the dashboard, q leaves as usual: to the menu, or out when opened directly.
+            press(&mut app, KeyCode::Char('q'));
+            if started.is_some() {
+                assert!(app.quit);
+            } else {
+                assert_eq!(app.module, None);
+                assert!(!app.quit);
+            }
+        }
     }
 
     #[test]

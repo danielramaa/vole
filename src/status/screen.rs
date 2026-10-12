@@ -11,6 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, RenderDirection, Sparkline};
 
+use super::battery::State;
 use super::cpu::Times;
 use super::reading::{Reader, Reading};
 use crate::app::ModuleScreen;
@@ -185,6 +186,27 @@ impl Screen {
         lines.collect()
     }
 
+    /// The battery panel's lines: how full each battery is, and how long until it is empty or
+    /// full.
+    fn battery_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let rows: Vec<Meter> = (self.reading.batteries.iter())
+            .map(|battery| {
+                let left = battery.left.map(hours_and_minutes);
+                let state = match (battery.state, left) {
+                    (State::Discharging, Some(left)) => format!("{left} left"),
+                    (State::Discharging, None) => "on battery".into(),
+                    (State::Charging, Some(left)) => format!("{left} to full"),
+                    (State::Charging, None) => "charging".into(),
+                    (State::Full, _) => "full".into(),
+                    (State::NotCharging, _) => "not charging".into(),
+                    (State::Unknown, _) => String::new(),
+                };
+                (battery.name.clone(), battery.percent, 100, state)
+            })
+            .collect();
+        meters(&rows, width)
+    }
+
     /// The disks panel's lines: how full each filesystem on a disk is, then what the disks read
     /// and write.
     fn disk_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -283,11 +305,13 @@ impl ModuleScreen for Screen {
         self.draw_cpu(frame, left);
         let disks = self.disk_lines(right.width);
         let temperatures = self.temperature_lines(right.width);
-        let [memory, network, disks_area, temperatures_area] = Layout::vertical([
+        let batteries = self.battery_lines(right.width);
+        let [memory, network, disks_area, temperatures_area, battery_area] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Fill(1),
             Constraint::Length(panel_height(&disks)),
             Constraint::Length(panel_height(&temperatures)),
+            Constraint::Length(panel_height(&batteries)),
         ])
         .areas(right);
         self.draw_memory(frame, memory);
@@ -295,6 +319,12 @@ impl ModuleScreen for Screen {
         draw_lines(frame, disks_area, panel("Disks", String::new()), disks);
         let block = panel("Temperatures", String::new());
         draw_lines(frame, temperatures_area, block, temperatures);
+        draw_lines(
+            frame,
+            battery_area,
+            panel("Battery", String::new()),
+            batteries,
+        );
     }
 }
 
@@ -440,6 +470,15 @@ fn core_lines(cores: &[(u32, Times)], width: u16) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// `duration` in hours and minutes, e.g. `3 h 40 min`.
+fn hours_and_minutes(duration: Duration) -> String {
+    let minutes = duration.as_secs() / 60;
+    match (minutes / 60, minutes % 60) {
+        (0, minutes) => format!("{minutes} min"),
+        (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
+}
+
 /// `interval` as the title says it, e.g. `250 ms` or `1.5 s`.
 fn interval_text(interval: Duration) -> String {
     let ms = interval.as_millis();
@@ -453,6 +492,7 @@ fn interval_text(interval: Duration) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::status::battery::Battery;
     use crate::status::cpu::Cpu;
     use crate::status::disks::{DiskIo, Filesystem};
     use crate::status::memory::Memory;
@@ -602,6 +642,38 @@ mod tests {
         // No sensors, no panel.
         screen.show(Reading::default(), Instant::now());
         assert_eq!(panel_height(&screen.temperature_lines(30)), 0);
+    }
+
+    #[test]
+    fn says_how_long_the_batteries_last() {
+        let mut screen = screen();
+        let battery = |name: &str, state, left| Battery {
+            name: name.into(),
+            percent: 56,
+            state,
+            left,
+        };
+        let reading = Reading {
+            batteries: vec![
+                battery(
+                    "BAT0",
+                    State::Discharging,
+                    Some(Duration::from_secs(13_203)),
+                ),
+                battery("BAT1", State::Charging, None),
+                battery("BAT2", State::NotCharging, None),
+            ],
+            ..Reading::default()
+        };
+        screen.show(reading, Instant::now());
+        let lines: Vec<String> = (screen.battery_lines(40).iter())
+            .map(|line| line.to_string())
+            .collect();
+        assert!(lines[0].ends_with("56%  3 h 40 min left"), "{lines:#?}");
+        // Details line up at the right.
+        assert!(lines[1].ends_with("56%         charging"), "{lines:#?}");
+        assert!(lines[2].ends_with("not charging"), "{lines:#?}");
+        assert_eq!(hours_and_minutes(Duration::from_secs(59 * 60)), "59 min");
     }
 
     #[test]

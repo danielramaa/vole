@@ -5,6 +5,7 @@ use std::sync::mpsc::{self, Receiver, Sender, TryRecvError};
 use std::thread;
 use std::time::{Duration, Instant};
 
+use super::battery::{self, Battery};
 use super::cpu::Cpu;
 use super::disks::{self, DiskIo, Filesystem};
 use super::memory::Memory;
@@ -27,6 +28,7 @@ pub struct Reading {
     /// What each interface received and sent each second since the reading before.
     pub network: Option<Vec<Traffic>>,
     pub temperatures: Vec<Temperature>,
+    pub batteries: Vec<Battery>,
 }
 
 /// The thread taking readings. It ends with its `Reader`.
@@ -87,6 +89,7 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
         memory: Memory::read(),
         filesystems: disks::filesystems(),
         temperatures: sensors::temperatures(),
+        batteries: battery::batteries(),
         ..Reading::default()
     };
     let earlier = before

@@ -1,6 +1,7 @@
 //! `status`: the system dashboard. It reads `/proc` and `/sys` again every refresh, while it is
 //! on screen.
 
+mod battery;
 mod cpu;
 mod disks;
 mod memory;

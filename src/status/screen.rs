@@ -562,16 +562,21 @@ type Meter = (String, u64, u64, String);
 /// Lines showing parts of wholes as bars, lined up: each row's label, its bar, its percentage
 /// and its detail at the right edge of `width`, e.g. `Swap  ██▌        12%  1.0 of 8.0 GiB`.
 fn meters(rows: &[Meter], width: u16) -> Vec<Line<'static>> {
-    let label = rows.iter().map(|row| Span::raw(row.0.as_str()).width());
-    let label = label.max().unwrap_or(0);
-    let detail = rows.iter().map(|row| Span::raw(row.3.as_str()).width());
-    let detail = detail.max().unwrap_or(0);
-    let bar = usize::from(width).saturating_sub(label + 1 + 5 + 2 + detail);
+    let width = usize::from(width);
+    let columns = |text: &str| Span::raw(text).width();
+    // A long label, like a USB disk's mount point, is cut at the start, so the numbers show.
+    let label = rows.iter().map(|row| columns(&row.0)).max().unwrap_or(0);
+    let label = label.min(width / 3);
+    let detail = rows.iter().map(|row| columns(&row.3)).max().unwrap_or(0);
+    let bar = width.saturating_sub(label + 1 + 5 + 2 + detail);
     rows.iter()
         .map(|(name, part, whole, text)| {
+            let name = ui::fit_start(name, label);
+            let name = format!("{name}{}", " ".repeat(label.saturating_sub(columns(&name))));
             let share = format!("{}%", ui::share(*part, *whole, 100));
             let bar = ui::bar(*part, *whole, bar);
-            Line::from(format!("{name:<label$} {bar} {share:>4}  {text:>detail$}"))
+            let text = format!("{}{text}", " ".repeat(detail.saturating_sub(columns(text))));
+            Line::from(format!("{name} {bar} {share:>4}  {text}"))
         })
         .collect()
 }
@@ -944,6 +949,28 @@ mod tests {
         screen.measure_health = false;
         screen.reopen();
         assert!(screen.measure_health);
+    }
+
+    #[test]
+    fn long_mount_points_leave_room_for_the_numbers() {
+        let rows = [
+            ("/".into(), GIB, 4 * GIB, "3.0 GiB free".into()),
+            (
+                "/run/media/me/My Passport".into(),
+                GIB,
+                2 * GIB,
+                "1.0 GiB free".into(),
+            ),
+        ];
+        let lines: Vec<String> = (meters(&rows, 38).iter())
+            .map(|line| line.to_string())
+            .collect();
+        // A bar of 6 cells: 38 columns less the label's 12, a percentage and the detail.
+        let line = |label: &str, bar: &str, share: &str, free: &str| {
+            format!("{label:<12} {bar:<6} {share:>4}  {free}")
+        };
+        assert_eq!(lines[0], line("/", "█▌", "25%", "3.0 GiB free"));
+        assert_eq!(lines[1], line("…My Passport", "███", "50%", "1.0 GiB free"));
     }
 
     #[test]

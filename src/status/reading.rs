@@ -9,6 +9,7 @@ use super::cpu::Cpu;
 use super::disks::{self, DiskIo, Filesystem};
 use super::memory::Memory;
 use super::network::{self, Traffic};
+use super::sensors::{self, Temperature};
 
 /// Readings further apart than this tell nothing about now: the dashboard wasn't on screen in
 /// between. The next one starts afresh.
@@ -25,6 +26,7 @@ pub struct Reading {
     pub disk_io: Option<Vec<DiskIo>>,
     /// What each interface received and sent each second since the reading before.
     pub network: Option<Vec<Traffic>>,
+    pub temperatures: Vec<Temperature>,
 }
 
 /// The thread taking readings. It ends with its `Reader`.
@@ -84,6 +86,7 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
     let mut reading = Reading {
         memory: Memory::read(),
         filesystems: disks::filesystems(),
+        temperatures: sensors::temperatures(),
         ..Reading::default()
     };
     let earlier = before

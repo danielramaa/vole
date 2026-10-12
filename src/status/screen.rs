@@ -162,6 +162,29 @@ impl Screen {
         }
     }
 
+    /// The temperatures panel's lines: what each sensor chip measures first, in bold when it is
+    /// too hot.
+    fn temperature_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let temperatures = &self.reading.temperatures;
+        let chip = temperatures
+            .iter()
+            .map(|t| Span::raw(t.chip.as_str()).width());
+        let chip = chip.max().unwrap_or(0);
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let lines = temperatures.iter().map(|temperature| {
+            let label = temperature.label.as_deref().unwrap_or_default();
+            let name = ui::printable(&format!("{:<chip$}  {label}", temperature.chip));
+            let degrees = format!("{:.0}°C", temperature.celsius);
+            let line = ui::right_aligned(vec![Span::raw(name)], degrees, usize::from(width));
+            if temperature.is_high() {
+                line.style(bold)
+            } else {
+                line
+            }
+        });
+        lines.collect()
+    }
+
     /// The disks panel's lines: how full each filesystem on a disk is, then what the disks read
     /// and write.
     fn disk_lines(&self, width: u16) -> Vec<Line<'static>> {
@@ -259,15 +282,19 @@ impl ModuleScreen for Screen {
             .areas(inner);
         self.draw_cpu(frame, left);
         let disks = self.disk_lines(right.width);
-        let [memory, network, disks_area] = Layout::vertical([
+        let temperatures = self.temperature_lines(right.width);
+        let [memory, network, disks_area, temperatures_area] = Layout::vertical([
             Constraint::Fill(1),
             Constraint::Fill(1),
-            Constraint::Length(height(&disks) + 1),
+            Constraint::Length(panel_height(&disks)),
+            Constraint::Length(panel_height(&temperatures)),
         ])
         .areas(right);
         self.draw_memory(frame, memory);
         self.draw_network(frame, network);
         draw_lines(frame, disks_area, panel("Disks", String::new()), disks);
+        let block = panel("Temperatures", String::new());
+        draw_lines(frame, temperatures_area, block, temperatures);
     }
 }
 
@@ -332,6 +359,14 @@ fn draw_lines(frame: &mut Frame, area: Rect, block: Block, lines: Vec<Line>) {
 /// How many rows `lines` take.
 fn height(lines: &[Line]) -> u16 {
     u16::try_from(lines.len()).unwrap_or(u16::MAX)
+}
+
+/// How many rows a panel holding `lines` takes: none when there is nothing to show.
+fn panel_height(lines: &[Line]) -> u16 {
+    match height(lines) {
+        0 => 0,
+        rows => rows.saturating_add(1),
+    }
 }
 
 /// A rate in bytes per second, e.g. `1.2 MiB/s`.
@@ -422,6 +457,7 @@ mod tests {
     use crate::status::disks::{DiskIo, Filesystem};
     use crate::status::memory::Memory;
     use crate::status::network::Traffic;
+    use crate::status::sensors::Temperature;
 
     const GIB: u64 = 1024 * size::MIB;
 
@@ -539,6 +575,33 @@ mod tests {
             "{rows}"
         );
         assert!(rows.contains("↓ 2.0 KiB/s  ↑ 1.0 KiB/s"), "{rows}");
+    }
+
+    #[test]
+    fn shows_temperatures_in_bold_when_too_hot() {
+        let mut screen = screen();
+        let temperature = |chip: &str, label: Option<&str>, celsius| Temperature {
+            chip: chip.into(),
+            label: label.map(String::from),
+            celsius,
+            high: Some(100.0),
+        };
+        let reading = Reading {
+            temperatures: vec![
+                temperature("coretemp", Some("Package id 0"), 100.4),
+                temperature("nvme", None, 36.85),
+            ],
+            ..Reading::default()
+        };
+        screen.show(reading, Instant::now());
+        let lines = screen.temperature_lines(30);
+        assert_eq!(lines[0].to_string(), "coretemp  Package id 0   100°C");
+        assert_eq!(lines[1].to_string(), format!("nvme{}37°C", " ".repeat(22)));
+        assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(!lines[1].style.add_modifier.contains(Modifier::BOLD));
+        // No sensors, no panel.
+        screen.show(Reading::default(), Instant::now());
+        assert_eq!(panel_height(&screen.temperature_lines(30)), 0);
     }
 
     #[test]

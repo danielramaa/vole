@@ -7,5 +7,6 @@ mod memory;
 mod network;
 mod reading;
 mod screen;
+mod sensors;
 
 pub use screen::Screen;

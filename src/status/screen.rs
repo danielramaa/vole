@@ -38,6 +38,10 @@ const HISTORY: usize = 1024;
 /// The columns between the cores' columns, and between panels side by side.
 const GAP: u16 = 2;
 
+/// The rows the cores leave the processes panel at least: its heading, the column names and three
+/// processes.
+const PROCESSES: u16 = 5;
+
 pub struct Screen {
     /// How long between readings.
     interval: Duration,
@@ -423,11 +427,15 @@ impl ModuleScreen for Screen {
         let [left, right] = Layout::horizontal([Constraint::Fill(1); 2])
             .spacing(GAP)
             .areas(inner);
-        let cores = self.reading.cpu.as_ref().map(|cpu| cpu.cores.as_slice());
-        let cores = core_lines(cores.unwrap_or_default(), left.width);
         // The graph grows with the screen, slower than the list of processes.
         let graph = (left.height.saturating_sub(21) / 4 + 2).min(10);
         let health = self.health_lines(left.width);
+        // The cores leave room for a few processes.
+        let room = left
+            .height
+            .saturating_sub(1 + graph + panel_height(&health) + PROCESSES);
+        let cores = self.reading.cpu.as_ref().map(|cpu| cpu.cores.as_slice());
+        let cores = core_lines(cores.unwrap_or_default(), left.width, room);
         let [cpu, processes, health_area] = Layout::vertical([
             Constraint::Length(1 + graph + height(&cores)),
             Constraint::Fill(1),
@@ -584,8 +592,10 @@ fn percent(times: Times) -> String {
     format!("{}%", ui::share(times.busy, times.total, 100))
 }
 
-/// Each core's use as a bar, in as many columns as fit in `width`, numbered down each column.
-fn core_lines(cores: &[(u32, Times)], width: u16) -> Vec<Line<'static>> {
+/// Each core's use, in `width` columns and, when it can be, no more than `rows` rows: as a bar
+/// with its number and percentage, in as many columns as fit, numbered down each column; or, for
+/// more cores than that holds, as a strip of a cell per core, filled as far as the core is busy.
+fn core_lines(cores: &[(u32, Times)], width: u16, rows: u16) -> Vec<Line<'static>> {
     let Some(last) = cores.iter().map(|&(n, _)| n).max() else {
         return Vec::new();
     };
@@ -595,21 +605,40 @@ fn core_lines(cores: &[(u32, Times)], width: u16) -> Vec<Line<'static>> {
     let gap = usize::from(GAP);
     let width = usize::from(width);
     let columns = ((width + gap) / (narrowest + gap)).clamp(1, cores.len());
-    let rows = cores.len().div_ceil(columns);
+    let needed = cores.len().div_ceil(columns);
+    if needed > usize::from(rows) {
+        return core_strip(cores, width, label);
+    }
     let cell = (width + gap) / columns - gap;
     let bar = cell.saturating_sub(label + 1 + 5).max(1);
-    (0..rows)
+    (0..needed)
         .map(|row| {
             let cells: Vec<String> = cores
                 .iter()
                 .skip(row)
-                .step_by(rows)
+                .step_by(needed)
                 .map(|&(n, times)| {
                     let share = ui::bar(times.busy, times.total, bar);
                     format!("{n:>label$} {share} {:>4}", percent(times))
                 })
                 .collect();
             Line::from(cells.join(&" ".repeat(gap)))
+        })
+        .collect()
+}
+
+/// Each core's use as a cell, `▁` idle to `█` busy, in rows of `width` columns, each after the
+/// number of its first core, `label` columns wide.
+fn core_strip(cores: &[(u32, Times)], width: usize, label: usize) -> Vec<Line<'static>> {
+    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let cells = width.saturating_sub(label + 1).max(1);
+    cores
+        .chunks(cells)
+        .map(|row| {
+            let busy = row
+                .iter()
+                .map(|&(_, times)| LEVELS[ui::share(times.busy, times.total, 7) as usize]);
+            Line::from(format!("{:>label$} {}", row[0].0, busy.collect::<String>()))
         })
         .collect()
 }
@@ -700,11 +729,14 @@ mod tests {
 
     #[test]
     fn shows_the_use_of_each_cpu() {
-        let rows = render(&mut screen(), 80, 12).join("\n");
+        let rows = render(&mut screen(), 80, 24).join("\n");
         assert!(rows.contains("every 1 s"), "{rows}");
         assert!(rows.contains("CPU") && rows.contains("62%"), "{rows}");
         assert!(rows.contains("0 █"), "{rows}");
         assert!(rows.contains(" 50%") && rows.contains("100%"), "{rows}");
+        // With no room for a bar each, the cores take a cell each.
+        let rows = render(&mut screen(), 80, 12).join("\n");
+        assert!(rows.contains("0 █▄█▁"), "{rows}");
     }
 
     #[test]
@@ -923,10 +955,10 @@ mod tests {
     #[test]
     fn cores_go_down_each_column() {
         let cores: Vec<(u32, Times)> = (0..16).map(|n| (n, times(n.into(), 100))).collect();
-        let lines: Vec<String> = core_lines(&cores, 39)
-            .iter()
-            .map(|line| line.to_string())
-            .collect();
+        let text = |lines: Vec<Line>| -> Vec<String> {
+            lines.iter().map(|line| line.to_string()).collect()
+        };
+        let lines = text(core_lines(&cores, 39, 8));
         assert_eq!(lines.len(), 6, "{lines:#?}");
         assert!(
             lines[0].starts_with(" 0 ") && lines[0].contains(" 6 "),
@@ -937,7 +969,18 @@ mod tests {
                 .iter()
                 .all(|line| Line::from(line.as_str()).width() <= 39)
         );
-        assert!(core_lines(&[], 39).is_empty());
+        assert!(core_lines(&[], 39, 8).is_empty());
+    }
+
+    #[test]
+    fn many_cores_take_a_cell_each() {
+        let cores: Vec<(u32, Times)> = (0..16).map(|n| (n, times(0, 100))).collect();
+        let lines: Vec<String> = (core_lines(&cores, 12, 4).iter())
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(lines, [" 0 ▁▁▁▁▁▁▁▁▁", " 9 ▁▁▁▁▁▁▁"]);
+        let busy: Vec<(u32, Times)> = (0..3).map(|n| (n, times(n.into(), 2))).collect();
+        assert_eq!(core_lines(&busy, 30, 0)[0].to_string(), "0 ▁▄█");
     }
 
     #[test]

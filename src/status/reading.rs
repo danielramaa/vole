@@ -11,7 +11,7 @@ use super::disks::{self, DiskIo, Filesystem};
 use super::memory::Memory;
 use super::network::{self, Traffic};
 use super::processes::{self, Process};
-use super::sensors::{self, Temperature};
+use super::sensors::{Sensors, Temperature};
 
 /// Readings further apart than this tell nothing about now: the dashboard wasn't on screen in
 /// between. The next one starts afresh.
@@ -48,9 +48,11 @@ impl Reader {
         let (sender, readings) = mpsc::channel();
         thread::spawn(move || {
             let mut before = None;
+            let mut sensors = Sensors::default();
             for () in asked {
+                let reading = read(&mut before, &mut sensors, Instant::now());
                 // The screen may have gone already; then nobody is listening.
-                if sender.send(read(&mut before, Instant::now())).is_err() {
+                if sender.send(reading).is_err() {
                     break;
                 }
             }
@@ -83,8 +85,8 @@ struct Counters {
 }
 
 /// Takes a reading `at` now, telling what changed since the reading `before`, which it then
-/// replaces.
-fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
+/// replaces, with the `sensors` found so far.
+fn read(before: &mut Option<Counters>, sensors: &mut Sensors, at: Instant) -> Reading {
     let now = Counters {
         at,
         cpu: Cpu::read(),
@@ -95,7 +97,7 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
     let mut reading = Reading {
         memory: Memory::read(),
         filesystems: disks::filesystems(),
-        temperatures: sensors::temperatures(),
+        temperatures: sensors.read(),
         batteries: battery::batteries(),
         ..Reading::default()
     };
@@ -137,15 +139,12 @@ mod tests {
     #[test]
     fn rates_need_a_reading_shortly_before() {
         let start = Instant::now();
-        let mut before = None;
-        assert!(read(&mut before, start).cpu.is_none());
-        assert!(
-            read(&mut before, start + Duration::from_secs(1))
-                .cpu
-                .is_some()
-        );
+        let (mut before, mut sensors) = (None, Sensors::default());
+        let mut read_at = |at| read(&mut before, &mut sensors, at);
+        assert!(read_at(start).cpu.is_none());
+        assert!(read_at(start + Duration::from_secs(1)).cpu.is_some());
         // Long after, as when the dashboard was left and opened again.
-        assert!(read(&mut before, start + GAP * 3).cpu.is_none());
+        assert!(read_at(start + GAP * 3).cpu.is_none());
     }
 
     #[test]

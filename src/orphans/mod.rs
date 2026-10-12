@@ -106,6 +106,17 @@ pub fn build_plan(home: &Path, config: &Config, left: &[(PathBuf, String)]) -> R
     Ok(plan)
 }
 
+/// How many Orphaned Packages the Plan lists: those `pacman -Qdtq` lists, and those that only
+/// become orphans once they are removed.
+pub fn package_count() -> Result<usize> {
+    let orphans = pacman::orphans().context("listing the orphaned packages")?;
+    if orphans.is_empty() {
+        return Ok(0);
+    }
+    let installed = pacman::installed().context("reading the installed packages")?;
+    Ok(Plan::build(&installed, &orphans).packages.len())
+}
+
 /// Checks the selected configs against the programs running now, since one may have started
 /// using a config after the scan. Flags already set stay set.
 pub fn refresh_in_use(plan: &mut Plan, config: &Config) {

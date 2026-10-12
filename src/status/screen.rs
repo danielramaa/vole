@@ -858,7 +858,7 @@ mod tests {
             let lines = screen.health_lines(38);
             lines.iter().map(|line| line.to_string()).collect()
         };
-        assert_eq!(lines(&screen)[0], "Pacman cache  measuring…");
+        assert_eq!(lines(&screen)[0], "Pacman cache       measuring…");
         screen.health = Health::with(&[
             (Check::PacmanCache, Ok("14.2 GiB".into())),
             (
@@ -868,7 +868,7 @@ mod tests {
         ]);
         let lines = lines(&screen);
         assert_eq!(lines[0], format!("Pacman cache{}14.2 GiB", " ".repeat(18)));
-        assert_eq!(lines[1], "Journal       journalctl failed: no s…");
+        assert_eq!(lines[1], "Journal            journalctl failed:…");
     }
 
     #[test]

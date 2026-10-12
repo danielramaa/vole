@@ -7,22 +7,24 @@ use std::thread;
 use anyhow::{Context, Result};
 
 use crate::disk::{self, Mounts};
-use crate::{clean, pacman, size};
+use crate::{clean, orphans, pacman, size};
 
 /// A row of the health panel.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Check {
     PacmanCache,
     Journal,
+    OrphanedPackages,
 }
 
 impl Check {
-    pub const ALL: [Check; 2] = [Check::PacmanCache, Check::Journal];
+    pub const ALL: [Check; 3] = [Check::PacmanCache, Check::Journal, Check::OrphanedPackages];
 
     pub fn label(self) -> &'static str {
         match self {
             Check::PacmanCache => "Pacman cache",
             Check::Journal => "Journal",
+            Check::OrphanedPackages => "Orphaned packages",
         }
     }
 
@@ -39,7 +41,16 @@ impl Check {
                     format!("≥ {usage}")
                 })
             }
+            Check::OrphanedPackages => orphans::package_count().map(count),
         }
+    }
+}
+
+/// `n` as a row says it: `none` for 0.
+fn count(n: usize) -> String {
+    match n {
+        0 => "none".into(),
+        n => n.to_string(),
     }
 }
 
@@ -125,6 +136,12 @@ fn pacman_cache() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn counts_say_none_for_nothing() {
+        assert_eq!(count(0), "none");
+        assert_eq!(count(27), "27");
+    }
 
     #[test]
     fn rows_keep_what_they_said_until_measured_again() {

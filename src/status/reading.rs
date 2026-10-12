@@ -20,7 +20,9 @@ const GAP: Duration = Duration::from_secs(10);
 /// What the dashboard shows, read at one moment.
 #[derive(Debug, Default)]
 pub struct Reading {
-    /// The time the CPUs spent since the reading before; `None` without one close enough before.
+    /// How long since the reading before; `None` without one close enough before.
+    pub elapsed: Option<Duration>,
+    /// The time the CPUs spent since the reading before.
     pub cpu: Option<Cpu>,
     pub memory: Option<Memory>,
     pub filesystems: Vec<Filesystem>,
@@ -102,6 +104,7 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
         .filter(|earlier| at.duration_since(earlier.at) <= GAP);
     if let Some(earlier) = earlier {
         let elapsed = at.duration_since(earlier.at);
+        reading.elapsed = Some(elapsed);
         reading.cpu = (now.cpu.as_ref())
             .zip(earlier.cpu.as_ref())
             .map(|(now, earlier)| now.since(earlier));

@@ -27,6 +27,10 @@ const SOON: Duration = Duration::from_millis(250);
 /// The intervals `+` and `-` step through, in milliseconds: as configurable, from 250 ms to 5 s.
 const INTERVALS: [u64; 5] = [250, 500, 1000, 2000, 5000];
 
+/// How calmly the graphs follow the readings: a change shows about two thirds of the way after
+/// this long, whether the dashboard reads every 250 ms or every second.
+const SMOOTHING: Duration = Duration::from_millis(500);
+
 /// How many readings the graphs keep: more than a terminal is wide.
 const HISTORY: usize = 1024;
 
@@ -82,21 +86,23 @@ impl Screen {
 
     /// Shows `reading`, which came `now`.
     fn show(&mut self, reading: Reading, now: Instant) {
+        let elapsed = reading.elapsed;
         match &reading.cpu {
-            Some(cpu) => self
-                .cpu_graph
-                .push(ui::share(cpu.all.busy, cpu.all.total, 1000)),
+            Some(cpu) => {
+                let busy = ui::share(cpu.all.busy, cpu.all.total, 1000);
+                self.cpu_graph.push(busy, elapsed);
+            }
             None => self.due = self.due.min(now + SOON),
         }
         if let Some(network) = &reading.network {
-            self.received_graph
-                .push(network.iter().map(|interface| interface.received).sum());
-            self.sent_graph
-                .push(network.iter().map(|interface| interface.sent).sum());
+            let received = network.iter().map(|interface| interface.received).sum();
+            self.received_graph.push(received, elapsed);
+            let sent = network.iter().map(|interface| interface.sent).sum();
+            self.sent_graph.push(sent, elapsed);
         }
         if let Some(memory) = &reading.memory {
-            self.memory_graph
-                .push(ui::share(memory.used(), memory.total, 1000));
+            let used = ui::share(memory.used(), memory.total, 1000);
+            self.memory_graph.push(used, elapsed);
         }
         self.reading = reading;
     }
@@ -407,33 +413,42 @@ impl ModuleScreen for Screen {
     }
 }
 
-/// A graph's values, oldest first, the last [`HISTORY`] of them.
+/// A graph's values, oldest first, the last [`HISTORY`] of them, smoothed.
 #[derive(Default)]
-struct History(VecDeque<u64>);
+struct History(VecDeque<f64>);
 
 impl History {
-    fn push(&mut self, value: u64) {
+    /// Adds `value`, read `elapsed` after the value before. It goes only part of the way from
+    /// that value, as far as [`SMOOTHING`] says for `elapsed`; all the way without one.
+    fn push(&mut self, value: u64, elapsed: Option<Duration>) {
+        let value = value as f64;
+        let smoothed = match (self.0.back(), elapsed) {
+            (Some(&last), Some(elapsed)) => {
+                let follow = 1.0 - (-elapsed.as_secs_f64() / SMOOTHING.as_secs_f64()).exp();
+                last + (value - last) * follow
+            }
+            _ => value,
+        };
         if self.0.len() == HISTORY {
             self.0.pop_front();
         }
-        self.0.push_back(value);
+        self.0.push_back(smoothed);
+    }
+
+    /// The values shown in `width` columns, newest first.
+    fn shown(&self, width: u16) -> impl Iterator<Item = u64> {
+        let shown = self.0.iter().rev().take(usize::from(width));
+        shown.map(|&value| value.round() as u64)
     }
 
     /// The most the graph shows in `width` columns, at least 1.
     fn peak(&self, width: u16) -> u64 {
-        let shown = self.0.iter().rev().take(usize::from(width));
-        shown.copied().max().unwrap_or(0).max(1)
+        self.shown(width).max().unwrap_or(0).max(1)
     }
 
     /// Draws the values as a graph from 0 to `max`, the newest at the right edge.
     fn draw(&self, frame: &mut Frame, area: Rect, max: u64) {
-        let newest_first: Vec<u64> = self
-            .0
-            .iter()
-            .rev()
-            .take(usize::from(area.width))
-            .copied()
-            .collect();
+        let newest_first: Vec<u64> = self.shown(area.width).collect();
         let graph = Sparkline::default()
             .data(newest_first)
             .max(max)
@@ -704,7 +719,7 @@ mod tests {
             ..Reading::default()
         };
         screen.show(reading, Instant::now());
-        assert_eq!(screen.received_graph.0.back(), Some(&2048));
+        assert_eq!(screen.received_graph.0.back(), Some(&2048.0));
         let rows = render(&mut screen, 80, 16).join("\n");
         assert!(
             rows.contains("Network") && rows.contains("enp3s0, wlan0"),
@@ -884,9 +899,26 @@ mod tests {
     fn graphs_keep_the_last_readings() {
         let mut graph = History::default();
         for value in 0..HISTORY as u64 + 10 {
-            graph.push(value);
+            graph.push(value, None);
         }
         assert_eq!(graph.0.len(), HISTORY);
-        assert_eq!(graph.0.front(), Some(&10));
+        assert_eq!(graph.0.front(), Some(&10.0));
+    }
+
+    #[test]
+    fn graphs_follow_the_readings_calmly_at_any_interval() {
+        let follow = |every: Duration, readings: usize| {
+            let mut graph = History::default();
+            graph.push(0, None);
+            for _ in 0..readings {
+                graph.push(1000, Some(every));
+            }
+            graph.peak(1)
+        };
+        // Two thirds of the way after SMOOTHING, read all at once or in steps.
+        assert_eq!(follow(SMOOTHING, 1), 632);
+        assert_eq!(follow(SMOOTHING / 2, 2), 632);
+        // Readings far apart are hardly smoothed.
+        assert_eq!(follow(Duration::from_secs(5), 1), 1000);
     }
 }

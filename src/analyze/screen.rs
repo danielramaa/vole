@@ -18,7 +18,6 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 
-use super::disks::{Mount, MountTable};
 use super::scan::{self, Progress};
 use super::tip;
 use super::trash::{self, GIO, Gio, Kept, Picked, Picker};
@@ -26,6 +25,7 @@ use super::tree::{Id, Kind, ROOT, Tree, Unwalked};
 use crate::app::ModuleScreen;
 use crate::config::Config;
 use crate::log::{Log, Outcome};
+use crate::mounts::{Mount, MountTable};
 use crate::size;
 use crate::term::RunRoot;
 use crate::ui::{self, printable};

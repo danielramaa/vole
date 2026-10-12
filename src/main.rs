@@ -6,6 +6,7 @@ mod date;
 mod disk;
 mod in_use;
 mod log;
+mod mounts;
 mod orphans;
 mod pacman;
 mod safety;

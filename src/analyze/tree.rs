@@ -5,7 +5,7 @@ use std::ffi::{OsStr, OsString};
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
 
-use super::disks::Mount;
+use crate::mounts::Mount;
 
 /// A file or folder of a [`Tree`].
 pub type Id = u32;

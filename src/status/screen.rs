@@ -175,7 +175,7 @@ impl Screen {
         lines.extend(
             busiest
                 .iter()
-                .take(usize::from(inner.height))
+                .take(usize::from(inner.height.saturating_sub(1)))
                 .map(|process| {
                     let shown = ui::fit(&ui::printable(&process.name), name);
                     Line::from(format!(

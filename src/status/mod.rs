@@ -6,6 +6,7 @@ mod cpu;
 mod disks;
 mod memory;
 mod network;
+mod processes;
 mod reading;
 mod screen;
 mod sensors;

@@ -10,6 +10,7 @@ use super::cpu::Cpu;
 use super::disks::{self, DiskIo, Filesystem};
 use super::memory::Memory;
 use super::network::{self, Traffic};
+use super::processes::{self, Process};
 use super::sensors::{self, Temperature};
 
 /// Readings further apart than this tell nothing about now: the dashboard wasn't on screen in
@@ -29,6 +30,8 @@ pub struct Reading {
     pub network: Option<Vec<Traffic>>,
     pub temperatures: Vec<Temperature>,
     pub batteries: Vec<Battery>,
+    /// Every process, with what it took of one CPU since the reading before.
+    pub processes: Option<Vec<Process>>,
 }
 
 /// The thread taking readings. It ends with its `Reader`.
@@ -74,6 +77,7 @@ struct Counters {
     cpu: Option<Cpu>,
     disk_io: Vec<DiskIo>,
     network: Vec<Traffic>,
+    processes: Vec<Process>,
 }
 
 /// Takes a reading `at` now, telling what changed since the reading `before`, which it then
@@ -84,6 +88,7 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
         cpu: Cpu::read(),
         disk_io: disks::io(),
         network: network::traffic(),
+        processes: processes::processes(),
     };
     let mut reading = Reading {
         memory: Memory::read(),
@@ -102,6 +107,12 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
             .map(|(now, earlier)| now.since(earlier));
         reading.disk_io = Some(DiskIo::rates(&now.disk_io, &earlier.disk_io, elapsed));
         reading.network = Some(Traffic::rates(&now.network, &earlier.network, elapsed));
+        if let Some(cpu) = &reading.cpu {
+            // The ticks each CPU spent in between, which a process's share is out of.
+            let ticks = cpu.all.total / cpu.cores.len().max(1) as u64;
+            let rates = processes::rates(&now.processes, &earlier.processes, ticks);
+            reading.processes = Some(rates);
+        }
     }
     *before = Some(now);
     reading

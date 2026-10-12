@@ -5,7 +5,7 @@ use std::io;
 use std::time::{Duration, Instant};
 
 use ratatui::Frame;
-use ratatui::crossterm::event::KeyEvent;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -13,6 +13,7 @@ use ratatui::widgets::{Block, Borders, Paragraph, RenderDirection, Sparkline};
 
 use super::battery::State;
 use super::cpu::Times;
+use super::processes::Process;
 use super::reading::{Reader, Reading};
 use crate::app::ModuleScreen;
 use crate::config::Config;
@@ -42,6 +43,8 @@ pub struct Screen {
     reading: Reading,
     /// The CPU use of the readings so far.
     cpu_graph: History,
+    /// Whether the busiest processes are those holding the most memory, not CPU.
+    by_memory: bool,
     /// The memory used, as of each reading so far.
     memory_graph: History,
     /// What the network received and sent each second, as of each reading so far.
@@ -60,6 +63,7 @@ impl Screen {
             due: Instant::now(),
             reading: Reading::default(),
             cpu_graph: History::default(),
+            by_memory: false,
             memory_graph: History::default(),
             received_graph: History::default(),
             sent_graph: History::default(),
@@ -88,20 +92,66 @@ impl Screen {
         self.reading = reading;
     }
 
-    /// The CPU panel: the use of all CPUs over time, then of each now.
-    fn draw_cpu(&self, frame: &mut Frame, area: Rect) {
-        let cpu = self.reading.cpu.as_ref();
-        let total = cpu.map_or(String::new(), |cpu| percent(cpu.all));
-        let block = panel("CPU", total);
+    /// The CPU panel: the use of all CPUs over time, then of each now, in `cores`.
+    fn draw_cpu(&self, frame: &mut Frame, area: Rect, cores: Vec<Line>) {
+        let total = self.reading.cpu.as_ref();
+        let block = panel("CPU", total.map_or(String::new(), |cpu| percent(cpu.all)));
         let inner = block.inner(area);
         frame.render_widget(block, area);
-        let cores = cpu.map_or(&[][..], |cpu| &cpu.cores);
-        let lines = core_lines(cores, inner.width);
-        let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
         let [graph, grid] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(rows)]).areas(inner);
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(height(&cores))])
+                .areas(inner);
         self.cpu_graph.draw(frame, graph, 1000);
-        frame.render_widget(Paragraph::new(lines), grid);
+        frame.render_widget(Paragraph::new(cores), grid);
+    }
+
+    /// The processes panel: the busiest processes, by CPU or by memory, as many as fit.
+    fn draw_processes(&self, frame: &mut Frame, area: Rect) {
+        let by = if self.by_memory {
+            "by memory"
+        } else {
+            "by CPU"
+        };
+        let block = panel("Processes", by.into());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let Some(processes) = &self.reading.processes else {
+            return;
+        };
+        let mut busiest: Vec<&Process> = processes.iter().collect();
+        let by_cpu = |a: &&Process, b: &&Process| b.cpu.total_cmp(&a.cpu);
+        let by_memory = |a: &&Process, b: &&Process| b.memory.cmp(&a.memory);
+        if self.by_memory {
+            busiest.sort_by(|a, b| by_memory(a, b).then(by_cpu(a, b)));
+        } else {
+            busiest.sort_by(|a, b| by_cpu(a, b).then(by_memory(a, b)));
+        }
+        // The pid, the name, its share of a CPU and the memory it holds, e.g.
+        // `   4321  firefox   12.3%    1.2 GiB`.
+        let name = usize::from(inner.width).saturating_sub(7 + 2 + 2 + 6 + 2 + 10);
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let mut lines = vec![Line::styled(
+            format!(
+                "{:>7}  {:<name$}  {:>6}  {:>10}",
+                "PID", "Name", "CPU", "Memory"
+            ),
+            dim,
+        )];
+        lines.extend(
+            busiest
+                .iter()
+                .take(usize::from(inner.height))
+                .map(|process| {
+                    let shown = ui::fit(&ui::printable(&process.name), name);
+                    Line::from(format!(
+                        "{:>7}  {shown:<name$}  {:>5.1}%  {:>10}",
+                        process.pid,
+                        process.cpu,
+                        size::format(process.memory)
+                    ))
+                }),
+        );
+        frame.render_widget(Paragraph::new(lines), inner);
     }
 
     /// The memory panel: how much memory and swap are used, then the memory used over time.
@@ -268,12 +318,20 @@ impl ModuleScreen for Screen {
         }
     }
 
-    fn on_key(&mut self, _key: KeyEvent) -> bool {
-        false
+    fn on_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('s') => self.by_memory = !self.by_memory,
+            _ => return false,
+        }
+        true
     }
 
     fn hint(&self) -> &'static str {
-        ""
+        if self.by_memory {
+            "s sort by CPU"
+        } else {
+            "s sort by memory"
+        }
     }
 
     fn can_leave(&self) -> bool {
@@ -302,7 +360,17 @@ impl ModuleScreen for Screen {
         let [left, right] = Layout::horizontal([Constraint::Fill(1); 2])
             .spacing(GAP)
             .areas(inner);
-        self.draw_cpu(frame, left);
+        let cores = self.reading.cpu.as_ref().map(|cpu| cpu.cores.as_slice());
+        let cores = core_lines(cores.unwrap_or_default(), left.width);
+        // The graph grows with the screen, slower than the list of processes.
+        let graph = (left.height.saturating_sub(21) / 4 + 2).min(10);
+        let [cpu, processes] = Layout::vertical([
+            Constraint::Length(1 + graph + height(&cores)),
+            Constraint::Fill(1),
+        ])
+        .areas(left);
+        self.draw_cpu(frame, cpu, cores);
+        self.draw_processes(frame, processes);
         let disks = self.disk_lines(right.width);
         let temperatures = self.temperature_lines(right.width);
         let batteries = self.battery_lines(right.width);
@@ -674,6 +742,39 @@ mod tests {
         assert!(lines[1].ends_with("56%         charging"), "{lines:#?}");
         assert!(lines[2].ends_with("not charging"), "{lines:#?}");
         assert_eq!(hours_and_minutes(Duration::from_secs(59 * 60)), "59 min");
+    }
+
+    #[test]
+    fn lists_the_busiest_processes_by_cpu_or_by_memory() {
+        let mut screen = screen();
+        let reading = Reading {
+            processes: Some(vec![
+                Process::new(1, "systemd", 0.0, 10 * size::MIB),
+                Process::new(4321, "firefox", 0.5, GIB),
+                Process::new(66, "cc1plus", 98.7, 400 * size::MIB),
+            ]),
+            ..Reading::default()
+        };
+        screen.show(reading, Instant::now());
+        let names = |screen: &mut Screen| -> Vec<String> {
+            let rows = render(screen, 80, 16);
+            let at = |name: &str| rows.iter().position(|row| row.contains(name)).unwrap();
+            let mut names = ["systemd", "firefox", "cc1plus"].map(String::from).to_vec();
+            names.sort_by_key(|name| at(name));
+            names
+        };
+        assert_eq!(names(&mut screen), ["cc1plus", "firefox", "systemd"]);
+        let rows = render(&mut screen, 80, 16).join("\n");
+        assert!(
+            rows.contains("by CPU") && rows.contains("  66  cc1plus"),
+            "{rows}"
+        );
+        assert!(rows.contains("98.7%   400.0 MiB"), "{rows}");
+        assert_eq!(screen.hint(), "s sort by memory");
+        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('s'))));
+        assert_eq!(names(&mut screen), ["firefox", "cc1plus", "systemd"]);
+        assert!(render(&mut screen, 80, 16).join("\n").contains("by memory"));
+        assert!(!screen.on_key(KeyEvent::from(KeyCode::Char('q'))));
     }
 
     #[test]

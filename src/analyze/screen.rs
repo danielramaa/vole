@@ -796,7 +796,7 @@ impl View {
         let width = usize::from(header.width);
         let room = width.saturating_sub(Span::raw(size.as_str()).width() + 1);
         let path = printable(&self.tree.path(self.dir).to_string_lossy());
-        let path = Span::styled(fit_start(&path, room), bold);
+        let path = Span::styled(ui::fit_start(&path, room), bold);
         frame.render_widget(ui::right_aligned(vec![path], size, width), header);
 
         if self.rows.is_empty() {
@@ -859,8 +859,8 @@ impl View {
         let size = tree.size(id);
         let right = format!(
             "{} {:>4}  {:>12}",
-            bar(size, total),
-            format!("{}%", share(size, total, 100)),
+            ui::bar(size, total, BAR),
+            format!("{}%", ui::share(size, total, 100)),
             self.size_text(id)
         );
         let mut name = printable(&tree.name(id).to_string_lossy());
@@ -877,7 +877,7 @@ impl View {
         let room = width
             .saturating_sub(2 + check.len() + Span::raw(right.as_str()).width() + 1)
             .saturating_sub(mark.as_ref().map_or(0, String::len));
-        let mut spans = vec![Span::raw(format!("  {check}{}", fit(&name, room)))];
+        let mut spans = vec![Span::raw(format!("  {check}{}", ui::fit(&name, room)))];
         if let Some(mark) = mark {
             spans.push(Span::styled(mark, Style::new().add_modifier(Modifier::DIM)));
         }
@@ -992,52 +992,6 @@ impl View {
         (self.tree.kind(id) == Kind::Symlink)
             .then_some("A symlink: what it points to is counted where it is.")
     }
-}
-
-/// `part`'s share of `whole`, out of `scale`.
-fn share(part: u64, whole: u64, scale: u64) -> u64 {
-    if whole == 0 {
-        return 0;
-    }
-    let share = u128::from(part) * u128::from(scale) / u128::from(whole);
-    u64::try_from(share).unwrap_or(u64::MAX).min(scale)
-}
-
-/// `size`'s share of `total` as a bar [`BAR`] cells wide, drawn in eighths of a cell.
-fn bar(size: u64, total: u64) -> String {
-    const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
-    let eighths = share(size, total, BAR as u64 * 8) as usize;
-    let mut bar = "█".repeat(eighths / 8);
-    bar.push_str(EIGHTHS[eighths % 8]);
-    let cells = eighths.div_ceil(8);
-    bar.push_str(&" ".repeat(BAR - cells));
-    bar
-}
-
-/// `text` cut to `width` columns, ending with … where it was cut.
-fn fit(text: &str, width: usize) -> String {
-    if Span::raw(text).width() <= width {
-        return text.to_string();
-    }
-    let mut fitted = String::new();
-    // The … takes one column.
-    let mut used = 1;
-    for c in text.chars() {
-        let columns = Span::raw(c.to_string()).width();
-        if used + columns > width {
-            break;
-        }
-        used += columns;
-        fitted.push(c);
-    }
-    fitted.push('…');
-    fitted
-}
-
-/// `text` cut at the start to `width` columns, so its end stays.
-fn fit_start(text: &str, width: usize) -> String {
-    let reversed: String = text.chars().rev().collect();
-    fit(&reversed, width).chars().rev().collect()
 }
 
 /// `n` with its thousands apart, e.g. `1,234,567`.
@@ -1335,15 +1289,9 @@ mod tests {
     }
 
     #[test]
-    fn cuts_text_by_columns() {
-        assert_eq!(fit("abcdef", 6), "abcdef");
-        assert_eq!(fit("abcdef", 4), "abc…");
-        assert_eq!(fit("日本語", 4), "日…");
-        assert_eq!(fit_start("/home/me/Videos", 8), "…/Videos");
+    fn counts_with_thousands_apart() {
         assert_eq!(count(999), "999");
         assert_eq!(count(1000), "1,000");
-        assert_eq!(bar(1, 1), "█".repeat(BAR));
-        assert_eq!(bar(0, 0), " ".repeat(BAR));
     }
 
     /// A home folder holding `Videos/old.mkv`, `Videos/new.mkv`, `.ssh/id` and `notes`, and a

@@ -1,10 +1,12 @@
-//! The health panel: what vole can clean up, measured by the official tools, each on a thread of
-//! its own, so a slow one doesn't hold the others up.
+//! The health panel: what vole can clean up, and the updates pacman would install, measured by
+//! the official tools, each on a thread of its own, so a slow one doesn't hold the others up.
 
+use std::path::Path;
+use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 
 use crate::disk::{self, Mounts};
 use crate::{clean, orphans, pacman, size};
@@ -15,16 +17,23 @@ pub enum Check {
     PacmanCache,
     Journal,
     OrphanedPackages,
+    PendingUpdates,
 }
 
 impl Check {
-    pub const ALL: [Check; 3] = [Check::PacmanCache, Check::Journal, Check::OrphanedPackages];
+    pub const ALL: [Check; 4] = [
+        Check::PacmanCache,
+        Check::Journal,
+        Check::OrphanedPackages,
+        Check::PendingUpdates,
+    ];
 
     pub fn label(self) -> &'static str {
         match self {
             Check::PacmanCache => "Pacman cache",
             Check::Journal => "Journal",
             Check::OrphanedPackages => "Orphaned packages",
+            Check::PendingUpdates => "Pending updates",
         }
     }
 
@@ -42,6 +51,7 @@ impl Check {
                 })
             }
             Check::OrphanedPackages => orphans::package_count().map(count),
+            Check::PendingUpdates => pending_updates().map(count),
         }
     }
 }
@@ -125,6 +135,49 @@ impl Health {
     }
 }
 
+const CHECKUPDATES: &str = "/usr/bin/checkupdates";
+
+/// How many packages the repositories have newer versions of, as `checkupdates` says. It syncs a
+/// copy of the package databases in a folder of its own, never pacman's, so a later `pacman -S`
+/// still can't make a partial upgrade.
+fn pending_updates() -> Result<usize> {
+    if !Path::new(CHECKUPDATES).exists() {
+        bail!("checkupdates not found; install pacman-contrib");
+    }
+    let output = Command::new(CHECKUPDATES)
+        .arg("--nocolor")
+        .env("LC_ALL", "C")
+        .output()
+        .with_context(|| format!("running {CHECKUPDATES}"))?;
+    updates(&output)
+}
+
+/// Reads what `checkupdates` said: a line per package, e.g. `linux 6.17.1-1 -> 6.17.2-1`, or
+/// exit status 2 for none.
+fn updates(output: &Output) -> Result<usize> {
+    match output.status.code() {
+        Some(0) => {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            Ok(stdout
+                .lines()
+                .filter(|line| !line.trim().is_empty())
+                .count())
+        }
+        Some(2) => Ok(0),
+        _ => {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            let error = stderr
+                .lines()
+                .map(|line| line.trim_start_matches("==> ERROR:").trim())
+                .find(|line| !line.is_empty());
+            match error {
+                Some(error) => bail!("{error}"),
+                None => bail!("checkupdates failed ({})", output.status),
+            }
+        }
+    }
+}
+
 /// The space pacman's package cache takes on disk.
 fn pacman_cache() -> Result<u64> {
     let dirs = pacman::cache_dirs().context("asking pacman-conf where the cache is")?;
@@ -136,6 +189,31 @@ fn pacman_cache() -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn output(code: i32, stdout: &str, stderr: &str) -> Output {
+        use std::os::unix::process::ExitStatusExt;
+        Output {
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into(),
+            stderr: stderr.into(),
+        }
+    }
+
+    #[test]
+    fn reads_what_checkupdates_says() {
+        let pending = "linux 6.17.1.arch1-1 -> 6.17.2.arch1-1\nmesa 1:25.2.4-1 -> 1:25.2.5-1\n";
+        assert_eq!(updates(&output(0, pending, "")).unwrap(), 2);
+        assert_eq!(updates(&output(2, "", "")).unwrap(), 0);
+        let offline = output(1, "", "==> ERROR: Cannot fetch updates\n");
+        assert_eq!(
+            updates(&offline).unwrap_err().to_string(),
+            "Cannot fetch updates"
+        );
+        assert_eq!(
+            updates(&output(1, "", "")).unwrap_err().to_string(),
+            "checkupdates failed (exit status: 1)"
+        );
+    }
 
     #[test]
     fn counts_say_none_for_nothing() {

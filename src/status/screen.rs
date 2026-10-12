@@ -246,7 +246,7 @@ impl Screen {
                     let why = ui::fit(&ui::printable(why), width.saturating_sub(label + 2));
                     Line::from(vec![name[0].clone(), Span::styled(format!("  {why}"), dim)])
                 }
-                None => Line::from(vec![name[0].clone(), Span::styled("  measuring…", dim)]),
+                None => Line::from(vec![name[0].clone(), Span::styled("  checking…", dim)]),
             }
         });
         lines.collect()
@@ -858,7 +858,7 @@ mod tests {
             let lines = screen.health_lines(38);
             lines.iter().map(|line| line.to_string()).collect()
         };
-        assert_eq!(lines(&screen)[0], "Pacman cache       measuring…");
+        assert_eq!(lines(&screen)[0], "Pacman cache       checking…");
         screen.health = Health::with(&[
             (Check::PacmanCache, Ok("14.2 GiB".into())),
             (

@@ -126,7 +126,8 @@ impl App {
             }
             Some(Module::Status) => {
                 self.status
-                    .get_or_insert_with(|| status::Screen::new(&self.config));
+                    .get_or_insert_with(|| status::Screen::new(&self.config))
+                    .reopen();
             }
             None => {}
         }

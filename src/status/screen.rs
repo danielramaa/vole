@@ -53,8 +53,10 @@ pub struct Screen {
     cpu_graph: History,
     /// Whether the busiest processes are those holding the most memory, not CPU.
     by_memory: bool,
-    /// What vole can clean up, measured when the dashboard opens.
+    /// What vole can clean up, measured each time the dashboard opens.
     health: Health,
+    /// Whether the health panel is to be measured on the next tick.
+    measure_health: bool,
     /// The memory used, as of each reading so far.
     memory_graph: History,
     /// What the network received and sent each second, as of each reading so far.
@@ -75,11 +77,18 @@ impl Screen {
             cpu_graph: History::default(),
             by_memory: false,
             health: Health::default(),
+            measure_health: true,
             memory_graph: History::default(),
             received_graph: History::default(),
             sent_graph: History::default(),
             failed: None,
         }
+    }
+
+    /// The dashboard is opened again: the health panel is measured afresh, as clean and orphans
+    /// change it.
+    pub fn reopen(&mut self) {
+        self.measure_health = true;
     }
 
     /// Reads every `interval` from now on; the next reading comes no later than that from now.
@@ -332,7 +341,7 @@ impl ModuleScreen for Screen {
             return;
         }
         let now = Instant::now();
-        if self.reader.is_none() {
+        if std::mem::take(&mut self.measure_health) {
             self.health.measure();
         }
         self.health.update();
@@ -869,6 +878,15 @@ mod tests {
         let lines = lines(&screen);
         assert_eq!(lines[0], format!("Pacman cache{}14.2 GiB", " ".repeat(18)));
         assert_eq!(lines[1], "Journal            journalctl failed:…");
+    }
+
+    #[test]
+    fn measures_the_health_panel_each_time_it_opens() {
+        let mut screen = screen();
+        assert!(screen.measure_health);
+        screen.measure_health = false;
+        screen.reopen();
+        assert!(screen.measure_health);
     }
 
     #[test]

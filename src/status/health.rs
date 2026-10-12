@@ -183,7 +183,8 @@ fn pacman_cache() -> Result<u64> {
     let dirs = pacman::cache_dirs().context("asking pacman-conf where the cache is")?;
     // Measuring only: without the mount points, the walk still stops at other filesystems.
     let mounts = Mounts::load().unwrap_or_default();
-    Ok(dirs.iter().map(|dir| disk::disk_usage(dir, &mounts)).sum())
+    // One walk, so a package linked from two of the folders counts once.
+    Ok(disk::disk_usage_all(&dirs, &mounts))
 }
 
 #[cfg(test)]

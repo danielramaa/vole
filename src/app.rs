@@ -50,7 +50,7 @@ impl Module {
 
 /// What the App needs from the screen of a module.
 pub trait ModuleScreen {
-    /// Moves background work along; called before each frame.
+    /// Moves background work along; called before each frame while the module is on screen.
     fn tick(&mut self);
     /// Handles a key, returning whether it was used.
     fn on_key(&mut self, key: KeyEvent) -> bool;
@@ -138,10 +138,10 @@ impl App {
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
-            for &module in Module::all() {
-                if let Some(screen) = self.screen(module) {
-                    screen.tick();
-                }
+            // Only the module on screen moves along: what the others' threads find waits for
+            // them, and the dashboard only reads the system while it is shown.
+            if let Some(screen) = self.module.and_then(|module| self.screen(module)) {
+                screen.tick();
             }
             terminal.draw(|frame| self.draw(frame))?;
             // Root commands need the terminal, which only the App has. Only the module on

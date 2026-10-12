@@ -43,6 +43,9 @@ pub struct Screen {
     cpu_graph: History,
     /// The memory used, as of each reading so far.
     memory_graph: History,
+    /// What the network received and sent each second, as of each reading so far.
+    received_graph: History,
+    sent_graph: History,
     /// Why there are no readings any more, once the thread taking them stopped.
     failed: Option<String>,
 }
@@ -57,6 +60,8 @@ impl Screen {
             reading: Reading::default(),
             cpu_graph: History::default(),
             memory_graph: History::default(),
+            received_graph: History::default(),
+            sent_graph: History::default(),
             failed: None,
         }
     }
@@ -68,6 +73,12 @@ impl Screen {
                 .cpu_graph
                 .push(ui::share(cpu.all.busy, cpu.all.total, 1000)),
             None => self.due = self.due.min(now + SOON),
+        }
+        if let Some(network) = &reading.network {
+            self.received_graph
+                .push(network.iter().map(|interface| interface.received).sum());
+            self.sent_graph
+                .push(network.iter().map(|interface| interface.sent).sum());
         }
         if let Some(memory) = &reading.memory {
             self.memory_graph
@@ -114,6 +125,41 @@ impl Screen {
                 .areas(inner);
         frame.render_widget(Paragraph::new(lines), meters);
         self.memory_graph.draw(frame, graph, 1000);
+    }
+
+    /// The network panel: what the network receives and sends now, then over time, each graph
+    /// up to the most it reached on screen.
+    fn draw_network(&self, frame: &mut Frame, area: Rect) {
+        let network = self.reading.network.as_deref().unwrap_or_default();
+        let names: Vec<&str> = network
+            .iter()
+            .map(|interface| interface.name.as_str())
+            .collect();
+        let block = panel("Network", names.join(", "));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [now, graphs] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+        if self.reading.network.is_some() {
+            let received = network.iter().map(|interface| interface.received).sum();
+            let sent = network.iter().map(|interface| interface.sent).sum();
+            let text = format!("↓ {}  ↑ {}", rate(received), rate(sent));
+            frame.render_widget(Line::from(text), now);
+        }
+        // What is sent only shows with room for both graphs.
+        let [received, sent] = match graphs.height {
+            0 | 1 => [graphs, Rect::default()],
+            _ => Layout::vertical([Constraint::Fill(1); 2]).areas(graphs),
+        };
+        for (graph, area, arrow) in [
+            (&self.received_graph, received, "↓"),
+            (&self.sent_graph, sent, "↑"),
+        ] {
+            let [label, area] =
+                Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
+            frame.render_widget(Line::from(arrow), label);
+            graph.draw(frame, area, graph.peak(area.width));
+        }
     }
 
     /// The disks panel's lines: how full each filesystem on a disk is, then what the disks read
@@ -213,10 +259,14 @@ impl ModuleScreen for Screen {
             .areas(inner);
         self.draw_cpu(frame, left);
         let disks = self.disk_lines(right.width);
-        let [memory, disks_area] =
-            Layout::vertical([Constraint::Fill(1), Constraint::Length(height(&disks) + 1)])
-                .areas(right);
+        let [memory, network, disks_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(height(&disks) + 1),
+        ])
+        .areas(right);
         self.draw_memory(frame, memory);
+        self.draw_network(frame, network);
         draw_lines(frame, disks_area, panel("Disks", String::new()), disks);
     }
 }
@@ -231,6 +281,12 @@ impl History {
             self.0.pop_front();
         }
         self.0.push_back(value);
+    }
+
+    /// The most the graph shows in `width` columns, at least 1.
+    fn peak(&self, width: u16) -> u64 {
+        let shown = self.0.iter().rev().take(usize::from(width));
+        shown.copied().max().unwrap_or(0).max(1)
     }
 
     /// Draws the values as a graph from 0 to `max`, the newest at the right edge.
@@ -365,6 +421,7 @@ mod tests {
     use crate::status::cpu::Cpu;
     use crate::status::disks::{DiskIo, Filesystem};
     use crate::status::memory::Memory;
+    use crate::status::network::Traffic;
 
     const GIB: u64 = 1024 * size::MIB;
 
@@ -460,6 +517,28 @@ mod tests {
             "{rows}"
         );
         assert!(rows.contains("read 2.0 KiB/s  write 0 B/s"), "{rows}");
+    }
+
+    #[test]
+    fn shows_what_the_network_receives_and_sends() {
+        let mut screen = screen();
+        let interface = |name: &str| Traffic {
+            name: name.into(),
+            received: 1024,
+            sent: 512,
+        };
+        let reading = Reading {
+            network: Some(vec![interface("enp3s0"), interface("wlan0")]),
+            ..Reading::default()
+        };
+        screen.show(reading, Instant::now());
+        assert_eq!(screen.received_graph.0.back(), Some(&2048));
+        let rows = render(&mut screen, 80, 16).join("\n");
+        assert!(
+            rows.contains("Network") && rows.contains("enp3s0, wlan0"),
+            "{rows}"
+        );
+        assert!(rows.contains("↓ 2.0 KiB/s  ↑ 1.0 KiB/s"), "{rows}");
     }
 
     #[test]

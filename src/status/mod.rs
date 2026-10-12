@@ -4,6 +4,7 @@
 mod cpu;
 mod disks;
 mod memory;
+mod network;
 mod reading;
 mod screen;
 

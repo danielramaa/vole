@@ -8,6 +8,7 @@ use std::time::{Duration, Instant};
 use super::cpu::Cpu;
 use super::disks::{self, DiskIo, Filesystem};
 use super::memory::Memory;
+use super::network::{self, Traffic};
 
 /// Readings further apart than this tell nothing about now: the dashboard wasn't on screen in
 /// between. The next one starts afresh.
@@ -22,6 +23,8 @@ pub struct Reading {
     pub filesystems: Vec<Filesystem>,
     /// What each disk read and wrote each second since the reading before.
     pub disk_io: Option<Vec<DiskIo>>,
+    /// What each interface received and sent each second since the reading before.
+    pub network: Option<Vec<Traffic>>,
 }
 
 /// The thread taking readings. It ends with its `Reader`.
@@ -66,6 +69,7 @@ struct Counters {
     at: Instant,
     cpu: Option<Cpu>,
     disk_io: Vec<DiskIo>,
+    network: Vec<Traffic>,
 }
 
 /// Takes a reading `at` now, telling what changed since the reading `before`, which it then
@@ -75,29 +79,26 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
         at,
         cpu: Cpu::read(),
         disk_io: disks::io(),
+        network: network::traffic(),
+    };
+    let mut reading = Reading {
+        memory: Memory::read(),
+        filesystems: disks::filesystems(),
+        ..Reading::default()
     };
     let earlier = before
         .take()
         .filter(|earlier| at.duration_since(earlier.at) <= GAP);
-    let earlier = earlier.as_ref();
-    let cpu = match (&now.cpu, earlier.and_then(|earlier| earlier.cpu.as_ref())) {
-        (Some(now), Some(earlier)) => Some(now.since(earlier)),
-        _ => None,
-    };
-    let disk_io = earlier.map(|earlier| {
-        DiskIo::rates(
-            &now.disk_io,
-            &earlier.disk_io,
-            at.duration_since(earlier.at),
-        )
-    });
-    *before = Some(now);
-    Reading {
-        cpu,
-        memory: Memory::read(),
-        filesystems: disks::filesystems(),
-        disk_io,
+    if let Some(earlier) = earlier {
+        let elapsed = at.duration_since(earlier.at);
+        reading.cpu = (now.cpu.as_ref())
+            .zip(earlier.cpu.as_ref())
+            .map(|(now, earlier)| now.since(earlier));
+        reading.disk_io = Some(DiskIo::rates(&now.disk_io, &earlier.disk_io, elapsed));
+        reading.network = Some(Traffic::rates(&now.network, &earlier.network, elapsed));
     }
+    *before = Some(now);
+    reading
 }
 
 /// How much a count grew each second, from `earlier` to `now`, `elapsed` apart.

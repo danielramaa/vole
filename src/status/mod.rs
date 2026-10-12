@@ -2,6 +2,7 @@
 //! on screen.
 
 mod cpu;
+mod memory;
 mod reading;
 mod screen;
 

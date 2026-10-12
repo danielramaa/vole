@@ -8,7 +8,7 @@ use ratatui::Frame;
 use ratatui::crossterm::event::KeyEvent;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
-use ratatui::text::Line;
+use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Paragraph, RenderDirection, Sparkline};
 
 use super::cpu::Times;
@@ -16,7 +16,7 @@ use super::reading::{Reader, Reading};
 use crate::app::ModuleScreen;
 use crate::config::Config;
 use crate::term::RunRoot;
-use crate::ui;
+use crate::{size, ui};
 
 /// How soon after a reading with no rates (the first, or the first after a pause) the next one
 /// is taken, so the rates show up quickly.
@@ -41,6 +41,8 @@ pub struct Screen {
     reading: Reading,
     /// The CPU use of the readings so far.
     cpu_graph: History,
+    /// The memory used, as of each reading so far.
+    memory_graph: History,
     /// Why there are no readings any more, once the thread taking them stopped.
     failed: Option<String>,
 }
@@ -54,6 +56,7 @@ impl Screen {
             due: Instant::now(),
             reading: Reading::default(),
             cpu_graph: History::default(),
+            memory_graph: History::default(),
             failed: None,
         }
     }
@@ -65,6 +68,10 @@ impl Screen {
                 .cpu_graph
                 .push(ui::share(cpu.all.busy, cpu.all.total, 1000)),
             None => self.due = self.due.min(now + SOON),
+        }
+        if let Some(memory) = &reading.memory {
+            self.memory_graph
+                .push(ui::share(memory.used(), memory.total, 1000));
         }
         self.reading = reading;
     }
@@ -83,6 +90,33 @@ impl Screen {
             Layout::vertical([Constraint::Fill(1), Constraint::Length(rows)]).areas(inner);
         self.cpu_graph.draw(frame, graph, 1000);
         frame.render_widget(Paragraph::new(lines), grid);
+    }
+
+    /// The memory panel: how much memory and swap are used, then the memory used over time.
+    fn draw_memory(&self, frame: &mut Frame, area: Rect) {
+        let block = panel("Memory", String::new());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let mut rows = Vec::new();
+        if let Some(memory) = &self.reading.memory {
+            let used = memory.used();
+            rows.push(("Used", used, memory.total, part_of(used, memory.total)));
+            if memory.swap_total > 0 {
+                let swap = memory.swap_used();
+                rows.push((
+                    "Swap",
+                    swap,
+                    memory.swap_total,
+                    part_of(swap, memory.swap_total),
+                ));
+            }
+        }
+        let lines = meters(&rows, inner.width);
+        let height = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let [meters, graph] =
+            Layout::vertical([Constraint::Length(height), Constraint::Fill(1)]).areas(inner);
+        frame.render_widget(Paragraph::new(lines), meters);
+        self.memory_graph.draw(frame, graph, 1000);
     }
 }
 
@@ -149,10 +183,11 @@ impl ModuleScreen for Screen {
             frame.render_widget(Paragraph::new(failed.as_str()), inner);
             return;
         }
-        let [left, _right] = Layout::horizontal([Constraint::Fill(1); 2])
+        let [left, right] = Layout::horizontal([Constraint::Fill(1); 2])
             .spacing(GAP)
             .areas(inner);
         self.draw_cpu(frame, left);
+        self.draw_memory(frame, right);
     }
 }
 
@@ -201,6 +236,34 @@ fn panel(title: &str, value: String) -> Block<'_> {
         block = block.title(Line::styled(format!(" {value}"), bright).right_aligned());
     }
     block
+}
+
+/// Lines showing parts of wholes as bars, lined up: each row's label, its bar, its percentage
+/// and its detail at the right edge of `width`, e.g. `Swap  ██▌        12%  1.0 of 8.0 GiB`.
+fn meters(rows: &[(&str, u64, u64, String)], width: u16) -> Vec<Line<'static>> {
+    let label = rows.iter().map(|row| Span::raw(row.0).width());
+    let label = label.max().unwrap_or(0);
+    let detail = rows.iter().map(|row| Span::raw(row.3.as_str()).width());
+    let detail = detail.max().unwrap_or(0);
+    let bar = usize::from(width).saturating_sub(label + 1 + 5 + 2 + detail);
+    rows.iter()
+        .map(|(name, part, whole, text)| {
+            let share = format!("{}%", ui::share(*part, *whole, 100));
+            let bar = ui::bar(*part, *whole, bar);
+            Line::from(format!("{name:<label$} {bar} {share:>4}  {text:>detail$}"))
+        })
+        .collect()
+}
+
+/// `part` of `whole`, with the unit once when they share it, e.g. `5.1 of 15.2 GiB`.
+fn part_of(part: u64, whole: u64) -> String {
+    let (part, whole) = (size::format(part), size::format(whole));
+    match (part.split_once(' '), whole.split_once(' ')) {
+        (Some((number, unit)), Some((_, whole_unit))) if unit == whole_unit => {
+            format!("{number} of {whole}")
+        }
+        _ => format!("{part} of {whole}"),
+    }
 }
 
 /// The share of `times` that was busy, in percent.
@@ -252,6 +315,9 @@ fn interval_text(interval: Duration) -> String {
 mod tests {
     use super::*;
     use crate::status::cpu::Cpu;
+    use crate::status::memory::Memory;
+
+    const GIB: u64 = 1024 * size::MIB;
 
     fn render(screen: &mut Screen, width: u16, height: u16) -> Vec<String> {
         let backend = ratatui::backend::TestBackend::new(width, height);
@@ -281,7 +347,10 @@ mod tests {
                 (3, times(0, 100)),
             ],
         };
-        let reading = Reading { cpu: Some(cpu) };
+        let reading = Reading {
+            cpu: Some(cpu),
+            ..Reading::default()
+        };
         screen.show(reading, Instant::now());
         screen
     }
@@ -293,6 +362,34 @@ mod tests {
         assert!(rows.contains("CPU") && rows.contains("62%"), "{rows}");
         assert!(rows.contains("0 █"), "{rows}");
         assert!(rows.contains(" 50%") && rows.contains("100%"), "{rows}");
+    }
+
+    #[test]
+    fn shows_swap_only_when_there_is_some() {
+        let mut screen = screen();
+        let memory = Memory {
+            total: 16 * GIB,
+            available: 4 * GIB,
+            swap_total: 0,
+            swap_free: 0,
+        };
+        let reading = Reading {
+            memory: Some(memory),
+            ..Reading::default()
+        };
+        screen.show(reading, Instant::now());
+        let rows = render(&mut screen, 80, 12).join("\n");
+        assert!(
+            rows.contains("Used") && rows.contains("75%  12.0 of 16.0 GiB"),
+            "{rows}"
+        );
+        assert!(!rows.contains("Swap"), "{rows}");
+    }
+
+    #[test]
+    fn says_how_much_of_how_much() {
+        assert_eq!(part_of(1536, 2048), "1.5 of 2.0 KiB");
+        assert_eq!(part_of(512, 2048), "512 B of 2.0 KiB");
     }
 
     #[test]

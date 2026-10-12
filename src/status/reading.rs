@@ -6,6 +6,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use super::cpu::Cpu;
+use super::memory::Memory;
 
 /// Readings further apart than this tell nothing about now: the dashboard wasn't on screen in
 /// between. The next one starts afresh.
@@ -16,6 +17,7 @@ const GAP: Duration = Duration::from_secs(10);
 pub struct Reading {
     /// The time the CPUs spent since the reading before; `None` without one close enough before.
     pub cpu: Option<Cpu>,
+    pub memory: Option<Memory>,
 }
 
 /// The thread taking readings. It ends with its `Reader`.
@@ -77,7 +79,10 @@ fn read(before: &mut Option<Counters>, at: Instant) -> Reading {
         _ => None,
     };
     *before = Some(now);
-    Reading { cpu }
+    Reading {
+        cpu,
+        memory: Memory::read(),
+    }
 }
 
 #[cfg(test)]

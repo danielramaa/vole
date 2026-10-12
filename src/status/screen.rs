@@ -1,0 +1,344 @@
+//! The `status` screen: the dashboard, read again every refresh while it is on screen.
+
+use std::collections::VecDeque;
+use std::io;
+use std::time::{Duration, Instant};
+
+use ratatui::Frame;
+use ratatui::crossterm::event::KeyEvent;
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::Line;
+use ratatui::widgets::{Block, Borders, Paragraph, RenderDirection, Sparkline};
+
+use super::cpu::Times;
+use super::reading::{Reader, Reading};
+use crate::app::ModuleScreen;
+use crate::config::Config;
+use crate::term::RunRoot;
+use crate::ui;
+
+/// How soon after a reading with no rates (the first, or the first after a pause) the next one
+/// is taken, so the rates show up quickly.
+const SOON: Duration = Duration::from_millis(250);
+
+/// How many readings the graphs keep: more than a terminal is wide.
+const HISTORY: usize = 1024;
+
+/// The columns between the cores' columns, and between panels side by side.
+const GAP: u16 = 2;
+
+pub struct Screen {
+    /// How long between readings.
+    interval: Duration,
+    /// The thread taking readings, from the first tick on.
+    reader: Option<Reader>,
+    /// Whether a reading was asked for and hasn't come yet.
+    waiting: bool,
+    /// When to ask for the next reading.
+    due: Instant,
+    /// The latest reading.
+    reading: Reading,
+    /// The CPU use of the readings so far.
+    cpu_graph: History,
+    /// Why there are no readings any more, once the thread taking them stopped.
+    failed: Option<String>,
+}
+
+impl Screen {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            interval: Duration::from_millis(u64::from(config.status_refresh_ms)),
+            reader: None,
+            waiting: false,
+            due: Instant::now(),
+            reading: Reading::default(),
+            cpu_graph: History::default(),
+            failed: None,
+        }
+    }
+
+    /// Shows `reading`, which came `now`.
+    fn show(&mut self, reading: Reading, now: Instant) {
+        match &reading.cpu {
+            Some(cpu) => self
+                .cpu_graph
+                .push(ui::share(cpu.all.busy, cpu.all.total, 1000)),
+            None => self.due = self.due.min(now + SOON),
+        }
+        self.reading = reading;
+    }
+
+    /// The CPU panel: the use of all CPUs over time, then of each now.
+    fn draw_cpu(&self, frame: &mut Frame, area: Rect) {
+        let cpu = self.reading.cpu.as_ref();
+        let total = cpu.map_or(String::new(), |cpu| percent(cpu.all));
+        let block = panel("CPU", total);
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let cores = cpu.map_or(&[][..], |cpu| &cpu.cores);
+        let lines = core_lines(cores, inner.width);
+        let rows = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+        let [graph, grid] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(rows)]).areas(inner);
+        self.cpu_graph.draw(frame, graph, 1000);
+        frame.render_widget(Paragraph::new(lines), grid);
+    }
+}
+
+impl ModuleScreen for Screen {
+    /// Picks up the reading asked for, and asks for the next one when it is due.
+    fn tick(&mut self) {
+        if self.failed.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        match self.reader.get_or_insert_with(Reader::start).take() {
+            Ok(Some(reading)) => {
+                self.waiting = false;
+                self.show(reading, now);
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.failed = Some("Reading the system stopped unexpectedly.".into());
+                return;
+            }
+        }
+        if !self.waiting
+            && now >= self.due
+            && let Some(reader) = &self.reader
+        {
+            reader.ask();
+            self.waiting = true;
+            // Readings stay `interval` apart on average, though ticks come only now and then.
+            self.due += self.interval;
+            if self.due < now {
+                self.due = now + self.interval;
+            }
+        }
+    }
+
+    fn on_key(&mut self, _key: KeyEvent) -> bool {
+        false
+    }
+
+    fn hint(&self) -> &'static str {
+        ""
+    }
+
+    fn can_leave(&self) -> bool {
+        true
+    }
+
+    fn needs_terminal(&self) -> bool {
+        false
+    }
+
+    fn run_root(&mut self, _: &mut RunRoot) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        let every = format!(" every {} ", interval_text(self.interval));
+        let block = Block::bordered()
+            .title(" status ")
+            .title(Line::from(every).right_aligned());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if let Some(failed) = &self.failed {
+            frame.render_widget(Paragraph::new(failed.as_str()), inner);
+            return;
+        }
+        let [left, _right] = Layout::horizontal([Constraint::Fill(1); 2])
+            .spacing(GAP)
+            .areas(inner);
+        self.draw_cpu(frame, left);
+    }
+}
+
+/// A graph's values, oldest first, the last [`HISTORY`] of them.
+#[derive(Default)]
+struct History(VecDeque<u64>);
+
+impl History {
+    fn push(&mut self, value: u64) {
+        if self.0.len() == HISTORY {
+            self.0.pop_front();
+        }
+        self.0.push_back(value);
+    }
+
+    /// Draws the values as a graph from 0 to `max`, the newest at the right edge.
+    fn draw(&self, frame: &mut Frame, area: Rect, max: u64) {
+        let newest_first: Vec<u64> = self
+            .0
+            .iter()
+            .rev()
+            .take(usize::from(area.width))
+            .copied()
+            .collect();
+        let graph = Sparkline::default()
+            .data(newest_first)
+            .max(max)
+            .direction(RenderDirection::RightToLeft);
+        frame.render_widget(graph, area);
+    }
+}
+
+/// A panel's frame: a rule across its top, with `title` at the left and `value` at the right.
+fn panel(title: &str, value: String) -> Block<'_> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    // The rule is dim; its titles aren't.
+    let bright = Style::new().remove_modifier(Modifier::DIM);
+    let mut block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(dim)
+        .title(Line::styled(
+            format!("{title} "),
+            bright.add_modifier(Modifier::BOLD),
+        ));
+    if !value.is_empty() {
+        block = block.title(Line::styled(format!(" {value}"), bright).right_aligned());
+    }
+    block
+}
+
+/// The share of `times` that was busy, in percent.
+fn percent(times: Times) -> String {
+    format!("{}%", ui::share(times.busy, times.total, 100))
+}
+
+/// Each core's use as a bar, in as many columns as fit in `width`, numbered down each column.
+fn core_lines(cores: &[(u32, Times)], width: u16) -> Vec<Line<'static>> {
+    let Some(last) = cores.iter().map(|&(n, _)| n).max() else {
+        return Vec::new();
+    };
+    let label = last.to_string().len();
+    // The number, a bar of at least 3 cells and the percentage, e.g. `12 ██▌  45%`.
+    let narrowest = label + 1 + 3 + 5;
+    let gap = usize::from(GAP);
+    let width = usize::from(width);
+    let columns = ((width + gap) / (narrowest + gap)).clamp(1, cores.len());
+    let rows = cores.len().div_ceil(columns);
+    let cell = (width + gap) / columns - gap;
+    let bar = cell.saturating_sub(label + 1 + 5).max(1);
+    (0..rows)
+        .map(|row| {
+            let cells: Vec<String> = cores
+                .iter()
+                .skip(row)
+                .step_by(rows)
+                .map(|&(n, times)| {
+                    let share = ui::bar(times.busy, times.total, bar);
+                    format!("{n:>label$} {share} {:>4}", percent(times))
+                })
+                .collect();
+            Line::from(cells.join(&" ".repeat(gap)))
+        })
+        .collect()
+}
+
+/// `interval` as the title says it, e.g. `250 ms` or `1.5 s`.
+fn interval_text(interval: Duration) -> String {
+    let ms = interval.as_millis();
+    if ms < 1000 {
+        return format!("{ms} ms");
+    }
+    let seconds = format!("{}.{:03}", ms / 1000, ms % 1000);
+    format!("{} s", seconds.trim_end_matches('0').trim_end_matches('.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status::cpu::Cpu;
+
+    fn render(screen: &mut Screen, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn times(busy: u64, total: u64) -> Times {
+        Times { busy, total }
+    }
+
+    /// A screen showing a reading of 4 CPUs.
+    fn screen() -> Screen {
+        let mut screen = Screen::new(&Config::default());
+        let cpu = Cpu {
+            all: times(250, 400),
+            cores: vec![
+                (0, times(100, 100)),
+                (1, times(50, 100)),
+                (2, times(100, 100)),
+                (3, times(0, 100)),
+            ],
+        };
+        let reading = Reading { cpu: Some(cpu) };
+        screen.show(reading, Instant::now());
+        screen
+    }
+
+    #[test]
+    fn shows_the_use_of_each_cpu() {
+        let rows = render(&mut screen(), 80, 12).join("\n");
+        assert!(rows.contains("every 1 s"), "{rows}");
+        assert!(rows.contains("CPU") && rows.contains("62%"), "{rows}");
+        assert!(rows.contains("0 █"), "{rows}");
+        assert!(rows.contains(" 50%") && rows.contains("100%"), "{rows}");
+    }
+
+    #[test]
+    fn cores_go_down_each_column() {
+        let cores: Vec<(u32, Times)> = (0..16).map(|n| (n, times(n.into(), 100))).collect();
+        let lines: Vec<String> = core_lines(&cores, 39)
+            .iter()
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(lines.len(), 6, "{lines:#?}");
+        assert!(
+            lines[0].starts_with(" 0 ") && lines[0].contains(" 6 "),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| Line::from(line.as_str()).width() <= 39)
+        );
+        assert!(core_lines(&[], 39).is_empty());
+    }
+
+    #[test]
+    fn rates_come_soon_after_a_reading_without_them() {
+        let mut screen = Screen::new(&Config::default());
+        let now = Instant::now();
+        screen.due = now + Duration::from_secs(1);
+        screen.show(Reading::default(), now);
+        assert_eq!(screen.due, now + SOON);
+    }
+
+    #[test]
+    fn says_how_often_it_reads() {
+        assert_eq!(interval_text(Duration::from_millis(250)), "250 ms");
+        assert_eq!(interval_text(Duration::from_millis(1000)), "1 s");
+        assert_eq!(interval_text(Duration::from_millis(1500)), "1.5 s");
+        assert_eq!(interval_text(Duration::from_millis(1250)), "1.25 s");
+    }
+
+    #[test]
+    fn graphs_keep_the_last_readings() {
+        let mut graph = History::default();
+        for value in 0..HISTORY as u64 + 10 {
+            graph.push(value);
+        }
+        assert_eq!(graph.0.len(), HISTORY);
+        assert_eq!(graph.0.front(), Some(&10));
+    }
+}

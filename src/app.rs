@@ -9,11 +9,11 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListState};
 
 use crate::config::Config;
 use crate::term::{self, RunRoot};
-use crate::{analyze, clean, orphans};
+use crate::{analyze, clean, orphans, status};
 
 /// The modules of vole. The doc comments are used both for `--help` and for the menu.
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
@@ -81,6 +81,8 @@ pub struct App {
     restore: Option<orphans::RestoreScreen>,
     /// The `analyze` screen once `analyze` has been opened, kept like `clean`'s.
     analyze: Option<analyze::Screen>,
+    /// The `status` screen once `status` has been opened, kept like `clean`'s, with its graphs.
+    status: Option<status::Screen>,
     quit: bool,
 }
 
@@ -95,6 +97,7 @@ impl App {
             orphans: None,
             restore: None,
             analyze: None,
+            status: None,
             quit: false,
         };
         app.open(module);
@@ -121,7 +124,11 @@ impl App {
                 self.analyze
                     .get_or_insert_with(|| analyze::Screen::new(&self.config));
             }
-            Some(Module::Status) | None => {}
+            Some(Module::Status) => {
+                self.status
+                    .get_or_insert_with(|| status::Screen::new(&self.config));
+            }
+            None => {}
         }
     }
 
@@ -132,7 +139,7 @@ impl App {
             Module::Orphans => self.orphans.as_mut().map(|s| s as &mut dyn ModuleScreen),
             Module::Restore => self.restore.as_mut().map(|s| s as &mut dyn ModuleScreen),
             Module::Analyze => self.analyze.as_mut().map(|s| s as &mut dyn ModuleScreen),
-            Module::Status => None,
+            Module::Status => self.status.as_mut().map(|s| s as &mut dyn ModuleScreen),
         }
     }
 
@@ -232,17 +239,11 @@ impl App {
                 let mut hints = Vec::new();
                 // Whether q leaves the module here, or the module uses it (e.g. to go back).
                 let mut can_leave = true;
-                match self.screen(module) {
-                    Some(screen) => {
-                        screen.draw(frame, body);
-                        hints.push(screen.hint());
-                        can_leave = screen.can_leave();
-                    }
-                    None => frame.render_widget(
-                        Paragraph::new(format!("{}\n\nComing soon.", module.description()))
-                            .block(Block::bordered().title(format!(" {} ", module.name()))),
-                        body,
-                    ),
+                // Every module has a screen once it is open.
+                if let Some(screen) = self.screen(module) {
+                    screen.draw(frame, body);
+                    hints.push(screen.hint());
+                    can_leave = screen.can_leave();
                 }
                 if can_leave {
                     hints.push(if self.started_on_menu {

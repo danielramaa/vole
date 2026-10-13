@@ -289,7 +289,10 @@ impl Screen {
             let label = temperature.label.as_deref().unwrap_or_default();
             let name = ui::printable(&format!("{:<chip$}  {label}", temperature.chip));
             let degrees = format!("{:.0}°C", temperature.celsius);
-            let line = ui::right_aligned(vec![Span::raw(name)], degrees, usize::from(width));
+            // A long name is cut, so the degrees always show.
+            let room = usize::from(width).saturating_sub(Span::raw(degrees.as_str()).width() + 1);
+            let name = Span::raw(ui::fit(&name, room));
+            let line = ui::right_aligned(vec![name], degrees, usize::from(width));
             if temperature.is_high() {
                 line.style(bold)
             } else {
@@ -845,6 +848,9 @@ mod tests {
         assert_eq!(lines[1].to_string(), format!("nvme{}37°C", " ".repeat(22)));
         assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
         assert!(!lines[1].style.add_modifier.contains(Modifier::BOLD));
+        // Long names are cut, so the degrees show.
+        let lines = screen.temperature_lines(20);
+        assert_eq!(lines[0].to_string(), "coretemp  Pac… 100°C");
         // No sensors, no panel.
         screen.show(Reading::default(), Instant::now());
         assert_eq!(panel_height(&screen.temperature_lines(30)), 0);

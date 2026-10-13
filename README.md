@@ -267,4 +267,4 @@ After changing `docker/Dockerfile`, rebuild with `docker compose build`.
 
 ## License
 
-Not chosen yet. A license will be added before the first release.
+vole is released under the [MIT License](LICENSE).

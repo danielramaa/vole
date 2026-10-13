@@ -21,6 +21,10 @@ use crate::config::Config;
 use crate::term::RunRoot;
 use crate::{size, ui};
 
+/// How long a reading may take before the title says how old the one shown is: a disk that
+/// doesn't answer can hold it up for good.
+const SLOW: Duration = Duration::from_secs(5);
+
 /// The intervals `+` and `-` step through, in milliseconds: as configurable, from 250 ms to 5 s.
 const INTERVALS: [u64; 5] = [250, 500, 1000, 2000, 5000];
 
@@ -45,6 +49,9 @@ pub struct Screen {
     reader: Option<Reader>,
     /// Whether a reading was asked for and hasn't come yet.
     waiting: bool,
+    /// When the last reading was asked for, and when the one shown came.
+    asked: Instant,
+    shown_at: Option<Instant>,
     /// Whether the next reading starts afresh: the dashboard was left since the last.
     afresh: bool,
     /// Whether the reading asked for before the dashboard was left is to be dropped when it
@@ -79,6 +86,8 @@ impl Screen {
             interval: Duration::from_millis(u64::from(config.status_refresh_ms)),
             reader: None,
             waiting: false,
+            asked: Instant::now(),
+            shown_at: None,
             afresh: false,
             stale: false,
             due: Instant::now(),
@@ -116,6 +125,7 @@ impl Screen {
     }
 
     fn show(&mut self, reading: Reading) {
+        self.shown_at = Some(Instant::now());
         let elapsed = reading.elapsed;
         if let Some(cpu) = &reading.cpu {
             let busy = ui::share(cpu.all.busy, cpu.all.total, 1000);
@@ -390,6 +400,7 @@ impl ModuleScreen for Screen {
         {
             reader.ask(std::mem::take(&mut self.afresh));
             self.waiting = true;
+            self.asked = now;
             // Readings stay `interval` apart on average, though ticks come only now and then.
             self.due += self.interval;
             if self.due < now {
@@ -435,7 +446,17 @@ impl ModuleScreen for Screen {
     }
 
     fn draw(&mut self, frame: &mut Frame, area: Rect) {
-        let every = format!(" every {} ", interval_text(self.interval));
+        let mut every = format!(" every {} ", interval_text(self.interval));
+        if let Some(shown_at) = self.shown_at
+            && self.waiting
+            && self.asked.elapsed() > SLOW
+        {
+            let ago = shown_at.elapsed().as_secs();
+            every = format!(
+                " every {}, last read {ago} s ago ",
+                interval_text(self.interval)
+            );
+        }
         let block = Block::bordered()
             .title(" status ")
             .title(Line::from(every).right_aligned());
@@ -1066,6 +1087,18 @@ mod tests {
         // As when /proc/stat can't be read.
         screen.show(Reading::default());
         assert_eq!(screen.due, due);
+    }
+
+    #[test]
+    fn says_how_old_the_reading_is_when_the_next_is_slow_to_come() {
+        let mut screen = screen();
+        let title = |screen: &mut Screen| render(screen, 80, 4)[0].clone();
+        assert!(title(&mut screen).contains(" every 1 s ┐"));
+        screen.waiting = true;
+        let long_ago = Instant::now() - SLOW * 2;
+        screen.asked = long_ago;
+        screen.shown_at = Some(long_ago);
+        assert!(title(&mut screen).contains(" every 1 s, last read 10 s ago "));
     }
 
     #[test]

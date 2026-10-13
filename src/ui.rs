@@ -29,6 +29,51 @@ pub fn right_aligned(mut spans: Vec<Span<'static>>, right: String, width: usize)
     Line::from(spans)
 }
 
+/// `part`'s share of `whole`, out of `scale`.
+pub fn share(part: u64, whole: u64, scale: u64) -> u64 {
+    if whole == 0 {
+        return 0;
+    }
+    let share = u128::from(part) * u128::from(scale) / u128::from(whole);
+    u64::try_from(share).unwrap_or(u64::MAX).min(scale)
+}
+
+/// `part`'s share of `whole` as a bar `cells` wide, drawn in eighths of a cell.
+pub fn bar(part: u64, whole: u64, cells: usize) -> String {
+    const EIGHTHS: [&str; 8] = ["", "▏", "▎", "▍", "▌", "▋", "▊", "▉"];
+    let eighths = share(part, whole, cells as u64 * 8) as usize;
+    let mut bar = "█".repeat(eighths / 8);
+    bar.push_str(EIGHTHS[eighths % 8]);
+    bar.push_str(&" ".repeat(cells - eighths.div_ceil(8)));
+    bar
+}
+
+/// `text` cut to `width` columns, ending with … where it was cut.
+pub fn fit(text: &str, width: usize) -> String {
+    if Span::raw(text).width() <= width {
+        return text.to_string();
+    }
+    let mut fitted = String::new();
+    // The … takes one column.
+    let mut used = 1;
+    for c in text.chars() {
+        let columns = Span::raw(c.to_string()).width();
+        if used + columns > width {
+            break;
+        }
+        used += columns;
+        fitted.push(c);
+    }
+    fitted.push('…');
+    fitted
+}
+
+/// `text` cut at the start to `width` columns, so its end stays.
+pub fn fit_start(text: &str, width: usize) -> String {
+    let reversed: String = text.chars().rev().collect();
+    fit(&reversed, width).chars().rev().collect()
+}
+
 /// The scroll offset after `key`: j/k and the arrows move one line.
 pub fn scrolled(scroll: u16, key: KeyEvent) -> u16 {
     match key.code {
@@ -182,6 +227,22 @@ mod tests {
         let text = render(&[outcome("~/a\nb", 1, Some("~/a\nb: gone"), None)]);
         assert!(text.contains("✗ ~/a?b"), "{text}");
         assert!(text.contains("~/a?b: gone"), "{text}");
+    }
+
+    #[test]
+    fn cuts_text_by_columns() {
+        assert_eq!(fit("abcdef", 6), "abcdef");
+        assert_eq!(fit("abcdef", 4), "abc…");
+        assert_eq!(fit("日本語", 4), "日…");
+        assert_eq!(fit_start("/home/me/Videos", 8), "…/Videos");
+    }
+
+    #[test]
+    fn bars_show_a_share_in_eighths_of_a_cell() {
+        assert_eq!(bar(1, 1, 10), "█".repeat(10));
+        assert_eq!(bar(0, 0, 10), " ".repeat(10));
+        assert_eq!(bar(13, 20, 10), "██████▌   ");
+        assert_eq!(share(1, 3, 100), 33);
     }
 
     #[test]

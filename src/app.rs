@@ -9,11 +9,11 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, Ke
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::Line;
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::widgets::{Block, List, ListState};
 
 use crate::config::Config;
 use crate::term::{self, RunRoot};
-use crate::{analyze, clean, orphans};
+use crate::{analyze, clean, orphans, status};
 
 /// The modules of vole. The doc comments are used both for `--help` and for the menu.
 #[derive(ValueEnum, Clone, Copy, PartialEq, Eq, Debug)]
@@ -50,7 +50,7 @@ impl Module {
 
 /// What the App needs from the screen of a module.
 pub trait ModuleScreen {
-    /// Moves background work along; called before each frame.
+    /// Moves background work along; called before each frame while the module is on screen.
     fn tick(&mut self);
     /// Handles a key, returning whether it was used.
     fn on_key(&mut self, key: KeyEvent) -> bool;
@@ -59,6 +59,9 @@ pub trait ModuleScreen {
     fn hint(&self) -> &'static str;
     /// Whether the keys that leave a module (q, Esc, h, ←) leave it now.
     fn can_leave(&self) -> bool;
+    /// The module a key asked to open instead, like the dashboard's shortcut to `clean`; taken
+    /// once.
+    fn take_open(&mut self) -> Option<Module>;
     /// Whether root commands wait for [`ModuleScreen::run_root`].
     fn needs_terminal(&self) -> bool;
     /// Runs the waiting root commands; `run_root` runs them with the TUI paused.
@@ -70,6 +73,8 @@ pub struct App {
     module: Option<Module>,
     /// Whether vole was opened on the menu; leaving a module then goes back instead of quitting.
     started_on_menu: bool,
+    /// The module leaving the open one goes back to: the dashboard, after one of its shortcuts.
+    back_to: Option<Module>,
     menu: ListState,
     config: Config,
     /// The `clean` screen once `clean` has been opened. It is kept when leaving, so opening
@@ -81,6 +86,8 @@ pub struct App {
     restore: Option<orphans::RestoreScreen>,
     /// The `analyze` screen once `analyze` has been opened, kept like `clean`'s.
     analyze: Option<analyze::Screen>,
+    /// The `status` screen once `status` has been opened, kept like `clean`'s, with its graphs.
+    status: Option<status::Screen>,
     quit: bool,
 }
 
@@ -89,12 +96,14 @@ impl App {
         let mut app = Self {
             module: None,
             started_on_menu: module.is_none(),
+            back_to: None,
             menu: ListState::default().with_selected(Some(0)),
             config,
             clean: None,
             orphans: None,
             restore: None,
             analyze: None,
+            status: None,
             quit: false,
         };
         app.open(module);
@@ -121,7 +130,12 @@ impl App {
                 self.analyze
                     .get_or_insert_with(|| analyze::Screen::new(&self.config));
             }
-            Some(Module::Status) | None => {}
+            Some(Module::Status) => {
+                self.status
+                    .get_or_insert_with(|| status::Screen::new(&self.config))
+                    .reopen();
+            }
+            None => {}
         }
     }
 
@@ -132,16 +146,16 @@ impl App {
             Module::Orphans => self.orphans.as_mut().map(|s| s as &mut dyn ModuleScreen),
             Module::Restore => self.restore.as_mut().map(|s| s as &mut dyn ModuleScreen),
             Module::Analyze => self.analyze.as_mut().map(|s| s as &mut dyn ModuleScreen),
-            Module::Status => None,
+            Module::Status => self.status.as_mut().map(|s| s as &mut dyn ModuleScreen),
         }
     }
 
     pub fn run(mut self, terminal: &mut DefaultTerminal) -> Result<()> {
         while !self.quit {
-            for &module in Module::all() {
-                if let Some(screen) = self.screen(module) {
-                    screen.tick();
-                }
+            // Only the module on screen moves along: what the others' threads find waits for
+            // them, and the dashboard only reads the system while it is shown.
+            if let Some(screen) = self.module.and_then(|module| self.screen(module)) {
+                screen.tick();
             }
             terminal.draw(|frame| self.draw(frame))?;
             // Root commands need the terminal, which only the App has. Only the module on
@@ -174,11 +188,14 @@ impl App {
             Some(module) => {
                 // The module gets the key first, so it can use h/l, Esc, etc. for its own
                 // navigation; only keys it doesn't use leave it, and only where it allows.
-                let (used, can_leave) = match self.screen(module) {
-                    Some(screen) => (screen.on_key(key), screen.can_leave()),
-                    None => (false, true),
+                let (used, can_leave, open) = match self.screen(module) {
+                    Some(screen) => (screen.on_key(key), screen.can_leave(), screen.take_open()),
+                    None => (false, true, None),
                 };
-                if !used && can_leave {
+                if let Some(open) = open {
+                    self.back_to = Some(module);
+                    self.open(Some(open));
+                } else if !used && can_leave {
                     self.on_leave_key(key);
                 }
             }
@@ -204,7 +221,9 @@ impl App {
             key.code,
             KeyCode::Char('q') | KeyCode::Esc | KeyCode::Left | KeyCode::Char('h')
         ) {
-            if self.started_on_menu {
+            if let Some(back) = self.back_to.take() {
+                self.open(Some(back));
+            } else if self.started_on_menu {
                 self.open(None);
             } else {
                 self.quit = true;
@@ -232,20 +251,14 @@ impl App {
                 let mut hints = Vec::new();
                 // Whether q leaves the module here, or the module uses it (e.g. to go back).
                 let mut can_leave = true;
-                match self.screen(module) {
-                    Some(screen) => {
-                        screen.draw(frame, body);
-                        hints.push(screen.hint());
-                        can_leave = screen.can_leave();
-                    }
-                    None => frame.render_widget(
-                        Paragraph::new(format!("{}\n\nComing soon.", module.description()))
-                            .block(Block::bordered().title(format!(" {} ", module.name()))),
-                        body,
-                    ),
+                // Every module has a screen once it is open.
+                if let Some(screen) = self.screen(module) {
+                    screen.draw(frame, body);
+                    hints.push(screen.hint());
+                    can_leave = screen.can_leave();
                 }
                 if can_leave {
-                    hints.push(if self.started_on_menu {
+                    hints.push(if self.started_on_menu || self.back_to.is_some() {
                         "q/h back"
                     } else {
                         "q quit"
@@ -392,6 +405,33 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.module, Some(Module::Clean));
         assert!(app.clean.as_ref().is_some_and(clean::Screen::has_plan));
+    }
+
+    #[test]
+    fn the_dashboard_s_shortcuts_come_back_to_it() {
+        for (started, key, module) in [
+            (Some(Module::Status), 'c', Module::Clean),
+            (None, 'o', Module::Orphans),
+        ] {
+            let mut app = App::new(started, Config::default());
+            if started.is_none() {
+                app.open(Some(Module::Status));
+            }
+            press(&mut app, KeyCode::Char(key));
+            assert_eq!(app.module, Some(module));
+            assert!(footer(&mut app).contains("q/h back"));
+            press(&mut app, KeyCode::Char('q'));
+            assert_eq!(app.module, Some(Module::Status));
+            assert!(!app.quit);
+            // From the dashboard, q leaves as usual: to the menu, or out when opened directly.
+            press(&mut app, KeyCode::Char('q'));
+            if started.is_some() {
+                assert!(app.quit);
+            } else {
+                assert_eq!(app.module, None);
+                assert!(!app.quit);
+            }
+        }
     }
 
     #[test]

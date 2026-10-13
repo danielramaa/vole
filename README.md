@@ -7,7 +7,7 @@ vole brings the pacman cache, AUR helper cache, systemd journal, user caches, or
 It's inspired by [Mole](https://github.com/tw93/Mole) on macOS, but built for Arch: it knows about pacman, the AUR and systemd instead of treating Linux as generic.
 
 > [!WARNING]
-> **vole is in early development.** `vole clean`, `vole orphans`, `vole restore` and `vole analyze` work; `status` is still to come. See [Status](#status) for what works today and [ROADMAP.md](ROADMAP.md) for what's next.
+> **vole is in early development.** `vole clean`, `vole orphans`, `vole restore`, `vole analyze` and `vole status` work; it isn't on the AUR yet. See [Status](#status) for what works today and [ROADMAP.md](ROADMAP.md) for what's next.
 
 ---
 
@@ -35,7 +35,7 @@ The alternatives are separate tools (gdu, btop, paccache), scripts without a rea
 | **`orphans`** | Finds **orphaned packages** (including packages that only become orphans once others are removed) and **orphaned configs**: folders in `~/.config`, `~/.local/share`, `~/.local/state`, `~/.cache` and dotfiles in `~` that no installed program owns. |
 | **`restore`** | Puts orphaned configs you removed back where they were, from their dated backup. |
 | **`analyze`** | An interactive disk explorer, like ncdu or gdu. Covers the whole filesystem on the current disk. You can move what you pick in your home folder to the trash; outside it, vole shows how to free the space. |
-| **`status`** | A real-time dashboard read from `/proc` and `/sys`: CPU per core, memory, disk, network, temperatures, top processes, battery, and a system-health panel (cache sizes, orphans, journal size, pending updates). |
+| **`status`** | A real-time dashboard read from `/proc` and `/sys`: CPU per core, memory and swap, disks, network, temperatures, battery, the busiest processes, and a health panel (the pacman cache, the journal, orphaned packages, pending updates) with shortcuts to `clean` and `orphans`. |
 
 ### How orphaned packages are found
 
@@ -65,6 +65,17 @@ Removed orphaned configs aren't deleted. They move into a dated **backup** in `~
 
 - **Inside your home folder** you can select files and folders and move them to the desktop trash (`gio trash`), where your file manager can put them back until the trash is emptied. Anything can be picked, the Protected List included, but never Sealed Paths, a trash folder, vole's own folders, or what is mounted (a mount point, or a folder a bind mount shows elsewhere), nor what holds any of these. On screen, what can't be picked has no box, and says why.
 - **Outside it** vole only shows. The line under the list says how to free the space: known folders have their own tool (`vole clean` for the pacman cache and the journal, `docker system prune`, `flatpak uninstall --unused`, …), and for anything else, `pacman -Qo` tells which package it comes from, and whether other packages need it.
+
+### How the dashboard works
+
+`vole status` reads `/proc` and `/sys` every second (`status_refresh_ms`), on a thread of its own, and only while it is on screen; `+` and `-` make it read less or more often, from 250 ms to 5 s. Graphs show the CPU, the memory and the network over time, smoothed so they look as calm at any interval; the numbers are as read.
+
+- **CPU**: each CPU's use as a bar, or, when that wouldn't fit, a cell each, from ▁ idle to █ busy.
+- **Disks**: how full each filesystem on a disk is, once even when it is mounted at several paths (btrfs subvolumes, bind mounts), and what the disks read and write each second. Network shares are never asked, so one that doesn't answer can't hold the dashboard up.
+- **Network**: what the interfaces leading out of the computer receive and send. Bridges, VPNs and containers' interfaces are left out: what goes through them goes through those too.
+- **Temperatures and battery**: what each sensor chip measures first (a CPU's whole package, an NVMe disk's overall temperature), in bold once it is too hot, and how long each battery lasts or takes to charge. A wireless mouse's battery doesn't show.
+- **Processes**: the busiest, by CPU or by the memory they hold.
+- **Health**: the pacman cache, the journal, how many orphaned packages `vole orphans` would list, and how many updates are pending, measured each time the dashboard opens. `c` opens `clean` and `o` `orphans`; leaving them comes back to the dashboard. Pending updates come from `checkupdates`, which needs the network: it syncs a copy of the package databases in a folder of its own, never pacman's, so it can't lead to a partial upgrade. It runs at most every half hour.
 
 ## Safety
 
@@ -106,14 +117,14 @@ Only validated numbers from your config reach those commands, never free text, s
 | **M3**: `orphans`, packages | ✅ Done ([#4](https://github.com/danielramaa/vole/issues/4)) |
 | **M4**: `orphans`, configs and backups | ✅ Done ([#5](https://github.com/danielramaa/vole/issues/5)) |
 | **M5**: `analyze` | ✅ Done ([#6](https://github.com/danielramaa/vole/issues/6)) |
-| **M6**: `status` | ⏳ Next ([#7](https://github.com/danielramaa/vole/issues/7)) |
-| **M7**: AUR release | [#8](https://github.com/danielramaa/vole/issues/8) |
+| **M6**: `status` | ✅ Done ([#7](https://github.com/danielramaa/vole/issues/7)) |
+| **M7**: AUR release | ⏳ Next ([#8](https://github.com/danielramaa/vole/issues/8)) |
 
 ## Installation
 
 vole isn't on the AUR yet (planned for M7). For now, build it from source.
 
-Requirements: Rust **1.88** or newer, `pacman-contrib` (for `paccache`) and `glib2` (for `gio`, which moves what you pick in `analyze` to the trash).
+Requirements: Rust **1.88** or newer, `pacman-contrib` (for `paccache`, and `checkupdates`, which also needs `fakeroot`) and `glib2` (for `gio`, which moves what you pick in `analyze` to the trash).
 
 ```sh
 git clone https://github.com/danielramaa/vole.git
@@ -179,6 +190,14 @@ In `analyze`:
 | `t` | Review the selection, then `y` to move it to the trash or `n` to go back. If something is in use by a running program, it takes `Y` (shift+y) on a second screen. While moving, `Esc` stops after the current one. |
 | `o` | Scan again with other disks too, or without them, even while scanning (a disk that doesn't answer can hold a scan up) |
 | `r` | Scan again, or start over while scanning |
+
+In `status`:
+
+| Key | Action |
+|---|---|
+| `+` / `-` | Read less or more often: every 250 ms, 500 ms, 1 s, 2 s or 5 s |
+| `s` | List the processes holding the most memory instead of CPU, and back |
+| `c` / `o` | Open `clean` or `orphans`; leaving them comes back to the dashboard |
 
 ## Configuration
 

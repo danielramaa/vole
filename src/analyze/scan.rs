@@ -10,8 +10,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Condvar, Mutex};
 use std::thread;
 
-use super::disks::{Mount, MountTable};
 use super::tree::{Entry, Id, Kind, ROOT, Tree, Unwalked};
+use crate::mounts::{Mount, MountTable};
 
 /// How far a scan has got, for the screen to show while it runs, and how to stop it.
 #[derive(Debug, Default)]

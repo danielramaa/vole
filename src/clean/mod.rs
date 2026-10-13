@@ -16,6 +16,7 @@ use crate::disk;
 use crate::in_use;
 use crate::safety::Rules;
 use plan::{Item, Plan};
+pub use root::{journal_usage, sees_whole_journal};
 pub use screen::Screen;
 
 /// Builds the Plan. Only reads: nothing on disk changes.

@@ -1,0 +1,1182 @@
+//! The `status` screen: the dashboard, read again every refresh while it is on screen.
+
+use std::collections::VecDeque;
+use std::io;
+use std::time::{Duration, Instant};
+
+use ratatui::Frame;
+use ratatui::crossterm::event::{KeyCode, KeyEvent};
+use ratatui::layout::{Constraint, Layout, Rect};
+use ratatui::style::{Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, RenderDirection, Sparkline};
+
+use super::battery::State;
+use super::cpu::Times;
+use super::health::{Check, Health};
+use super::processes::Process;
+use super::reading::{Reader, Reading};
+use crate::app::{Module, ModuleScreen};
+use crate::config::Config;
+use crate::term::RunRoot;
+use crate::{size, ui};
+
+/// How long a reading may take before the title says how old the one shown is: a disk that
+/// doesn't answer can hold it up for good.
+const SLOW: Duration = Duration::from_secs(5);
+
+/// The intervals `+` and `-` step through, in milliseconds: as configurable, from 250 ms to 5 s.
+const INTERVALS: [u64; 5] = [250, 500, 1000, 2000, 5000];
+
+/// How calmly the graphs follow the readings: a change shows about two thirds of the way after
+/// this long, whether the dashboard reads every 250 ms or every second.
+const SMOOTHING: Duration = Duration::from_millis(500);
+
+/// How many readings the graphs keep: more than a terminal is wide.
+const HISTORY: usize = 1024;
+
+/// The columns between the cores' columns, and between panels side by side.
+const GAP: u16 = 2;
+
+/// The rows the cores leave the processes panel at least: its heading, the column names and three
+/// processes.
+const PROCESSES: u16 = 5;
+
+pub struct Screen {
+    /// How long between readings.
+    interval: Duration,
+    /// The thread taking readings, from the first tick on.
+    reader: Option<Reader>,
+    /// Whether a reading was asked for and hasn't come yet.
+    waiting: bool,
+    /// When the last reading was asked for, and when the one shown came.
+    asked: Instant,
+    shown_at: Option<Instant>,
+    /// Whether the next reading starts afresh: the dashboard was left since the last.
+    afresh: bool,
+    /// Whether the reading asked for before the dashboard was left is to be dropped when it
+    /// comes: it says nothing about now.
+    stale: bool,
+    /// When to ask for the next reading.
+    due: Instant,
+    /// The latest reading.
+    reading: Reading,
+    /// The CPU use of the readings so far.
+    cpu_graph: History,
+    /// Whether the busiest processes are those holding the most memory, not CPU.
+    by_memory: bool,
+    /// What vole can clean up, measured each time the dashboard opens.
+    health: Health,
+    /// Whether the health panel is to be measured on the next tick.
+    measure_health: bool,
+    /// The module a shortcut asked to open, until the App takes it.
+    open: Option<Module>,
+    /// The memory used, as of each reading so far.
+    memory_graph: History,
+    /// What the network received and sent each second, as of each reading so far.
+    received_graph: History,
+    sent_graph: History,
+    /// Why there are no readings any more, once the thread taking them stopped.
+    failed: Option<String>,
+}
+
+impl Screen {
+    pub fn new(config: &Config) -> Self {
+        Self {
+            interval: Duration::from_millis(u64::from(config.status_refresh_ms)),
+            reader: None,
+            waiting: false,
+            asked: Instant::now(),
+            shown_at: None,
+            afresh: false,
+            stale: false,
+            due: Instant::now(),
+            reading: Reading::default(),
+            cpu_graph: History::default(),
+            by_memory: false,
+            health: Health::default(),
+            measure_health: true,
+            open: None,
+            memory_graph: History::default(),
+            received_graph: History::default(),
+            sent_graph: History::default(),
+            failed: None,
+        }
+    }
+
+    /// The dashboard is opened again: the readings start afresh, and the health panel is measured
+    /// again, as clean and orphans change it. If the thread taking the readings had stopped, a
+    /// new one starts.
+    pub fn reopen(&mut self) {
+        self.measure_health = true;
+        self.afresh = true;
+        self.stale = self.waiting;
+        if self.failed.take().is_some() {
+            self.reader = None;
+            self.waiting = false;
+            self.stale = false;
+        }
+    }
+
+    /// Reads every `interval` from now on; the next reading comes no later than that from now.
+    fn set_interval(&mut self, interval: Duration) {
+        self.interval = interval;
+        self.due = self.due.min(Instant::now() + interval);
+    }
+
+    fn show(&mut self, reading: Reading) {
+        self.shown_at = Some(Instant::now());
+        let elapsed = reading.elapsed;
+        if let Some(cpu) = &reading.cpu {
+            let busy = ui::share(cpu.all.busy, cpu.all.total, 1000);
+            self.cpu_graph.push(busy, elapsed);
+        }
+        if let Some(network) = &reading.network {
+            let received = network.iter().map(|interface| interface.received).sum();
+            self.received_graph.push(received, elapsed);
+            let sent = network.iter().map(|interface| interface.sent).sum();
+            self.sent_graph.push(sent, elapsed);
+        }
+        if let Some(memory) = &reading.memory {
+            let used = ui::share(memory.used(), memory.total, 1000);
+            self.memory_graph.push(used, elapsed);
+        }
+        self.reading = reading;
+    }
+
+    /// The CPU panel: the use of all CPUs over time, then of each now, in `cores`.
+    fn draw_cpu(&self, frame: &mut Frame, area: Rect, cores: Vec<Line>) {
+        let total = self.reading.cpu.as_ref();
+        let block = panel("CPU", total.map_or(String::new(), |cpu| percent(cpu.all)));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [graph, grid] =
+            Layout::vertical([Constraint::Fill(1), Constraint::Length(height(&cores))])
+                .areas(inner);
+        self.cpu_graph.draw(frame, graph, 1000);
+        frame.render_widget(Paragraph::new(cores), grid);
+    }
+
+    /// The processes panel: the busiest processes, by CPU or by memory, as many as fit.
+    fn draw_processes(&self, frame: &mut Frame, area: Rect) {
+        let by = if self.by_memory {
+            "by memory"
+        } else {
+            "by CPU"
+        };
+        let block = panel("Processes", by.into());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let Some(processes) = &self.reading.processes else {
+            return;
+        };
+        let mut busiest: Vec<&Process> = processes.iter().collect();
+        let by_cpu = |a: &&Process, b: &&Process| b.cpu.total_cmp(&a.cpu);
+        let by_memory = |a: &&Process, b: &&Process| b.memory.cmp(&a.memory);
+        if self.by_memory {
+            busiest.sort_by(|a, b| by_memory(a, b).then(by_cpu(a, b)));
+        } else {
+            busiest.sort_by(|a, b| by_cpu(a, b).then(by_memory(a, b)));
+        }
+        // The pid, the name, its share of a CPU and the memory it holds, e.g.
+        // `   4321  firefox   12.3%    1.2 GiB`.
+        let name = usize::from(inner.width).saturating_sub(7 + 2 + 2 + 6 + 2 + 10);
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let mut lines = vec![Line::styled(
+            format!(
+                "{:>7}  {:<name$}  {:>6}  {:>10}",
+                "PID", "Name", "CPU", "Memory"
+            ),
+            dim,
+        )];
+        lines.extend(
+            busiest
+                .iter()
+                .take(usize::from(inner.height.saturating_sub(1)))
+                .map(|process| {
+                    let shown = ui::fit(&ui::printable(&process.name), name);
+                    // Lined up by the columns it takes: a wide character takes two.
+                    let pad = name.saturating_sub(Span::raw(shown.as_str()).width());
+                    // Several CPUs' worth needs no tenths, so `1600%` fits where `12.3%` does.
+                    let cpu = if process.cpu < 100.0 {
+                        format!("{:.1}%", process.cpu)
+                    } else {
+                        format!("{:.0}%", process.cpu)
+                    };
+                    Line::from(format!(
+                        "{:>7}  {shown}{}  {cpu:>6}  {:>10}",
+                        process.pid,
+                        " ".repeat(pad),
+                        size::format(process.memory)
+                    ))
+                }),
+        );
+        frame.render_widget(Paragraph::new(lines), inner);
+    }
+
+    /// The memory panel: how much memory and swap are used, then the memory used over time.
+    fn draw_memory(&self, frame: &mut Frame, area: Rect) {
+        let block = panel("Memory", String::new());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let mut rows = Vec::new();
+        if let Some(memory) = &self.reading.memory {
+            let used = memory.used();
+            let detail = part_of(used, memory.total);
+            rows.push(("Used".into(), used, memory.total, detail));
+            if memory.swap_total > 0 {
+                let swap = memory.swap_used();
+                let detail = part_of(swap, memory.swap_total);
+                rows.push(("Swap".into(), swap, memory.swap_total, detail));
+            }
+        }
+        let lines = meters(&rows, inner.width);
+        let [meters, graph] =
+            Layout::vertical([Constraint::Length(height(&lines)), Constraint::Fill(1)])
+                .areas(inner);
+        frame.render_widget(Paragraph::new(lines), meters);
+        self.memory_graph.draw(frame, graph, 1000);
+    }
+
+    /// The network panel: what the network receives and sends now, then over time, each graph
+    /// up to the most it reached on screen.
+    fn draw_network(&self, frame: &mut Frame, area: Rect) {
+        let network = self.reading.network.as_deref().unwrap_or_default();
+        let names: Vec<&str> = network
+            .iter()
+            .map(|interface| interface.name.as_str())
+            .collect();
+        let block = panel("Network", names.join(", "));
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        let [now, graphs] =
+            Layout::vertical([Constraint::Length(1), Constraint::Fill(1)]).areas(inner);
+        if self.reading.network.is_some() {
+            let received = network.iter().map(|interface| interface.received).sum();
+            let sent = network.iter().map(|interface| interface.sent).sum();
+            let text = format!("↓ {}  ↑ {}", rate(received), rate(sent));
+            frame.render_widget(Line::from(text), now);
+        }
+        // What is sent only shows with room for both graphs.
+        let [received, sent] = match graphs.height {
+            0 | 1 => [graphs, Rect::default()],
+            _ => Layout::vertical([Constraint::Fill(1); 2]).areas(graphs),
+        };
+        for (graph, area, arrow) in [
+            (&self.received_graph, received, "↓"),
+            (&self.sent_graph, sent, "↑"),
+        ] {
+            let [label, area] =
+                Layout::horizontal([Constraint::Length(2), Constraint::Fill(1)]).areas(area);
+            frame.render_widget(Line::from(arrow), label);
+            graph.draw(frame, area, graph.peak(area.width));
+        }
+    }
+
+    /// The health panel's lines: what each check measured, or why it couldn't, at the right.
+    fn health_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let width = usize::from(width);
+        let dim = Style::new().add_modifier(Modifier::DIM);
+        let label = Check::ALL.iter().map(|check| check.label().len()).max();
+        let label = label.unwrap_or(0);
+        let lines = Check::ALL.iter().map(|&check| {
+            let name = vec![Span::raw(format!("{:<label$}", check.label()))];
+            match self.health.row(check) {
+                Some(Ok(value)) => ui::right_aligned(name, value.clone(), width),
+                Some(Err(why)) => {
+                    let why = ui::fit(&ui::printable(why), width.saturating_sub(label + 2));
+                    Line::from(vec![name[0].clone(), Span::styled(format!("  {why}"), dim)])
+                }
+                None => Line::from(vec![name[0].clone(), Span::styled("  checking…", dim)]),
+            }
+        });
+        lines.collect()
+    }
+
+    /// The temperatures panel's lines: what each sensor chip measures first, in bold when it is
+    /// too hot.
+    fn temperature_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let temperatures = &self.reading.temperatures;
+        let chip = temperatures
+            .iter()
+            .map(|t| Span::raw(t.chip.as_str()).width());
+        let chip = chip.max().unwrap_or(0);
+        let bold = Style::new().add_modifier(Modifier::BOLD);
+        let lines = temperatures.iter().map(|temperature| {
+            let label = temperature.label.as_deref().unwrap_or_default();
+            let name = ui::printable(&format!("{:<chip$}  {label}", temperature.chip));
+            let degrees = format!("{:.0}°C", temperature.celsius);
+            // A long name is cut, so the degrees always show.
+            let room = usize::from(width).saturating_sub(Span::raw(degrees.as_str()).width() + 1);
+            let name = Span::raw(ui::fit(&name, room));
+            let line = ui::right_aligned(vec![name], degrees, usize::from(width));
+            if temperature.is_high() {
+                line.style(bold)
+            } else {
+                line
+            }
+        });
+        lines.collect()
+    }
+
+    /// The battery panel's lines: how full each battery is, and how long until it is empty or
+    /// full.
+    fn battery_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let rows: Vec<Meter> = (self.reading.batteries.iter())
+            .map(|battery| {
+                let left = battery.left.map(hours_and_minutes);
+                let state = match (battery.state, left) {
+                    (State::Discharging, Some(left)) => format!("{left} left"),
+                    (State::Discharging, None) => "on battery".into(),
+                    (State::Charging, Some(left)) => format!("{left} to full"),
+                    (State::Charging, None) => "charging".into(),
+                    (State::Full, _) => "full".into(),
+                    (State::NotCharging, _) => "not charging".into(),
+                    (State::Unknown, _) => String::new(),
+                };
+                (battery.name.clone(), battery.percent, 100, state)
+            })
+            .collect();
+        meters(&rows, width)
+    }
+
+    /// The disks panel's lines: how full each filesystem on a disk is, then what the disks read
+    /// and write.
+    fn disk_lines(&self, width: u16) -> Vec<Line<'static>> {
+        let reading = &self.reading;
+        let rows: Vec<Meter> = reading
+            .filesystems
+            .iter()
+            .map(|filesystem| {
+                let path = ui::printable(&filesystem.path.to_string_lossy());
+                let free = format!("{} free", size::format(filesystem.free));
+                let whole = filesystem.used + filesystem.free;
+                (path, filesystem.used, whole, free)
+            })
+            .collect();
+        let mut lines = meters(&rows, width);
+        // All disks together: a disk's own would take more than 80 columns.
+        if let Some(io) = &reading.disk_io {
+            let read = io.iter().map(|disk| disk.read).sum();
+            let written = io.iter().map(|disk| disk.written).sum();
+            lines.push(Line::from(format!(
+                "read {}  write {}",
+                rate(read),
+                rate(written)
+            )));
+        }
+        lines
+    }
+}
+
+impl ModuleScreen for Screen {
+    /// Picks up the reading asked for, and asks for the next one when it is due.
+    fn tick(&mut self) {
+        if self.failed.is_some() {
+            return;
+        }
+        let now = Instant::now();
+        // What came in while the dashboard wasn't on screen is taken in first.
+        self.health.update();
+        if std::mem::take(&mut self.measure_health) {
+            self.health.measure();
+        }
+        match self.reader.get_or_insert_with(Reader::start).take() {
+            Ok(Some(reading)) => {
+                self.waiting = false;
+                if !std::mem::take(&mut self.stale) {
+                    self.show(reading);
+                }
+            }
+            Ok(None) => {}
+            Err(_) => {
+                self.failed = Some("Reading the system stopped unexpectedly.".into());
+                return;
+            }
+        }
+        if !self.waiting
+            && now >= self.due
+            && let Some(reader) = &self.reader
+        {
+            reader.ask(std::mem::take(&mut self.afresh));
+            self.waiting = true;
+            self.asked = now;
+            // Readings stay `interval` apart on average, though ticks come only now and then.
+            self.due += self.interval;
+            if self.due < now {
+                self.due = now + self.interval;
+            }
+        }
+    }
+
+    fn on_key(&mut self, key: KeyEvent) -> bool {
+        match key.code {
+            KeyCode::Char('+') => self.set_interval(longer(self.interval)),
+            KeyCode::Char('-') => self.set_interval(shorter(self.interval)),
+            KeyCode::Char('s') => self.by_memory = !self.by_memory,
+            KeyCode::Char('c') => self.open = Some(Module::Clean),
+            KeyCode::Char('o') => self.open = Some(Module::Orphans),
+            _ => return false,
+        }
+        true
+    }
+
+    fn hint(&self) -> &'static str {
+        if self.by_memory {
+            "+/- refresh interval · s sort by CPU · c clean · o orphans"
+        } else {
+            "+/- refresh interval · s sort by memory · c clean · o orphans"
+        }
+    }
+
+    fn can_leave(&self) -> bool {
+        true
+    }
+
+    fn take_open(&mut self) -> Option<Module> {
+        self.open.take()
+    }
+
+    fn needs_terminal(&self) -> bool {
+        false
+    }
+
+    fn run_root(&mut self, _: &mut RunRoot) -> io::Result<()> {
+        Ok(())
+    }
+
+    fn draw(&mut self, frame: &mut Frame, area: Rect) {
+        let mut every = format!(" every {} ", interval_text(self.interval));
+        if let Some(shown_at) = self.shown_at
+            && self.waiting
+            && self.asked.elapsed() > SLOW
+        {
+            let ago = shown_at.elapsed().as_secs();
+            every = format!(
+                " every {}, last read {ago} s ago ",
+                interval_text(self.interval)
+            );
+        }
+        let block = Block::bordered()
+            .title(" status ")
+            .title(Line::from(every).right_aligned());
+        let inner = block.inner(area);
+        frame.render_widget(block, area);
+        if let Some(failed) = &self.failed {
+            frame.render_widget(Paragraph::new(failed.as_str()), inner);
+            return;
+        }
+        let [left, right] = Layout::horizontal([Constraint::Fill(1); 2])
+            .spacing(GAP)
+            .areas(inner);
+        // The graph grows with the screen, slower than the list of processes.
+        let graph = (left.height.saturating_sub(21) / 4 + 2).min(10);
+        let health = self.health_lines(left.width);
+        // The cores leave room for a few processes.
+        let room = left
+            .height
+            .saturating_sub(1 + graph + panel_height(&health) + PROCESSES);
+        let cores = self.reading.cpu.as_ref().map(|cpu| cpu.cores.as_slice());
+        let cores = core_lines(cores.unwrap_or_default(), left.width, room);
+        let [cpu, processes, health_area] = Layout::vertical([
+            Constraint::Length(1 + graph + height(&cores)),
+            Constraint::Fill(1),
+            Constraint::Length(panel_height(&health)),
+        ])
+        .areas(left);
+        self.draw_cpu(frame, cpu, cores);
+        self.draw_processes(frame, processes);
+        let block = panel("Health", "c clean · o orphans".into());
+        draw_lines(frame, health_area, block, health);
+        let disks = self.disk_lines(right.width);
+        let temperatures = self.temperature_lines(right.width);
+        let batteries = self.battery_lines(right.width);
+        let [memory, network, disks_area, temperatures_area, battery_area] = Layout::vertical([
+            Constraint::Fill(1),
+            Constraint::Fill(1),
+            Constraint::Length(panel_height(&disks)),
+            Constraint::Length(panel_height(&temperatures)),
+            Constraint::Length(panel_height(&batteries)),
+        ])
+        .areas(right);
+        self.draw_memory(frame, memory);
+        self.draw_network(frame, network);
+        draw_lines(frame, disks_area, panel("Disks", String::new()), disks);
+        let block = panel("Temperatures", String::new());
+        draw_lines(frame, temperatures_area, block, temperatures);
+        draw_lines(
+            frame,
+            battery_area,
+            panel("Battery", String::new()),
+            batteries,
+        );
+    }
+}
+
+/// A graph's values, oldest first, the last [`HISTORY`] of them, smoothed.
+#[derive(Default)]
+struct History(VecDeque<f64>);
+
+impl History {
+    /// Adds `value`, read `elapsed` after the value before. It goes only part of the way from
+    /// that value, as far as [`SMOOTHING`] says for `elapsed`; all the way without one.
+    fn push(&mut self, value: u64, elapsed: Option<Duration>) {
+        let value = value as f64;
+        let smoothed = match (self.0.back(), elapsed) {
+            (Some(&last), Some(elapsed)) => {
+                let follow = 1.0 - (-elapsed.as_secs_f64() / SMOOTHING.as_secs_f64()).exp();
+                last + (value - last) * follow
+            }
+            _ => value,
+        };
+        if self.0.len() == HISTORY {
+            self.0.pop_front();
+        }
+        self.0.push_back(smoothed);
+    }
+
+    /// The values shown in `width` columns, newest first.
+    fn shown(&self, width: u16) -> impl Iterator<Item = u64> {
+        let shown = self.0.iter().rev().take(usize::from(width));
+        shown.map(|&value| value.round() as u64)
+    }
+
+    /// The most the graph shows in `width` columns, at least 1.
+    fn peak(&self, width: u16) -> u64 {
+        self.shown(width).max().unwrap_or(0).max(1)
+    }
+
+    /// Draws the values as a graph from 0 to `max`, the newest at the right edge.
+    fn draw(&self, frame: &mut Frame, area: Rect, max: u64) {
+        let newest_first: Vec<u64> = self.shown(area.width).collect();
+        let graph = Sparkline::default()
+            .data(newest_first)
+            .max(max)
+            .direction(RenderDirection::RightToLeft);
+        frame.render_widget(graph, area);
+    }
+}
+
+/// A panel's frame: a rule across its top, with `title` at the left and `value` at the right.
+fn panel(title: &str, value: String) -> Block<'_> {
+    let dim = Style::new().add_modifier(Modifier::DIM);
+    // The rule is dim; its titles aren't.
+    let bright = Style::new().remove_modifier(Modifier::DIM);
+    let mut block = Block::new()
+        .borders(Borders::TOP)
+        .border_style(dim)
+        .title(Line::styled(
+            format!("{title} "),
+            bright.add_modifier(Modifier::BOLD),
+        ));
+    if !value.is_empty() {
+        block = block.title(Line::styled(format!(" {value}"), bright).right_aligned());
+    }
+    block
+}
+
+/// Draws a panel holding `lines`.
+fn draw_lines(frame: &mut Frame, area: Rect, block: Block, lines: Vec<Line>) {
+    frame.render_widget(Paragraph::new(lines).block(block), area);
+}
+
+/// How many rows `lines` take.
+fn height(lines: &[Line]) -> u16 {
+    u16::try_from(lines.len()).unwrap_or(u16::MAX)
+}
+
+/// How many rows a panel holding `lines` takes: none when there is nothing to show.
+fn panel_height(lines: &[Line]) -> u16 {
+    match height(lines) {
+        0 => 0,
+        rows => rows.saturating_add(1),
+    }
+}
+
+/// A rate in bytes per second, e.g. `1.2 MiB/s`.
+fn rate(bytes: u64) -> String {
+    format!("{}/s", size::format(bytes))
+}
+
+/// A part of a whole to show as a bar: its label, the part, the whole, and a detail.
+type Meter = (String, u64, u64, String);
+
+/// Lines showing parts of wholes as bars, lined up: each row's label, its bar, its percentage
+/// and its detail at the right edge of `width`, e.g. `Swap  ██▌        12%  1.0 of 8.0 GiB`.
+fn meters(rows: &[Meter], width: u16) -> Vec<Line<'static>> {
+    let width = usize::from(width);
+    let columns = |text: &str| Span::raw(text).width();
+    // A long label, like a USB disk's mount point, is cut at the start, so the numbers show.
+    let label = rows.iter().map(|row| columns(&row.0)).max().unwrap_or(0);
+    let label = label.min(width / 3);
+    let detail = rows.iter().map(|row| columns(&row.3)).max().unwrap_or(0);
+    let bar = width.saturating_sub(label + 1 + 5 + 2 + detail);
+    rows.iter()
+        .map(|(name, part, whole, text)| {
+            let name = ui::fit_start(name, label);
+            let name = format!("{name}{}", " ".repeat(label.saturating_sub(columns(&name))));
+            let share = format!("{}%", ui::share(*part, *whole, 100));
+            let bar = ui::bar(*part, *whole, bar);
+            let text = format!("{}{text}", " ".repeat(detail.saturating_sub(columns(text))));
+            Line::from(format!("{name} {bar} {share:>4}  {text}"))
+        })
+        .collect()
+}
+
+/// `part` of `whole`, with the unit once when they share it, e.g. `5.1 of 15.2 GiB`.
+fn part_of(part: u64, whole: u64) -> String {
+    let (part, whole) = (size::format(part), size::format(whole));
+    match (part.split_once(' '), whole.split_once(' ')) {
+        (Some((number, unit)), Some((_, whole_unit))) if unit == whole_unit => {
+            format!("{number} of {whole}")
+        }
+        _ => format!("{part} of {whole}"),
+    }
+}
+
+/// The share of `times` that was busy, in percent.
+fn percent(times: Times) -> String {
+    format!("{}%", ui::share(times.busy, times.total, 100))
+}
+
+/// Each core's use, in `width` columns and, when it can be, no more than `rows` rows: as a bar
+/// with its number and percentage, in as many columns as fit, numbered down each column; or, for
+/// more cores than that holds, as a strip of a cell per core, filled as far as the core is busy.
+fn core_lines(cores: &[(u32, Times)], width: u16, rows: u16) -> Vec<Line<'static>> {
+    let Some(last) = cores.iter().map(|&(n, _)| n).max() else {
+        return Vec::new();
+    };
+    let label = last.to_string().len();
+    // The number, a bar of at least 3 cells and the percentage, e.g. `12 ██▌  45%`.
+    let narrowest = label + 1 + 3 + 5;
+    let gap = usize::from(GAP);
+    let width = usize::from(width);
+    let columns = ((width + gap) / (narrowest + gap)).clamp(1, cores.len());
+    let needed = cores.len().div_ceil(columns);
+    if needed > usize::from(rows) {
+        return core_strip(cores, width, label);
+    }
+    let cell = (width + gap) / columns - gap;
+    let bar = cell.saturating_sub(label + 1 + 5).max(1);
+    (0..needed)
+        .map(|row| {
+            let cells: Vec<String> = cores
+                .iter()
+                .skip(row)
+                .step_by(needed)
+                .map(|&(n, times)| {
+                    let share = ui::bar(times.busy, times.total, bar);
+                    format!("{n:>label$} {share} {:>4}", percent(times))
+                })
+                .collect();
+            Line::from(cells.join(&" ".repeat(gap)))
+        })
+        .collect()
+}
+
+/// Each core's use as a cell, `▁` idle to `█` busy, in rows of `width` columns, each after the
+/// number of its first core, `label` columns wide.
+fn core_strip(cores: &[(u32, Times)], width: usize, label: usize) -> Vec<Line<'static>> {
+    const LEVELS: [&str; 8] = ["▁", "▂", "▃", "▄", "▅", "▆", "▇", "█"];
+    let cells = width.saturating_sub(label + 1).max(1);
+    cores
+        .chunks(cells)
+        .map(|row| {
+            let busy = row
+                .iter()
+                .map(|&(_, times)| LEVELS[ui::share(times.busy, times.total, 7) as usize]);
+            Line::from(format!("{:>label$} {}", row[0].0, busy.collect::<String>()))
+        })
+        .collect()
+}
+
+/// `duration` in hours and minutes, e.g. `3 h 40 min`.
+fn hours_and_minutes(duration: Duration) -> String {
+    let minutes = duration.as_secs() / 60;
+    match (minutes / 60, minutes % 60) {
+        (0, minutes) => format!("{minutes} min"),
+        (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
+}
+
+/// The next interval of [`INTERVALS`] after `interval`, or the longest.
+fn longer(interval: Duration) -> Duration {
+    let next = INTERVALS
+        .iter()
+        .find(|&&ms| Duration::from_millis(ms) > interval);
+    Duration::from_millis(*next.unwrap_or(&INTERVALS[INTERVALS.len() - 1]))
+}
+
+/// The interval of [`INTERVALS`] before `interval`, or the shortest.
+fn shorter(interval: Duration) -> Duration {
+    let next = INTERVALS
+        .iter()
+        .rev()
+        .find(|&&ms| Duration::from_millis(ms) < interval);
+    Duration::from_millis(*next.unwrap_or(&INTERVALS[0]))
+}
+
+/// `interval` as the title says it, e.g. `250 ms` or `1.5 s`.
+fn interval_text(interval: Duration) -> String {
+    let ms = interval.as_millis();
+    if ms < 1000 {
+        return format!("{ms} ms");
+    }
+    let seconds = format!("{}.{:03}", ms / 1000, ms % 1000);
+    format!("{} s", seconds.trim_end_matches('0').trim_end_matches('.'))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::status::battery::Battery;
+    use crate::status::cpu::Cpu;
+    use crate::status::disks::{DiskIo, Filesystem};
+    use crate::status::memory::Memory;
+    use crate::status::network::Traffic;
+    use crate::status::sensors::Temperature;
+
+    const GIB: u64 = 1024 * size::MIB;
+
+    fn render(screen: &mut Screen, width: u16, height: u16) -> Vec<String> {
+        let backend = ratatui::backend::TestBackend::new(width, height);
+        let mut terminal = ratatui::Terminal::new(backend).unwrap();
+        terminal
+            .draw(|frame| screen.draw(frame, frame.area()))
+            .unwrap();
+        let buffer = terminal.backend().buffer();
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    fn times(busy: u64, total: u64) -> Times {
+        Times { busy, total }
+    }
+
+    /// A screen showing a reading of 4 CPUs.
+    fn screen() -> Screen {
+        let mut screen = Screen::new(&Config::default());
+        let cpu = Cpu {
+            all: times(250, 400),
+            cores: vec![
+                (0, times(100, 100)),
+                (1, times(50, 100)),
+                (2, times(100, 100)),
+                (3, times(0, 100)),
+            ],
+        };
+        let reading = Reading {
+            cpu: Some(cpu),
+            ..Reading::default()
+        };
+        screen.show(reading);
+        screen
+    }
+
+    #[test]
+    fn shows_the_use_of_each_cpu() {
+        let rows = render(&mut screen(), 80, 24).join("\n");
+        assert!(rows.contains("every 1 s"), "{rows}");
+        assert!(rows.contains("CPU") && rows.contains("62%"), "{rows}");
+        assert!(rows.contains("0 █"), "{rows}");
+        assert!(rows.contains(" 50%") && rows.contains("100%"), "{rows}");
+        // With no room for a bar each, the cores take a cell each.
+        let rows = render(&mut screen(), 80, 12).join("\n");
+        assert!(rows.contains("0 █▄█▁"), "{rows}");
+    }
+
+    #[test]
+    fn shows_swap_only_when_there_is_some() {
+        let mut screen = screen();
+        let memory = Memory {
+            total: 16 * GIB,
+            available: 4 * GIB,
+            swap_total: 0,
+            swap_free: 0,
+        };
+        let reading = Reading {
+            memory: Some(memory),
+            ..Reading::default()
+        };
+        screen.show(reading);
+        let rows = render(&mut screen, 80, 12).join("\n");
+        assert!(
+            rows.contains("Used") && rows.contains("75%  12.0 of 16.0 GiB"),
+            "{rows}"
+        );
+        assert!(!rows.contains("Swap"), "{rows}");
+    }
+
+    #[test]
+    fn shows_how_full_the_disks_are_and_what_they_read_and_write() {
+        let mut screen = screen();
+        let disk = |name: &str, read| DiskIo {
+            name: name.into(),
+            read,
+            written: 0,
+        };
+        let reading = Reading {
+            filesystems: vec![Filesystem {
+                path: "/home".into(),
+                used: 3 * GIB,
+                free: GIB,
+            }],
+            disk_io: Some(vec![disk("nvme0n1", 1024), disk("sda", 1024)]),
+            ..Reading::default()
+        };
+        screen.show(reading);
+        let rows = render(&mut screen, 80, 12).join("\n");
+        assert!(rows.contains("Disks"), "{rows}");
+        assert!(
+            rows.contains("/home") && rows.contains("75%  1.0 GiB free"),
+            "{rows}"
+        );
+        assert!(rows.contains("read 2.0 KiB/s  write 0 B/s"), "{rows}");
+    }
+
+    #[test]
+    fn shows_what_the_network_receives_and_sends() {
+        let mut screen = screen();
+        let interface = |name: &str| Traffic {
+            name: name.into(),
+            received: 1024,
+            sent: 512,
+        };
+        let reading = Reading {
+            network: Some(vec![interface("enp3s0"), interface("wlan0")]),
+            ..Reading::default()
+        };
+        screen.show(reading);
+        assert_eq!(screen.received_graph.0.back(), Some(&2048.0));
+        let rows = render(&mut screen, 80, 16).join("\n");
+        assert!(
+            rows.contains("Network") && rows.contains("enp3s0, wlan0"),
+            "{rows}"
+        );
+        assert!(rows.contains("↓ 2.0 KiB/s  ↑ 1.0 KiB/s"), "{rows}");
+    }
+
+    #[test]
+    fn shows_temperatures_in_bold_when_too_hot() {
+        let mut screen = screen();
+        let temperature = |chip: &str, label: Option<&str>, celsius| Temperature {
+            chip: chip.into(),
+            label: label.map(String::from),
+            celsius,
+            high: Some(100.0),
+        };
+        let reading = Reading {
+            temperatures: vec![
+                temperature("coretemp", Some("Package id 0"), 100.4),
+                temperature("nvme", None, 36.85),
+            ],
+            ..Reading::default()
+        };
+        screen.show(reading);
+        let lines = screen.temperature_lines(30);
+        assert_eq!(lines[0].to_string(), "coretemp  Package id 0   100°C");
+        assert_eq!(lines[1].to_string(), format!("nvme{}37°C", " ".repeat(22)));
+        assert!(lines[0].style.add_modifier.contains(Modifier::BOLD));
+        assert!(!lines[1].style.add_modifier.contains(Modifier::BOLD));
+        // Long names are cut, so the degrees show.
+        let lines = screen.temperature_lines(20);
+        assert_eq!(lines[0].to_string(), "coretemp  Pac… 100°C");
+        // No sensors, no panel.
+        screen.show(Reading::default());
+        assert_eq!(panel_height(&screen.temperature_lines(30)), 0);
+    }
+
+    #[test]
+    fn says_how_long_the_batteries_last() {
+        let mut screen = screen();
+        let battery = |name: &str, state, left| Battery {
+            name: name.into(),
+            percent: 56,
+            state,
+            left,
+        };
+        let reading = Reading {
+            batteries: vec![
+                battery(
+                    "BAT0",
+                    State::Discharging,
+                    Some(Duration::from_secs(13_203)),
+                ),
+                battery("BAT1", State::Charging, None),
+                battery("BAT2", State::NotCharging, None),
+            ],
+            ..Reading::default()
+        };
+        screen.show(reading);
+        let lines: Vec<String> = (screen.battery_lines(40).iter())
+            .map(|line| line.to_string())
+            .collect();
+        assert!(lines[0].ends_with("56%  3 h 40 min left"), "{lines:#?}");
+        // Details line up at the right.
+        assert!(lines[1].ends_with("56%         charging"), "{lines:#?}");
+        assert!(lines[2].ends_with("not charging"), "{lines:#?}");
+        assert_eq!(hours_and_minutes(Duration::from_secs(59 * 60)), "59 min");
+    }
+
+    #[test]
+    fn lists_the_busiest_processes_by_cpu_or_by_memory() {
+        let mut screen = screen();
+        let reading = Reading {
+            processes: Some(vec![
+                Process::new(1, "systemd", 0.0, 10 * size::MIB),
+                Process::new(4321, "firefox", 0.5, GIB),
+                Process::new(66, "cc1plus", 98.7, 400 * size::MIB),
+            ]),
+            ..Reading::default()
+        };
+        screen.show(reading);
+        let names = |screen: &mut Screen| -> Vec<String> {
+            let rows = render(screen, 80, 16);
+            let at = |name: &str| rows.iter().position(|row| row.contains(name)).unwrap();
+            let mut names = ["systemd", "firefox", "cc1plus"].map(String::from).to_vec();
+            names.sort_by_key(|name| at(name));
+            names
+        };
+        assert_eq!(names(&mut screen), ["cc1plus", "firefox", "systemd"]);
+        let rows = render(&mut screen, 80, 16).join("\n");
+        assert!(
+            rows.contains("by CPU") && rows.contains("  66  cc1plus"),
+            "{rows}"
+        );
+        assert!(rows.contains("98.7%   400.0 MiB"), "{rows}");
+        assert!(screen.hint().contains("s sort by memory"));
+        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('s'))));
+        assert_eq!(names(&mut screen), ["firefox", "cc1plus", "systemd"]);
+        assert!(render(&mut screen, 80, 16).join("\n").contains("by memory"));
+        assert!(!screen.on_key(KeyEvent::from(KeyCode::Char('q'))));
+    }
+
+    #[test]
+    fn says_what_vole_can_clean_up_or_why_it_cannot() {
+        let mut screen = screen();
+        let lines = |screen: &Screen| -> Vec<String> {
+            let lines = screen.health_lines(38);
+            lines.iter().map(|line| line.to_string()).collect()
+        };
+        assert_eq!(lines(&screen)[0], "Pacman cache       checking…");
+        screen.health = Health::with(&[
+            (Check::PacmanCache, Ok("14.2 GiB".into())),
+            (
+                Check::Journal,
+                Err("journalctl failed: no such\nfile".into()),
+            ),
+        ]);
+        let lines = lines(&screen);
+        assert_eq!(lines[0], format!("Pacman cache{}14.2 GiB", " ".repeat(18)));
+        assert_eq!(lines[1], "Journal            journalctl failed:…");
+    }
+
+    #[test]
+    fn c_and_o_open_clean_and_orphans() {
+        let mut screen = screen();
+        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('c'))));
+        assert_eq!(screen.take_open(), Some(Module::Clean));
+        assert_eq!(screen.take_open(), None);
+        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('o'))));
+        assert_eq!(screen.take_open(), Some(Module::Orphans));
+        assert!(
+            render(&mut screen, 80, 24)
+                .join("\n")
+                .contains("c clean · o orphans")
+        );
+    }
+
+    #[test]
+    fn measures_the_health_panel_each_time_it_opens() {
+        let mut screen = screen();
+        assert!(screen.measure_health);
+        screen.measure_health = false;
+        screen.reopen();
+        assert!(screen.measure_health);
+    }
+
+    #[test]
+    fn long_mount_points_leave_room_for_the_numbers() {
+        let rows = [
+            ("/".into(), GIB, 4 * GIB, "3.0 GiB free".into()),
+            (
+                "/run/media/me/My Passport".into(),
+                GIB,
+                2 * GIB,
+                "1.0 GiB free".into(),
+            ),
+        ];
+        let lines: Vec<String> = (meters(&rows, 38).iter())
+            .map(|line| line.to_string())
+            .collect();
+        // A bar of 6 cells: 38 columns less the label's 12, a percentage and the detail.
+        let line = |label: &str, bar: &str, share: &str, free: &str| {
+            format!("{label:<12} {bar:<6} {share:>4}  {free}")
+        };
+        assert_eq!(lines[0], line("/", "█▌", "25%", "3.0 GiB free"));
+        assert_eq!(lines[1], line("…My Passport", "███", "50%", "1.0 GiB free"));
+    }
+
+    #[test]
+    fn process_rows_fit_their_columns() {
+        let mut screen = screen();
+        let reading = Reading {
+            processes: Some(vec![
+                Process::new(4321, "xz", 1600.0, GIB),
+                Process::new(66, "百度网盘", 12.3, GIB),
+            ]),
+            ..Reading::default()
+        };
+        screen.show(reading);
+        let rows = render(&mut screen, 80, 24);
+        let row = |name: &str| {
+            let found = rows.iter().find(|row| row.contains(name));
+            found.unwrap_or_else(|| panic!("{rows:#?}")).clone()
+        };
+        // The column a text ends at; a wide character takes two cells.
+        let end = |row: &str, text: &str| row[..row.find(text).unwrap()].chars().count();
+        let (xz, wide) = (row("xz"), row("百"));
+        assert!(xz.contains(" 1600%     1.0 GiB  "), "{rows:#?}");
+        assert_eq!(end(&wide, "GiB"), end(&xz, "GiB"), "{rows:#?}");
+        assert_eq!(end(&wide, "%"), end(&xz, "%"), "{rows:#?}");
+    }
+
+    #[test]
+    fn says_how_much_of_how_much() {
+        assert_eq!(part_of(1536, 2048), "1.5 of 2.0 KiB");
+        assert_eq!(part_of(512, 2048), "512 B of 2.0 KiB");
+    }
+
+    #[test]
+    fn cores_go_down_each_column() {
+        let cores: Vec<(u32, Times)> = (0..16).map(|n| (n, times(n.into(), 100))).collect();
+        let text = |lines: Vec<Line>| -> Vec<String> {
+            lines.iter().map(|line| line.to_string()).collect()
+        };
+        let lines = text(core_lines(&cores, 39, 8));
+        assert_eq!(lines.len(), 6, "{lines:#?}");
+        assert!(
+            lines[0].starts_with(" 0 ") && lines[0].contains(" 6 "),
+            "{lines:#?}"
+        );
+        assert!(
+            lines
+                .iter()
+                .all(|line| Line::from(line.as_str()).width() <= 39)
+        );
+        assert!(core_lines(&[], 39, 8).is_empty());
+    }
+
+    #[test]
+    fn many_cores_take_a_cell_each() {
+        let cores: Vec<(u32, Times)> = (0..16).map(|n| (n, times(0, 100))).collect();
+        let lines: Vec<String> = (core_lines(&cores, 12, 4).iter())
+            .map(|line| line.to_string())
+            .collect();
+        assert_eq!(lines, [" 0 ▁▁▁▁▁▁▁▁▁", " 9 ▁▁▁▁▁▁▁"]);
+        let busy: Vec<(u32, Times)> = (0..3).map(|n| (n, times(n.into(), 2))).collect();
+        assert_eq!(core_lines(&busy, 30, 0)[0].to_string(), "0 ▁▄█");
+    }
+
+    #[test]
+    fn a_reading_without_the_cpu_keeps_the_interval() {
+        let mut screen = Screen::new(&Config::default());
+        let due = Instant::now() + Duration::from_secs(1);
+        screen.due = due;
+        // As when /proc/stat can't be read.
+        screen.show(Reading::default());
+        assert_eq!(screen.due, due);
+    }
+
+    #[test]
+    fn says_how_old_the_reading_is_when_the_next_is_slow_to_come() {
+        let mut screen = screen();
+        let title = |screen: &mut Screen| render(screen, 80, 4)[0].clone();
+        assert!(title(&mut screen).contains(" every 1 s ┐"));
+        screen.waiting = true;
+        let long_ago = Instant::now() - SLOW * 2;
+        screen.asked = long_ago;
+        screen.shown_at = Some(long_ago);
+        assert!(title(&mut screen).contains(" every 1 s, last read 10 s ago "));
+    }
+
+    #[test]
+    fn reopening_starts_the_readings_afresh() {
+        let mut screen = screen();
+        screen.waiting = true;
+        screen.reopen();
+        // The reading asked for before leaving is dropped, and the next starts afresh.
+        assert!(screen.stale && screen.afresh);
+        screen.failed = Some("Reading the system stopped unexpectedly.".into());
+        screen.reopen();
+        assert!(screen.failed.is_none() && screen.reader.is_none() && !screen.stale);
+    }
+
+    #[test]
+    fn plus_and_minus_change_how_often_it_reads() {
+        let mut screen = Screen::new(&Config {
+            status_refresh_ms: 1200,
+            ..Config::default()
+        });
+        let press = |screen: &mut Screen, c| screen.on_key(KeyEvent::from(KeyCode::Char(c)));
+        let ms = |screen: &Screen| screen.interval.as_millis();
+        assert!(press(&mut screen, '+'));
+        assert_eq!(ms(&screen), 2000);
+        press(&mut screen, '+');
+        press(&mut screen, '+');
+        assert_eq!(ms(&screen), 5000);
+        assert!(render(&mut screen, 80, 4)[0].contains("every 5 s"));
+        for _ in 0..5 {
+            press(&mut screen, '-');
+        }
+        assert_eq!(ms(&screen), 250);
+        // From 1.2 s, - goes to 1 s.
+        screen.interval = Duration::from_millis(1200);
+        press(&mut screen, '-');
+        assert_eq!(ms(&screen), 1000);
+    }
+
+    #[test]
+    fn a_shorter_interval_brings_the_next_reading_closer() {
+        let mut screen = Screen::new(&Config::default());
+        screen.due = Instant::now() + Duration::from_secs(5);
+        screen.set_interval(Duration::from_millis(250));
+        assert!(screen.due <= Instant::now() + Duration::from_millis(250));
+    }
+
+    #[test]
+    fn says_how_often_it_reads() {
+        assert_eq!(interval_text(Duration::from_millis(250)), "250 ms");
+        assert_eq!(interval_text(Duration::from_millis(1000)), "1 s");
+        assert_eq!(interval_text(Duration::from_millis(1500)), "1.5 s");
+        assert_eq!(interval_text(Duration::from_millis(1250)), "1.25 s");
+    }
+
+    #[test]
+    fn graphs_keep_the_last_readings() {
+        let mut graph = History::default();
+        for value in 0..HISTORY as u64 + 10 {
+            graph.push(value, None);
+        }
+        assert_eq!(graph.0.len(), HISTORY);
+        assert_eq!(graph.0.front(), Some(&10.0));
+    }
+
+    #[test]
+    fn graphs_follow_the_readings_calmly_at_any_interval() {
+        let follow = |every: Duration, readings: usize| {
+            let mut graph = History::default();
+            graph.push(0, None);
+            for _ in 0..readings {
+                graph.push(1000, Some(every));
+            }
+            graph.peak(1)
+        };
+        // Two thirds of the way after SMOOTHING, read all at once or in steps.
+        assert_eq!(follow(SMOOTHING, 1), 632);
+        assert_eq!(follow(SMOOTHING / 2, 2), 632);
+        // Readings far apart are hardly smoothed.
+        assert_eq!(follow(Duration::from_secs(5), 1), 1000);
+    }
+}

@@ -65,14 +65,11 @@ fn paccache_dry_run(selection: &[String]) -> Result<u64> {
 
 pub fn journal(max_mb: u32) -> Category {
     let mut category = Category::new("Journal");
-    let usage = run(JOURNALCTL, &["--disk-usage".to_string()]).and_then(|output| {
-        parse_journal_usage(&output).context("could not read journalctl --disk-usage")
-    });
     // An estimate: `--disk-usage` counts the active files too, which the vacuum only reaches
     // because M2 rotates them into archived files first (`--rotate --vacuum-size`).
-    match usage {
+    match journal_usage() {
         Ok(usage) => {
-            if !can_read_system_journal(Path::new(JOURNAL_DIR)) {
+            if !sees_whole_journal() {
                 category.note = Some("only the journal files you can read are counted".into());
             }
             let freed = usage.saturating_sub(u64::from(max_mb) * size::MIB);
@@ -88,6 +85,17 @@ pub fn journal(max_mb: u32) -> Category {
         Err(err) => category.note = Some(format!("{err:#}")),
     }
     category
+}
+
+/// The journal's size on disk, as `journalctl --disk-usage` says.
+pub fn journal_usage() -> Result<u64> {
+    let output = run(JOURNALCTL, &["--disk-usage".to_string()])?;
+    parse_journal_usage(&output).context("could not read journalctl --disk-usage")
+}
+
+/// Whether [`journal_usage`] counts every journal file; else only those the user can read.
+pub fn sees_whole_journal() -> bool {
+    can_read_system_journal(Path::new(JOURNAL_DIR))
 }
 
 const JOURNAL_DIR: &str = "/var/log/journal";

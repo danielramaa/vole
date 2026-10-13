@@ -6,10 +6,12 @@ mod date;
 mod disk;
 mod in_use;
 mod log;
+mod mounts;
 mod orphans;
 mod pacman;
 mod safety;
 mod size;
+mod status;
 mod term;
 #[cfg(test)]
 mod testdir;

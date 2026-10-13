@@ -21,7 +21,7 @@ use super::backup::{BACKUPS, OLD_DAYS, OldBackup};
 use super::configs::{Confidence, OrphanedConfig, PackageOwned};
 use super::plan::{Package, Plan};
 use super::{build_plan, refresh_in_use, remove, rules};
-use crate::app::ModuleScreen;
+use crate::app::{Module, ModuleScreen};
 use crate::config::Config;
 use crate::disk::Mounts;
 use crate::log::{Log, Outcome};
@@ -386,6 +386,10 @@ impl ModuleScreen for Screen {
             | State::RemovingHome { .. }
             | State::RootPending { .. } => false,
         }
+    }
+
+    fn take_open(&mut self) -> Option<Module> {
+        None
     }
 
     /// Whether `sudo pacman -Rns` is waiting for [`ModuleScreen::run_root`].

@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::backup::{self, Backup, Entry};
 use super::rules;
-use crate::app::ModuleScreen;
+use crate::app::{Module, ModuleScreen};
 use crate::config::Config;
 use crate::log::{Log, Outcome};
 use crate::term::RunRoot;
@@ -187,6 +187,10 @@ impl ModuleScreen for Screen {
             State::NotStarted | State::Ready(_) | State::Done { .. } | State::Failed(_) => true,
             State::Confirm { .. } => false,
         }
+    }
+
+    fn take_open(&mut self) -> Option<Module> {
+        None
     }
 
     fn needs_terminal(&self) -> bool {

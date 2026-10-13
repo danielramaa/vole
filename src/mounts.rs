@@ -93,8 +93,7 @@ impl MountTable {
         for (path, (mount, source)) in &shown {
             if matches!(mount, Mount::SameDisk | Mount::OtherDisk | Mount::UsbDisk) {
                 let kept = filesystems.entry(source).or_insert(path);
-                let shorter = |path: &PathBuf| (path.components().count(), path.clone());
-                if shorter(path) < shorter(kept) {
+                if (path.components().count(), path) < (kept.components().count(), *kept) {
                     *kept = path;
                 }
             }

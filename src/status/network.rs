@@ -42,19 +42,16 @@ pub fn traffic() -> Vec<Traffic> {
     leading_out(Path::new("/sys"), parse(&dev))
 }
 
-/// The interfaces of `all` that are up and lead out of the computer, as `sys` tells; or, when
-/// none does, all that are up but loopback.
+/// The interfaces of `all` that are up and lead out of the computer, as `sys` tells; or, in a
+/// container, where none does, all that are up but loopback.
 fn leading_out(sys: &Path, all: Vec<Traffic>) -> Vec<Traffic> {
-    let up: Vec<Traffic> = all
-        .into_iter()
-        .filter(|interface| interface.name != "lo" && is_up(sys, &interface.name))
-        .collect();
-    let out: Vec<Traffic> = up
-        .iter()
-        .filter(|interface| !is_virtual(sys, &interface.name))
-        .cloned()
-        .collect();
-    if out.is_empty() { up } else { out }
+    let all: Vec<Traffic> = all.into_iter().filter(|i| i.name != "lo").collect();
+    // A computer whose interfaces are down, Wi-Fi turned off say, still has them.
+    let container = all.iter().all(|interface| is_virtual(sys, &interface.name));
+    all.into_iter()
+        .filter(|interface| container || !is_virtual(sys, &interface.name))
+        .filter(|interface| is_up(sys, &interface.name))
+        .collect()
 }
 
 /// Reads `/proc/net/dev` lines, e.g. `  wlan0: 2854366736 2268464 0 0 0 0 0 0 102366473 653750 …`:
@@ -144,8 +141,15 @@ docker0:       0       0    0    0    0     0          0         0        0     
                 .to_vec()
         };
         assert_eq!(names(leading_out(sys.path(), all())), ["wlan0"]);
-        // In a container, only virtual interfaces.
-        let all = all().into_iter().filter(|i| i.name != "wlan0").collect();
+        // With Wi-Fi off, what goes between containers doesn't count.
+        let wifi_off = sys.path().join("devices/pci0000:00/net/wlan0/operstate");
+        fs::write(&wifi_off, "down\n").unwrap();
+        assert!(leading_out(sys.path(), all()).is_empty());
+        // In a container, every interface is virtual.
+        let all = all()
+            .into_iter()
+            .filter(|i| !i.name.starts_with(['w', 'e']))
+            .collect();
         assert_eq!(names(leading_out(sys.path(), all)), ["docker0"]);
     }
 

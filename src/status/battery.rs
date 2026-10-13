@@ -26,6 +26,9 @@ pub enum State {
     Unknown,
 }
 
+/// The most hours a battery is said to last or take to charge.
+const LONGEST: f64 = 99.0;
+
 /// The computer's batteries; a wireless mouse's or keyboard's aren't.
 pub fn batteries() -> Vec<Battery> {
     read_all(Path::new("/sys/class/power_supply"))
@@ -65,19 +68,23 @@ fn read(supply: &Path) -> Option<Battery> {
         ),
     };
     let percent = number("capacity").or_else(|| Some(now? * 100 / full.filter(|&f| f > 0)?))?;
-    let hours = match state {
-        State::Discharging => Some(now? as f64 / draw.filter(|&d| d > 0)? as f64),
-        State::Charging => {
-            Some(full?.saturating_sub(now?) as f64 / draw.filter(|&d| d > 0)? as f64)
+    let hours = || {
+        let (now, draw) = (now? as f64, draw.filter(|&draw| draw > 0)? as f64);
+        match state {
+            State::Discharging => Some(now / draw),
+            State::Charging => Some((full? as f64 - now).max(0.0) / draw),
+            State::Full | State::NotCharging | State::Unknown => None,
         }
-        State::Full | State::NotCharging | State::Unknown => None,
     };
     let name = supply.file_name()?.to_string_lossy().into_owned();
     Some(Battery {
         name,
         percent: percent.min(100),
         state,
-        left: hours.map(|hours| Duration::from_secs((hours * 3600.0).round() as u64)),
+        // Past that, it draws too little to tell, as some batteries say just after unplugging.
+        left: hours()
+            .filter(|&hours| hours < LONGEST)
+            .map(|hours| Duration::from_secs((hours * 3600.0).round() as u64)),
     })
 }
 
@@ -143,7 +150,35 @@ mod tests {
             "BAT0",
             &[("type", "Battery"), ("status", "Full"), ("capacity", "100")],
         );
+        supply(
+            &power_supply,
+            "BAT2",
+            &[
+                ("type", "Battery"),
+                ("status", "Discharging"),
+                ("capacity", "80"),
+                ("energy_now", "40000000"),
+                ("power_now", "1000"),
+            ],
+        );
+        supply(
+            &power_supply,
+            "BAT3",
+            &[
+                ("type", "Battery"),
+                ("status", "Charging"),
+                ("capacity", "99"),
+            ],
+        );
         let batteries = read_all(power_supply.path());
+        assert_eq!(batteries.len(), 4);
+        // Drawing 1 mW, it would last 40000 hours: too little to tell.
+        assert_eq!((batteries[2].percent, batteries[2].left), (80, None));
+        // Saying neither how full it is in µWh nor what it draws, it still shows.
+        assert_eq!(
+            (batteries[3].state, batteries[3].left),
+            (State::Charging, None)
+        );
         assert_eq!(batteries[0].state, State::Full);
         assert_eq!(batteries[0].left, None);
         assert_eq!(batteries[1].percent, 60);

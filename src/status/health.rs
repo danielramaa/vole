@@ -1,7 +1,8 @@
 //! The health panel: what vole can clean up, and the updates pacman would install, measured by
 //! the official tools, each on a thread of its own, so a slow one doesn't hold the others up.
 
-use std::path::Path;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -181,10 +182,23 @@ fn updates(output: &Output) -> Result<usize> {
 /// The space pacman's package cache takes on disk.
 fn pacman_cache() -> Result<u64> {
     let dirs = pacman::cache_dirs().context("asking pacman-conf where the cache is")?;
-    // Measuring only: without the mount points, the walk still stops at other filesystems.
-    let mounts = Mounts::load().unwrap_or_default();
-    // One walk, so a package linked from two of the folders counts once.
-    Ok(disk::disk_usage_all(&dirs, &mounts))
+    Ok(space_taken(&dirs))
+}
+
+/// The space the folders `dirs` take on disk, where they really are, each once.
+fn space_taken(dirs: &[PathBuf]) -> u64 {
+    // pacman follows a symlink to a folder; the walk wouldn't.
+    let mut dirs: Vec<PathBuf> = dirs
+        .iter()
+        .filter_map(|dir| fs::canonicalize(dir).ok())
+        .collect();
+    // A folder listed twice, or inside another, would count twice.
+    dirs.sort();
+    dirs.dedup_by(|inside, folder| inside.starts_with(folder));
+    // Without the mount points, as a folder may be one, like a btrfs subvolume for the cache:
+    // the walk still stays on the filesystem each folder is on. One walk, so a package linked
+    // from two of the folders counts once.
+    disk::disk_usage_all(&dirs, &Mounts::default())
 }
 
 #[cfg(test)]
@@ -214,6 +228,24 @@ mod tests {
             updates(&output(1, "", "")).unwrap_err().to_string(),
             "checkupdates failed (exit status: 1)"
         );
+    }
+
+    #[test]
+    fn measures_each_cache_folder_once_where_it_really_is() {
+        let dir = crate::testdir::TestDir::new();
+        let cache = dir.dir("cache");
+        dir.file("cache/a.pkg.tar.zst", 50_000);
+        dir.file("cache/aur/b.pkg.tar.zst", 50_000);
+        let link = dir.symlink("link", &cache);
+        let once = space_taken(std::slice::from_ref(&cache));
+        assert!(once > 100_000, "{once}");
+        let listed = [
+            link,
+            cache.clone(),
+            cache.join("aur"),
+            cache.join("../cache"),
+        ];
+        assert_eq!(space_taken(&listed), once);
     }
 
     #[test]

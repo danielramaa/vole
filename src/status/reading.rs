@@ -13,14 +13,13 @@ use super::network::{self, Traffic};
 use super::processes::{self, Process};
 use super::sensors::{Sensors, Temperature};
 
-/// Readings further apart than this tell nothing about now: the dashboard wasn't on screen in
-/// between. The next one starts afresh.
-const GAP: Duration = Duration::from_secs(10);
+/// How long apart the two readings are that the first rates are told from.
+const FIRST: Duration = Duration::from_millis(250);
 
 /// What the dashboard shows, read at one moment.
 #[derive(Debug, Default)]
 pub struct Reading {
-    /// How long since the reading before; `None` without one close enough before.
+    /// How long since the reading before; `None` without one.
     pub elapsed: Option<Duration>,
     /// The time the CPUs spent since the reading before.
     pub cpu: Option<Cpu>,
@@ -38,7 +37,8 @@ pub struct Reading {
 
 /// The thread taking readings. It ends with its `Reader`.
 pub struct Reader {
-    ask: Sender<()>,
+    /// Asks for a reading; `true` to start afresh.
+    ask: Sender<bool>,
     readings: Receiver<Reading>,
 }
 
@@ -49,7 +49,16 @@ impl Reader {
         thread::spawn(move || {
             let mut before = None;
             let mut sensors = Sensors::default();
-            for () in asked {
+            for afresh in asked {
+                if afresh {
+                    before = None;
+                }
+                // Rates are told from the reading before: without one, one now, and the one
+                // asked for shortly after.
+                if before.is_none() {
+                    read(&mut before, &mut sensors, Instant::now());
+                    thread::sleep(FIRST);
+                }
                 let reading = read(&mut before, &mut sensors, Instant::now());
                 // The screen may have gone already; then nobody is listening.
                 if sender.send(reading).is_err() {
@@ -60,9 +69,10 @@ impl Reader {
         Self { ask, readings }
     }
 
-    /// Asks for a reading, which [`Reader::take`] gets once it has been taken.
-    pub fn ask(&self) {
-        let _ = self.ask.send(());
+    /// Asks for a reading, which [`Reader::take`] gets once it has been taken; `afresh` when the
+    /// readings before say nothing about now, as when the dashboard wasn't on screen since.
+    pub fn ask(&self, afresh: bool) {
+        let _ = self.ask.send(afresh);
     }
 
     /// The reading asked for, once it is there; an error when the thread stopped.
@@ -101,10 +111,7 @@ fn read(before: &mut Option<Counters>, sensors: &mut Sensors, at: Instant) -> Re
         batteries: battery::batteries(),
         ..Reading::default()
     };
-    let earlier = before
-        .take()
-        .filter(|earlier| at.duration_since(earlier.at) <= GAP);
-    if let Some(earlier) = earlier {
+    if let Some(earlier) = before.take() {
         let elapsed = at.duration_since(earlier.at);
         reading.elapsed = Some(elapsed);
         reading.cpu = (now.cpu.as_ref())
@@ -137,14 +144,15 @@ mod tests {
     use super::*;
 
     #[test]
-    fn rates_need_a_reading_shortly_before() {
+    fn rates_need_a_reading_before() {
         let start = Instant::now();
         let (mut before, mut sensors) = (None, Sensors::default());
         let mut read_at = |at| read(&mut before, &mut sensors, at);
         assert!(read_at(start).cpu.is_none());
-        assert!(read_at(start + Duration::from_secs(1)).cpu.is_some());
-        // Long after, as when the dashboard was left and opened again.
-        assert!(read_at(start + GAP * 3).cpu.is_none());
+        let second = Duration::from_secs(1);
+        let reading = read_at(start + second);
+        assert!(reading.cpu.is_some() && reading.processes.is_some());
+        assert_eq!(reading.elapsed, Some(second));
     }
 
     #[test]
@@ -156,17 +164,32 @@ mod tests {
         assert_eq!(per_second(3000, 1000, Duration::ZERO), 0);
     }
 
-    #[test]
-    fn readings_come_when_asked() {
-        let reader = Reader::start();
-        reader.ask();
-        let reading = loop {
+    /// The reading `reader` was asked for, once it comes.
+    fn next(reader: &Reader) -> Reading {
+        loop {
             if let Some(reading) = reader.take().unwrap() {
                 break reading;
             }
             thread::sleep(Duration::from_millis(5));
-        };
-        assert!(reading.cpu.is_none());
+        }
+    }
+
+    #[test]
+    fn every_reading_has_rates_even_the_first() {
+        let reader = Reader::start();
+        reader.ask(false);
+        let first = next(&reader);
+        assert!(first.cpu.is_some());
+        assert!(first.elapsed.is_some_and(|elapsed| elapsed >= FIRST));
         assert!(reader.take().unwrap().is_none());
+        reader.ask(false);
+        assert!(next(&reader).elapsed.is_some_and(|elapsed| elapsed < FIRST));
+        // Afresh, as when the dashboard comes back: from a reading just taken.
+        reader.ask(true);
+        assert!(
+            next(&reader)
+                .elapsed
+                .is_some_and(|elapsed| elapsed >= FIRST)
+        );
     }
 }

@@ -21,10 +21,6 @@ use crate::config::Config;
 use crate::term::RunRoot;
 use crate::{size, ui};
 
-/// How soon after a reading with no rates (the first, or the first after a pause) the next one
-/// is taken, so the rates show up quickly.
-const SOON: Duration = Duration::from_millis(250);
-
 /// The intervals `+` and `-` step through, in milliseconds: as configurable, from 250 ms to 5 s.
 const INTERVALS: [u64; 5] = [250, 500, 1000, 2000, 5000];
 
@@ -49,6 +45,11 @@ pub struct Screen {
     reader: Option<Reader>,
     /// Whether a reading was asked for and hasn't come yet.
     waiting: bool,
+    /// Whether the next reading starts afresh: the dashboard was left since the last.
+    afresh: bool,
+    /// Whether the reading asked for before the dashboard was left is to be dropped when it
+    /// comes: it says nothing about now.
+    stale: bool,
     /// When to ask for the next reading.
     due: Instant,
     /// The latest reading.
@@ -78,6 +79,8 @@ impl Screen {
             interval: Duration::from_millis(u64::from(config.status_refresh_ms)),
             reader: None,
             waiting: false,
+            afresh: false,
+            stale: false,
             due: Instant::now(),
             reading: Reading::default(),
             cpu_graph: History::default(),
@@ -92,10 +95,18 @@ impl Screen {
         }
     }
 
-    /// The dashboard is opened again: the health panel is measured afresh, as clean and orphans
-    /// change it.
+    /// The dashboard is opened again: the readings start afresh, and the health panel is measured
+    /// again, as clean and orphans change it. If the thread taking the readings had stopped, a
+    /// new one starts.
     pub fn reopen(&mut self) {
         self.measure_health = true;
+        self.afresh = true;
+        self.stale = self.waiting;
+        if self.failed.take().is_some() {
+            self.reader = None;
+            self.waiting = false;
+            self.stale = false;
+        }
     }
 
     /// Reads every `interval` from now on; the next reading comes no later than that from now.
@@ -104,15 +115,11 @@ impl Screen {
         self.due = self.due.min(Instant::now() + interval);
     }
 
-    /// Shows `reading`, which came `now`.
-    fn show(&mut self, reading: Reading, now: Instant) {
+    fn show(&mut self, reading: Reading) {
         let elapsed = reading.elapsed;
-        match &reading.cpu {
-            Some(cpu) => {
-                let busy = ui::share(cpu.all.busy, cpu.all.total, 1000);
-                self.cpu_graph.push(busy, elapsed);
-            }
-            None => self.due = self.due.min(now + SOON),
+        if let Some(cpu) = &reading.cpu {
+            let busy = ui::share(cpu.all.busy, cpu.all.total, 1000);
+            self.cpu_graph.push(busy, elapsed);
         }
         if let Some(network) = &reading.network {
             let received = network.iter().map(|interface| interface.received).sum();
@@ -367,7 +374,9 @@ impl ModuleScreen for Screen {
         match self.reader.get_or_insert_with(Reader::start).take() {
             Ok(Some(reading)) => {
                 self.waiting = false;
-                self.show(reading, now);
+                if !std::mem::take(&mut self.stale) {
+                    self.show(reading);
+                }
             }
             Ok(None) => {}
             Err(_) => {
@@ -379,7 +388,7 @@ impl ModuleScreen for Screen {
             && now >= self.due
             && let Some(reader) = &self.reader
         {
-            reader.ask();
+            reader.ask(std::mem::take(&mut self.afresh));
             self.waiting = true;
             // Readings stay `interval` apart on average, though ticks come only now and then.
             self.due += self.interval;
@@ -740,7 +749,7 @@ mod tests {
             cpu: Some(cpu),
             ..Reading::default()
         };
-        screen.show(reading, Instant::now());
+        screen.show(reading);
         screen
     }
 
@@ -769,7 +778,7 @@ mod tests {
             memory: Some(memory),
             ..Reading::default()
         };
-        screen.show(reading, Instant::now());
+        screen.show(reading);
         let rows = render(&mut screen, 80, 12).join("\n");
         assert!(
             rows.contains("Used") && rows.contains("75%  12.0 of 16.0 GiB"),
@@ -795,7 +804,7 @@ mod tests {
             disk_io: Some(vec![disk("nvme0n1", 1024), disk("sda", 1024)]),
             ..Reading::default()
         };
-        screen.show(reading, Instant::now());
+        screen.show(reading);
         let rows = render(&mut screen, 80, 12).join("\n");
         assert!(rows.contains("Disks"), "{rows}");
         assert!(
@@ -817,7 +826,7 @@ mod tests {
             network: Some(vec![interface("enp3s0"), interface("wlan0")]),
             ..Reading::default()
         };
-        screen.show(reading, Instant::now());
+        screen.show(reading);
         assert_eq!(screen.received_graph.0.back(), Some(&2048.0));
         let rows = render(&mut screen, 80, 16).join("\n");
         assert!(
@@ -843,7 +852,7 @@ mod tests {
             ],
             ..Reading::default()
         };
-        screen.show(reading, Instant::now());
+        screen.show(reading);
         let lines = screen.temperature_lines(30);
         assert_eq!(lines[0].to_string(), "coretemp  Package id 0   100°C");
         assert_eq!(lines[1].to_string(), format!("nvme{}37°C", " ".repeat(22)));
@@ -853,7 +862,7 @@ mod tests {
         let lines = screen.temperature_lines(20);
         assert_eq!(lines[0].to_string(), "coretemp  Pac… 100°C");
         // No sensors, no panel.
-        screen.show(Reading::default(), Instant::now());
+        screen.show(Reading::default());
         assert_eq!(panel_height(&screen.temperature_lines(30)), 0);
     }
 
@@ -878,7 +887,7 @@ mod tests {
             ],
             ..Reading::default()
         };
-        screen.show(reading, Instant::now());
+        screen.show(reading);
         let lines: Vec<String> = (screen.battery_lines(40).iter())
             .map(|line| line.to_string())
             .collect();
@@ -900,7 +909,7 @@ mod tests {
             ]),
             ..Reading::default()
         };
-        screen.show(reading, Instant::now());
+        screen.show(reading);
         let names = |screen: &mut Screen| -> Vec<String> {
             let rows = render(screen, 80, 16);
             let at = |name: &str| rows.iter().position(|row| row.contains(name)).unwrap();
@@ -998,7 +1007,7 @@ mod tests {
             ]),
             ..Reading::default()
         };
-        screen.show(reading, Instant::now());
+        screen.show(reading);
         let rows = render(&mut screen, 80, 24);
         let row = |name: &str| {
             let found = rows.iter().find(|row| row.contains(name));
@@ -1050,12 +1059,25 @@ mod tests {
     }
 
     #[test]
-    fn rates_come_soon_after_a_reading_without_them() {
+    fn a_reading_without_the_cpu_keeps_the_interval() {
         let mut screen = Screen::new(&Config::default());
-        let now = Instant::now();
-        screen.due = now + Duration::from_secs(1);
-        screen.show(Reading::default(), now);
-        assert_eq!(screen.due, now + SOON);
+        let due = Instant::now() + Duration::from_secs(1);
+        screen.due = due;
+        // As when /proc/stat can't be read.
+        screen.show(Reading::default());
+        assert_eq!(screen.due, due);
+    }
+
+    #[test]
+    fn reopening_starts_the_readings_afresh() {
+        let mut screen = screen();
+        screen.waiting = true;
+        screen.reopen();
+        // The reading asked for before leaving is dropped, and the next starts afresh.
+        assert!(screen.stale && screen.afresh);
+        screen.failed = Some("Reading the system stopped unexpectedly.".into());
+        screen.reopen();
+        assert!(screen.failed.is_none() && screen.reader.is_none() && !screen.stale);
     }
 
     #[test]

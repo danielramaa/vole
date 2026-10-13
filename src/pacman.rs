@@ -164,7 +164,15 @@ pub fn cache_dirs() -> Result<Vec<PathBuf>> {
         .env("LC_ALL", "C")
         .output()
         .with_context(|| format!("running {PACMAN_CONF}"))?;
-    check(&output)?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let said = errors(&stderr).next();
+        let said = said.or_else(|| stderr.lines().find(|line| !line.trim().is_empty()));
+        match said {
+            Some(message) => bail!("pacman-conf: {}", message.trim()),
+            None => bail!("pacman-conf failed ({})", output.status),
+        }
+    }
     let lines = output.stdout.split(|&b| b == b'\n');
     let dirs = lines
         .filter(|line| !line.is_empty())

@@ -27,8 +27,9 @@ impl Temperature {
 /// question in turn, so they are asked once, and only the temperature each time.
 #[derive(Debug, Default)]
 pub struct Sensors {
-    /// The chips' folders when they were last looked at, to tell when one comes or goes.
-    folders: Vec<PathBuf>,
+    /// The chips' folders when they were last looked at, with the devices they lead to, to tell
+    /// when one comes or goes: the kernel gives a new chip the number of one that went.
+    folders: Vec<(PathBuf, Option<PathBuf>)>,
     /// Each chip's first temperature, by chip, with the file it is read from.
     chips: Vec<(Temperature, PathBuf)>,
 }
@@ -41,15 +42,15 @@ impl Sensors {
 
     /// [`Sensors::read`], with the chips in `hwmon`.
     fn read_in(&mut self, hwmon: &Path) -> Vec<Temperature> {
-        let mut folders: Vec<PathBuf> = fs::read_dir(hwmon)
+        let mut folders: Vec<(PathBuf, Option<PathBuf>)> = fs::read_dir(hwmon)
             .into_iter()
             .flatten()
             .flatten()
-            .map(|entry| entry.path())
+            .map(|entry| (entry.path(), fs::read_link(entry.path()).ok()))
             .collect();
         folders.sort();
         if folders != self.folders {
-            self.chips = folders.iter().filter_map(|chip| first(chip)).collect();
+            self.chips = folders.iter().filter_map(|(chip, _)| first(chip)).collect();
             self.chips.sort_by(|(a, _), (b, _)| a.chip.cmp(&b.chip));
             self.folders = folders;
         }
@@ -164,6 +165,35 @@ mod tests {
         let temperatures = sensors.read_in(hwmon.path());
         assert_eq!(temperatures.len(), 4);
         assert_eq!(temperatures[1].label.as_deref(), Some("Changed"));
+    }
+
+    #[test]
+    fn a_new_chip_with_the_number_of_one_that_went_is_read_afresh() {
+        let sys = TestDir::new();
+        chip(
+            &sys,
+            "devices/usb1/hwmon/hwmon5",
+            "nvme",
+            &[("temp1_input", "40000")],
+        );
+        chip(
+            &sys,
+            "devices/usb2/hwmon/hwmon5",
+            "drivetemp",
+            &[("temp1_input", "30000")],
+        );
+        let hwmon = sys.dir("class/hwmon");
+        let link = hwmon.join("hwmon5");
+        std::os::unix::fs::symlink(sys.path().join("devices/usb1/hwmon/hwmon5"), &link).unwrap();
+        let mut sensors = Sensors::default();
+        assert_eq!(sensors.read_in(&hwmon)[0].chip, "nvme");
+        fs::remove_file(&link).unwrap();
+        std::os::unix::fs::symlink(sys.path().join("devices/usb2/hwmon/hwmon5"), &link).unwrap();
+        let temperatures = sensors.read_in(&hwmon);
+        assert_eq!(
+            (temperatures[0].chip.as_str(), temperatures[0].celsius),
+            ("drivetemp", 30.0)
+        );
     }
 
     #[test]

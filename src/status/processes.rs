@@ -39,8 +39,9 @@ pub fn processes() -> Vec<Process> {
     let pids = fs::read_dir("/proc").into_iter().flatten().flatten();
     pids.filter_map(|entry| {
         let pid = entry.file_name().to_str()?.parse().ok()?;
-        let stat = fs::read_to_string(entry.path().join("stat")).ok()?;
-        parse(pid, &stat, page)
+        // The kernel cuts names at 15 bytes, which may split a character.
+        let stat = fs::read(entry.path().join("stat")).ok()?;
+        parse(pid, &String::from_utf8_lossy(&stat), page)
     })
     .collect()
 }
@@ -119,6 +120,16 @@ mod tests {
             .map(|process| process.cpu)
             .collect();
         assert_eq!(cpu, [25.0, 15.0, 5.0]);
+    }
+
+    #[test]
+    fn reads_processes_whose_names_were_cut_inside_a_character() {
+        // `ПриветМирПрограмма` cut at 15 bytes, the last byte the start of `р`.
+        let mut stat =
+            b"77 (\xd0\x9f\xd1\x80\xd0\xb8\xd0\xb2\xd0\xb5\xd1\x82\xd0\x9c\xd0) S".to_vec();
+        stat.extend_from_slice(&b" 0".repeat(21));
+        let process = parse(77, &String::from_utf8_lossy(&stat), 4096).unwrap();
+        assert_eq!(process.name, "ПриветМ\u{fffd}");
     }
 
     #[test]

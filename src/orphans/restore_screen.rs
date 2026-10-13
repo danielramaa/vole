@@ -1,4 +1,4 @@
-//! `restore`: putting configs from a Backup back where they were.
+//! The `restore` screen: putting configs from a Backup back where they were.
 
 use std::io;
 

@@ -1,4 +1,4 @@
-//! `restore`: putting configs from a Backup back where they were.
+//! The `restore` screen: putting configs from a Backup back where they were.
 
 use std::io;
 
@@ -11,7 +11,7 @@ use ratatui::widgets::{Block, List, ListItem, ListState, Paragraph};
 
 use super::backup::{self, Backup, Entry};
 use super::rules;
-use crate::app::{Module, ModuleScreen};
+use crate::app::{Action, ModuleScreen, Tick};
 use crate::config::Config;
 use crate::log::{Log, Outcome};
 use crate::term::RunRoot;
@@ -113,17 +113,17 @@ impl Screen {
 
 impl ModuleScreen for Screen {
     /// Lists the Backups the first time.
-    fn tick(&mut self) {
+    fn tick(&mut self) -> Tick {
         if let State::NotStarted = self.state {
             self.state = match dirs::home_dir() {
                 Some(home) => State::Ready(View::new(backup::list(&home))),
                 None => State::Failed("the home directory could not be found".into()),
             };
         }
+        Tick::Nothing
     }
 
-    /// Returns whether the key was used.
-    fn on_key(&mut self, key: KeyEvent) -> bool {
+    fn on_key(&mut self, key: KeyEvent) -> Action {
         let back = matches!(
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
@@ -168,7 +168,7 @@ impl ModuleScreen for Screen {
             state => (state, false),
         };
         self.state = state;
-        used
+        if used { Action::Used } else { Action::Unused }
     }
 
     fn hint(&self) -> &'static str {
@@ -187,14 +187,6 @@ impl ModuleScreen for Screen {
             State::NotStarted | State::Ready(_) | State::Done { .. } | State::Failed(_) => true,
             State::Confirm { .. } => false,
         }
-    }
-
-    fn take_open(&mut self) -> Option<Module> {
-        None
-    }
-
-    fn needs_terminal(&self) -> bool {
-        false
     }
 
     fn run_root(&mut self, _: &mut RunRoot) -> io::Result<()> {
@@ -469,7 +461,7 @@ mod tests {
     }
 
     fn press(screen: &mut Screen, code: KeyCode) -> bool {
-        screen.on_key(KeyEvent::from(code))
+        screen.on_key(KeyEvent::from(code)) == Action::Used
     }
 
     fn render(screen: &mut Screen) -> String {

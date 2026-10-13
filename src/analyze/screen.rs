@@ -22,7 +22,7 @@ use super::scan::{self, Progress};
 use super::tip;
 use super::trash::{self, GIO, Gio, Kept, Picked, Picker};
 use super::tree::{Id, Kind, ROOT, Tree, Unwalked};
-use crate::app::{Module, ModuleScreen};
+use crate::app::{Action, ModuleScreen, Tick};
 use crate::config::Config;
 use crate::log::{Log, Outcome};
 use crate::mounts::{Mount, MountTable};
@@ -189,7 +189,7 @@ impl Screen {
 
 impl ModuleScreen for Screen {
     /// Moves background work along: the scan, pacman's tips, and moving Items to the trash.
-    fn tick(&mut self) {
+    fn tick(&mut self) -> Tick {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
             State::NotStarted => self.start(),
@@ -256,10 +256,10 @@ impl ModuleScreen for Screen {
             },
             state => state,
         };
+        Tick::Nothing
     }
 
-    /// Returns whether the key was used.
-    fn on_key(&mut self, key: KeyEvent) -> bool {
+    fn on_key(&mut self, key: KeyEvent) -> Action {
         let back = matches!(
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
@@ -268,7 +268,7 @@ impl ModuleScreen for Screen {
             && key.code == KeyCode::Esc
         {
             stop.store(true, Ordering::Relaxed);
-            return true;
+            return Action::Used;
         }
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
@@ -367,7 +367,7 @@ impl ModuleScreen for Screen {
             state => (state, false),
         };
         self.state = state;
-        used
+        if used { Action::Used } else { Action::Unused }
     }
 
     fn hint(&self) -> &'static str {
@@ -393,14 +393,6 @@ impl ModuleScreen for Screen {
             | State::Failed(_) => true,
             State::Confirm { .. } | State::Confirmed { .. } | State::Trashing { .. } => false,
         }
-    }
-
-    fn take_open(&mut self) -> Option<Module> {
-        None
-    }
-
-    fn needs_terminal(&self) -> bool {
-        false
     }
 
     fn run_root(&mut self, _: &mut RunRoot) -> io::Result<()> {
@@ -1066,7 +1058,7 @@ mod tests {
     }
 
     fn press(screen: &mut Screen, code: KeyCode) -> bool {
-        screen.on_key(KeyEvent::from(code))
+        screen.on_key(KeyEvent::from(code)) == Action::Used
     }
 
     fn view(screen: &Screen) -> &View {

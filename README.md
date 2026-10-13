@@ -75,7 +75,7 @@ Removed orphaned configs aren't deleted. They move into a dated **backup** in `~
 - **Network**: what the interfaces leading out of the computer receive and send. Bridges, VPNs and containers' interfaces are left out: what goes through them goes through those too.
 - **Temperatures and battery**: what each sensor chip measures first (a CPU's whole package, an NVMe disk's overall temperature), in bold once it is too hot, and how long each battery lasts or takes to charge. A wireless mouse's battery doesn't show.
 - **Processes**: the busiest, by CPU or by the memory they hold.
-- **Health**: the pacman cache, the journal, how many orphaned packages `vole orphans` would list, and how many updates are pending, measured each time the dashboard opens. `c` opens `clean` and `o` `orphans`; leaving them comes back to the dashboard. Pending updates come from `checkupdates`, which needs the network: it syncs a copy of the package databases in a folder of its own, never pacman's, so it can't lead to a partial upgrade.
+- **Health**: the pacman cache, the journal, how many orphaned packages `vole orphans` would list, and how many updates are pending, measured each time the dashboard opens. `c` opens `clean` and `o` `orphans`; leaving them comes back to the dashboard. Pending updates come from `checkupdates`, which needs the network: it syncs a copy of the package databases in a folder of its own, never pacman's, so it can't lead to a partial upgrade. It runs at most every half hour.
 
 ## Safety
 

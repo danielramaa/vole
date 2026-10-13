@@ -6,6 +6,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 
@@ -35,6 +36,16 @@ impl Check {
             Check::Journal => "Journal",
             Check::OrphanedPackages => "Orphaned packages",
             Check::PendingUpdates => "Pending updates",
+        }
+    }
+
+    /// How long what the row says may be shown without measuring it again: pending updates,
+    /// which checkupdates goes online for and clean and orphans don't change, half an hour; the
+    /// others not at all.
+    fn keeps(self) -> Duration {
+        match self {
+            Check::PendingUpdates => Duration::from_secs(30 * 60),
+            Check::PacmanCache | Check::Journal | Check::OrphanedPackages => Duration::ZERO,
         }
     }
 
@@ -70,12 +81,25 @@ pub type Measured = Result<String, String>;
 
 /// The rows of the health panel, measured in the background.
 pub struct Health {
-    /// What each row of [`Check::ALL`] said last.
-    rows: [Option<Measured>; Check::ALL.len()],
-    /// Which rows are being measured.
-    measuring: [bool; Check::ALL.len()],
+    /// The rows of [`Check::ALL`], in order.
+    rows: [Row; Check::ALL.len()],
     sender: Sender<(Check, Measured)>,
     receiver: Receiver<(Check, Measured)>,
+    /// Measures a check in the background, and sends what it says.
+    run: fn(Check, Sender<(Check, Measured)>),
+}
+
+/// A row of the health panel.
+#[derive(Debug, Default)]
+struct Row {
+    /// What it said last.
+    shown: Option<Measured>,
+    /// When it was last asked to be measured.
+    started: Option<Instant>,
+    measuring: bool,
+    /// Whether it is to be measured again once it is done: it was asked to be while it was
+    /// being measured, so what it says may be from before.
+    again: bool,
 }
 
 impl Default for Health {
@@ -83,54 +107,77 @@ impl Default for Health {
         let (sender, receiver) = mpsc::channel();
         Self {
             rows: Default::default(),
-            measuring: Default::default(),
             sender,
             receiver,
+            run: |check, sender| {
+                thread::spawn(move || {
+                    // Shown on one row: the first line of the error.
+                    let measured = check
+                        .measure()
+                        .map_err(|err| format!("{err:#}").lines().next().unwrap_or("").into());
+                    let _ = sender.send((check, measured));
+                });
+            },
         }
     }
 }
 
 impl Health {
-    /// Measures each row again, unless it is being measured still. Until it is, a row keeps
+    /// Measures each row again, unless it was just measured and doesn't change that quickly.
+    /// A row being measured still is measured again once it is done. Until then, a row keeps
     /// what it said.
     pub fn measure(&mut self) {
+        self.measure_at(Instant::now());
+    }
+
+    /// [`Health::measure`], `now`.
+    fn measure_at(&mut self, now: Instant) {
         for check in Check::ALL {
-            if std::mem::replace(&mut self.measuring[check as usize], true) {
+            let row = &mut self.rows[check as usize];
+            if row
+                .started
+                .is_some_and(|at| now.duration_since(at) < check.keeps())
+            {
                 continue;
             }
-            let sender = self.sender.clone();
-            thread::spawn(move || {
-                // Shown on one row: the first line of the error.
-                let measured = check
-                    .measure()
-                    .map_err(|err| format!("{err:#}").lines().next().unwrap_or("").into());
-                let _ = sender.send((check, measured));
-            });
+            if row.measuring {
+                row.again = true;
+            } else {
+                self.start(check, now);
+            }
         }
     }
 
-    /// Takes in what was measured since.
+    /// Takes in what was measured since, and measures again what was asked to be meanwhile.
     pub fn update(&mut self) {
         while let Ok((check, measured)) = self.receiver.try_recv() {
-            self.set(check, measured);
+            let row = &mut self.rows[check as usize];
+            row.measuring = false;
+            if std::mem::take(&mut row.again) {
+                self.start(check, Instant::now());
+            } else {
+                row.shown = Some(measured);
+            }
         }
     }
 
     /// What `check`'s row says; `None` until it is first measured.
     pub fn row(&self, check: Check) -> Option<&Measured> {
-        self.rows[check as usize].as_ref()
+        self.rows[check as usize].shown.as_ref()
     }
 
-    fn set(&mut self, check: Check, measured: Measured) {
-        self.rows[check as usize] = Some(measured);
-        self.measuring[check as usize] = false;
+    fn start(&mut self, check: Check, now: Instant) {
+        let row = &mut self.rows[check as usize];
+        row.measuring = true;
+        row.started = Some(now);
+        (self.run)(check, self.sender.clone());
     }
 
     #[cfg(test)]
     pub fn with(rows: &[(Check, Measured)]) -> Self {
         let mut health = Self::default();
         for (check, measured) in rows {
-            health.set(*check, measured.clone());
+            health.rows[*check as usize].shown = Some(measured.clone());
         }
         health
     }
@@ -254,23 +301,69 @@ mod tests {
         assert_eq!(count(27), "27");
     }
 
+    /// Health that measures nothing: what was measured is sent by hand.
+    fn health() -> Health {
+        Health {
+            run: |_, _| {},
+            ..Health::default()
+        }
+    }
+
+    fn measuring(health: &Health) -> Vec<Check> {
+        let measuring = Check::ALL.into_iter();
+        measuring
+            .filter(|&check| health.rows[check as usize].measuring)
+            .collect()
+    }
+
     #[test]
     fn rows_keep_what_they_said_until_measured_again() {
-        let mut health = Health::with(&[(Check::Journal, Ok("2.1 GiB".into()))]);
+        let mut health = health();
+        health.measure();
+        assert_eq!(measuring(&health), Check::ALL);
         assert_eq!(health.row(Check::PacmanCache), None);
-        health.measuring = [true; Check::ALL.len()];
-        // Being measured still: not again.
+        let journal = |text: &str| (Check::Journal, Ok(text.to_string()));
+        health.sender.send(journal("2.1 GiB")).unwrap();
+        health.update();
+        assert_eq!(health.row(Check::Journal), Some(&Ok("2.1 GiB".into())));
+        // Measured again, it says what it said until it is done.
         health.measure();
         assert_eq!(health.row(Check::Journal), Some(&Ok("2.1 GiB".into())));
-        health
-            .sender
-            .send((Check::Journal, Err("journalctl failed".into())))
-            .unwrap();
+        health.sender.send(journal("50.0 MiB")).unwrap();
+        health.update();
+        assert_eq!(health.row(Check::Journal), Some(&Ok("50.0 MiB".into())));
+    }
+
+    #[test]
+    fn a_row_asked_again_while_measured_is_measured_once_more() {
+        let mut health = health();
+        health.measure();
+        // Asked again, as when the dashboard comes back from orphans, before the count is in.
+        health.measure();
+        let count = |n: &str| (Check::OrphanedPackages, Ok(n.to_string()));
+        health.sender.send(count("12")).unwrap();
+        health.update();
+        // That count may be from before the orphans went: it is measured again.
+        assert_eq!(health.row(Check::OrphanedPackages), None);
+        assert!(measuring(&health).contains(&Check::OrphanedPackages));
+        health.sender.send(count("none")).unwrap();
         health.update();
         assert_eq!(
-            health.row(Check::Journal),
-            Some(&Err("journalctl failed".into()))
+            health.row(Check::OrphanedPackages),
+            Some(&Ok("none".into()))
         );
-        assert!(!health.measuring[Check::Journal as usize]);
+    }
+
+    #[test]
+    fn pending_updates_are_checked_at_most_every_half_hour() {
+        let mut health = health();
+        health.measure();
+        let updates = (Check::PendingUpdates, Ok("12".to_string()));
+        health.sender.send(updates).unwrap();
+        health.update();
+        health.measure();
+        assert!(!measuring(&health).contains(&Check::PendingUpdates));
+        health.measure_at(Instant::now() + Check::PendingUpdates.keeps());
+        assert!(measuring(&health).contains(&Check::PendingUpdates));
     }
 }

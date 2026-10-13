@@ -359,10 +359,11 @@ impl ModuleScreen for Screen {
             return;
         }
         let now = Instant::now();
+        // What came in while the dashboard wasn't on screen is taken in first.
+        self.health.update();
         if std::mem::take(&mut self.measure_health) {
             self.health.measure();
         }
-        self.health.update();
         match self.reader.get_or_insert_with(Reader::start).take() {
             Ok(Some(reading)) => {
                 self.waiting = false;

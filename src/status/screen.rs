@@ -178,10 +178,18 @@ impl Screen {
                 .take(usize::from(inner.height.saturating_sub(1)))
                 .map(|process| {
                     let shown = ui::fit(&ui::printable(&process.name), name);
+                    // Lined up by the columns it takes: a wide character takes two.
+                    let pad = name.saturating_sub(Span::raw(shown.as_str()).width());
+                    // Several CPUs' worth needs no tenths, so `1600%` fits where `12.3%` does.
+                    let cpu = if process.cpu < 100.0 {
+                        format!("{:.1}%", process.cpu)
+                    } else {
+                        format!("{:.0}%", process.cpu)
+                    };
                     Line::from(format!(
-                        "{:>7}  {shown:<name$}  {:>5.1}%  {:>10}",
+                        "{:>7}  {shown}{}  {cpu:>6}  {:>10}",
                         process.pid,
-                        process.cpu,
+                        " ".repeat(pad),
                         size::format(process.memory)
                     ))
                 }),
@@ -971,6 +979,30 @@ mod tests {
         };
         assert_eq!(lines[0], line("/", "█▌", "25%", "3.0 GiB free"));
         assert_eq!(lines[1], line("…My Passport", "███", "50%", "1.0 GiB free"));
+    }
+
+    #[test]
+    fn process_rows_fit_their_columns() {
+        let mut screen = screen();
+        let reading = Reading {
+            processes: Some(vec![
+                Process::new(4321, "xz", 1600.0, GIB),
+                Process::new(66, "百度网盘", 12.3, GIB),
+            ]),
+            ..Reading::default()
+        };
+        screen.show(reading, Instant::now());
+        let rows = render(&mut screen, 80, 24);
+        let row = |name: &str| {
+            let found = rows.iter().find(|row| row.contains(name));
+            found.unwrap_or_else(|| panic!("{rows:#?}")).clone()
+        };
+        // The column a text ends at; a wide character takes two cells.
+        let end = |row: &str, text: &str| row[..row.find(text).unwrap()].chars().count();
+        let (xz, wide) = (row("xz"), row("百"));
+        assert!(xz.contains(" 1600%     1.0 GiB  "), "{rows:#?}");
+        assert_eq!(end(&wide, "GiB"), end(&xz, "GiB"), "{rows:#?}");
+        assert_eq!(end(&wide, "%"), end(&xz, "%"), "{rows:#?}");
     }
 
     #[test]

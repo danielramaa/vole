@@ -51,21 +51,35 @@ impl Module {
 /// What the App needs from the screen of a module.
 pub trait ModuleScreen {
     /// Moves background work along; called before each frame while the module is on screen.
-    fn tick(&mut self);
-    /// Handles a key, returning whether it was used.
-    fn on_key(&mut self, key: KeyEvent) -> bool;
+    fn tick(&mut self) -> Tick;
+    /// Handles a key.
+    fn on_key(&mut self, key: KeyEvent) -> Action;
     fn draw(&mut self, frame: &mut Frame, area: Rect);
     /// The module's keys, for the footer.
     fn hint(&self) -> &'static str;
     /// Whether the keys that leave a module (q, Esc, h, ←) leave it now.
     fn can_leave(&self) -> bool;
-    /// The module a key asked to open instead, like the dashboard's shortcut to `clean`; taken
-    /// once.
-    fn take_open(&mut self) -> Option<Module>;
-    /// Whether root commands wait for [`ModuleScreen::run_root`].
-    fn needs_terminal(&self) -> bool;
     /// Runs the waiting root commands; `run_root` runs them with the TUI paused.
     fn run_root(&mut self, run_root: &mut RunRoot) -> io::Result<()>;
+}
+
+/// What a module's screen did with a key, for the App.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Action {
+    Used,
+    /// Not used: the App may use it to leave the module, where [`ModuleScreen::can_leave`] allows.
+    Unused,
+    /// Opens another module instead, like the dashboard's shortcut to `clean`.
+    Open(Module),
+}
+
+/// What a module's screen needs from the App after a tick.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum Tick {
+    Nothing,
+    /// Root commands wait for the terminal, which the App lends with
+    /// [`ModuleScreen::run_root`].
+    RunRoot,
 }
 
 pub struct App {
@@ -154,15 +168,16 @@ impl App {
         while !self.quit {
             // Only the module on screen moves along: what the others' threads find waits for
             // them, and the dashboard only reads the system while it is shown.
-            if let Some(screen) = self.module.and_then(|module| self.screen(module)) {
-                screen.tick();
-            }
+            let tick = match self.module.and_then(|module| self.screen(module)) {
+                Some(screen) => screen.tick(),
+                None => Tick::Nothing,
+            };
             terminal.draw(|frame| self.draw(frame))?;
             // Root commands need the terminal, which only the App has. Only the module on
             // screen can be waiting for it: no module lets you leave while it confirms or
             // removes.
-            if let Some(screen) = self.module.and_then(|module| self.screen(module))
-                && screen.needs_terminal()
+            if tick == Tick::RunRoot
+                && let Some(screen) = self.module.and_then(|module| self.screen(module))
             {
                 screen.run_root(&mut |commands| term::run_external(terminal, commands))?;
                 continue;
@@ -188,15 +203,17 @@ impl App {
             Some(module) => {
                 // The module gets the key first, so it can use h/l, Esc, etc. for its own
                 // navigation; only keys it doesn't use leave it, and only where it allows.
-                let (used, can_leave, open) = match self.screen(module) {
-                    Some(screen) => (screen.on_key(key), screen.can_leave(), screen.take_open()),
-                    None => (false, true, None),
+                let (action, can_leave) = match self.screen(module) {
+                    Some(screen) => (screen.on_key(key), screen.can_leave()),
+                    None => (Action::Unused, true),
                 };
-                if let Some(open) = open {
-                    self.back_to = Some(module);
-                    self.open(Some(open));
-                } else if !used && can_leave {
-                    self.on_leave_key(key);
+                match action {
+                    Action::Open(open) => {
+                        self.back_to = Some(module);
+                        self.open(Some(open));
+                    }
+                    Action::Unused if can_leave => self.on_leave_key(key),
+                    Action::Used | Action::Unused => {}
                 }
             }
         }

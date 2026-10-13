@@ -17,7 +17,7 @@ use super::plan::{Item, Plan};
 use super::remove;
 use super::scan::ALLOWED_ROOTS;
 use super::{build_plan, refresh_in_use};
-use crate::app::{Module, ModuleScreen};
+use crate::app::{Action, ModuleScreen, Tick};
 use crate::config::Config;
 use crate::disk::Mounts;
 use crate::log::{Log, Outcome};
@@ -152,7 +152,8 @@ impl Screen {
 
 impl ModuleScreen for Screen {
     /// Moves background work along: starts the scan or the removal, and picks up their results.
-    fn tick(&mut self) {
+    /// Then asks for the terminal while the root commands wait for [`Screen::run_root`].
+    fn tick(&mut self) -> Tick {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
             State::NotStarted => State::Scanning(Self::start(self.config.clone())),
@@ -217,10 +218,14 @@ impl ModuleScreen for Screen {
             },
             state => state,
         };
+        if matches!(self.state, State::RootPending { .. }) {
+            Tick::RunRoot
+        } else {
+            Tick::Nothing
+        }
     }
 
-    /// Returns whether the key was used.
-    fn on_key(&mut self, key: KeyEvent) -> bool {
+    fn on_key(&mut self, key: KeyEvent) -> Action {
         let back = matches!(
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
@@ -229,7 +234,7 @@ impl ModuleScreen for Screen {
             && key.code == KeyCode::Esc
         {
             stop.store(true, Ordering::Relaxed);
-            return true;
+            return Action::Used;
         }
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
@@ -304,7 +309,7 @@ impl ModuleScreen for Screen {
             state => (state, false),
         };
         self.state = state;
-        used
+        if used { Action::Used } else { Action::Unused }
     }
 
     fn hint(&self) -> &'static str {
@@ -335,15 +340,6 @@ impl ModuleScreen for Screen {
             | State::RemovingHome { .. }
             | State::RootPending { .. } => false,
         }
-    }
-
-    fn take_open(&mut self) -> Option<Module> {
-        None
-    }
-
-    /// Whether the root commands are waiting for [`Screen::run_root`].
-    fn needs_terminal(&self) -> bool {
-        matches!(self.state, State::RootPending { .. })
     }
 
     /// Runs the confirmed root commands; `run_root` runs them with the TUI paused. Fails when
@@ -604,7 +600,7 @@ mod tests {
     }
 
     fn press(screen: &mut Screen, code: KeyCode) -> bool {
-        screen.on_key(KeyEvent::from(code))
+        screen.on_key(KeyEvent::from(code)) == Action::Used
     }
 
     #[test]

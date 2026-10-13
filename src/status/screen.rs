@@ -16,7 +16,7 @@ use super::cpu::Times;
 use super::health::{Check, Health};
 use super::processes::Process;
 use super::reading::{Reader, Reading};
-use crate::app::{Module, ModuleScreen};
+use crate::app::{Action, Module, ModuleScreen, Tick};
 use crate::config::Config;
 use crate::term::RunRoot;
 use crate::{size, ui};
@@ -69,8 +69,6 @@ pub struct Screen {
     health: Health,
     /// Whether the health panel is to be measured on the next tick.
     measure_health: bool,
-    /// The module a shortcut asked to open, until the App takes it.
-    open: Option<Module>,
     /// The memory used, as of each reading so far.
     memory_graph: History,
     /// What the network received and sent each second, as of each reading so far.
@@ -96,7 +94,6 @@ impl Screen {
             by_memory: false,
             health: Health::default(),
             measure_health: true,
-            open: None,
             memory_graph: History::default(),
             received_graph: History::default(),
             sent_graph: History::default(),
@@ -371,9 +368,9 @@ impl Screen {
 
 impl ModuleScreen for Screen {
     /// Picks up the reading asked for, and asks for the next one when it is due.
-    fn tick(&mut self) {
+    fn tick(&mut self) -> Tick {
         if self.failed.is_some() {
-            return;
+            return Tick::Nothing;
         }
         let now = Instant::now();
         // What came in while the dashboard wasn't on screen is taken in first.
@@ -391,7 +388,7 @@ impl ModuleScreen for Screen {
             Ok(None) => {}
             Err(_) => {
                 self.failed = Some("Reading the system stopped unexpectedly.".into());
-                return;
+                return Tick::Nothing;
             }
         }
         if !self.waiting
@@ -407,18 +404,19 @@ impl ModuleScreen for Screen {
                 self.due = now + self.interval;
             }
         }
+        Tick::Nothing
     }
 
-    fn on_key(&mut self, key: KeyEvent) -> bool {
+    fn on_key(&mut self, key: KeyEvent) -> Action {
         match key.code {
             KeyCode::Char('+') => self.set_interval(longer(self.interval)),
             KeyCode::Char('-') => self.set_interval(shorter(self.interval)),
             KeyCode::Char('s') => self.by_memory = !self.by_memory,
-            KeyCode::Char('c') => self.open = Some(Module::Clean),
-            KeyCode::Char('o') => self.open = Some(Module::Orphans),
-            _ => return false,
+            KeyCode::Char('c') => return Action::Open(Module::Clean),
+            KeyCode::Char('o') => return Action::Open(Module::Orphans),
+            _ => return Action::Unused,
         }
-        true
+        Action::Used
     }
 
     fn hint(&self) -> &'static str {
@@ -431,14 +429,6 @@ impl ModuleScreen for Screen {
 
     fn can_leave(&self) -> bool {
         true
-    }
-
-    fn take_open(&mut self) -> Option<Module> {
-        self.open.take()
-    }
-
-    fn needs_terminal(&self) -> bool {
-        false
     }
 
     fn run_root(&mut self, _: &mut RunRoot) -> io::Result<()> {
@@ -946,10 +936,16 @@ mod tests {
         );
         assert!(rows.contains("98.7%   400.0 MiB"), "{rows}");
         assert!(screen.hint().contains("s sort by memory"));
-        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('s'))));
+        assert_eq!(
+            screen.on_key(KeyEvent::from(KeyCode::Char('s'))),
+            Action::Used
+        );
         assert_eq!(names(&mut screen), ["firefox", "cc1plus", "systemd"]);
         assert!(render(&mut screen, 80, 16).join("\n").contains("by memory"));
-        assert!(!screen.on_key(KeyEvent::from(KeyCode::Char('q'))));
+        assert_eq!(
+            screen.on_key(KeyEvent::from(KeyCode::Char('q'))),
+            Action::Unused
+        );
     }
 
     #[test]
@@ -975,11 +971,9 @@ mod tests {
     #[test]
     fn c_and_o_open_clean_and_orphans() {
         let mut screen = screen();
-        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('c'))));
-        assert_eq!(screen.take_open(), Some(Module::Clean));
-        assert_eq!(screen.take_open(), None);
-        assert!(screen.on_key(KeyEvent::from(KeyCode::Char('o'))));
-        assert_eq!(screen.take_open(), Some(Module::Orphans));
+        let mut press = |c| screen.on_key(KeyEvent::from(KeyCode::Char(c)));
+        assert_eq!(press('c'), Action::Open(Module::Clean));
+        assert_eq!(press('o'), Action::Open(Module::Orphans));
         assert!(
             render(&mut screen, 80, 24)
                 .join("\n")
@@ -1119,7 +1113,9 @@ mod tests {
             status_refresh_ms: 1200,
             ..Config::default()
         });
-        let press = |screen: &mut Screen, c| screen.on_key(KeyEvent::from(KeyCode::Char(c)));
+        let press = |screen: &mut Screen, c| {
+            screen.on_key(KeyEvent::from(KeyCode::Char(c))) == Action::Used
+        };
         let ms = |screen: &Screen| screen.interval.as_millis();
         assert!(press(&mut screen, '+'));
         assert_eq!(ms(&screen), 2000);

@@ -21,7 +21,7 @@ use super::backup::{BACKUPS, OLD_DAYS, OldBackup};
 use super::configs::{Confidence, OrphanedConfig, PackageOwned};
 use super::plan::{Package, Plan};
 use super::{build_plan, refresh_in_use, remove, rules};
-use crate::app::{Module, ModuleScreen};
+use crate::app::{Action, ModuleScreen, Tick};
 use crate::config::Config;
 use crate::disk::Mounts;
 use crate::log::{Log, Outcome};
@@ -195,8 +195,9 @@ impl Screen {
 
 impl ModuleScreen for Screen {
     /// Moves background work along: starts the scan and picks up its result, and moves the
-    /// confirmed configs.
-    fn tick(&mut self) {
+    /// confirmed configs. Then asks for the terminal while `sudo pacman -Rns` waits for
+    /// [`ModuleScreen::run_root`].
+    fn tick(&mut self) -> Tick {
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         self.state = match state {
             State::NotStarted => {
@@ -259,10 +260,14 @@ impl ModuleScreen for Screen {
             }
             state => state,
         };
+        if matches!(self.state, State::RootPending { .. }) {
+            Tick::RunRoot
+        } else {
+            Tick::Nothing
+        }
     }
 
-    /// Returns whether the key was used.
-    fn on_key(&mut self, key: KeyEvent) -> bool {
+    fn on_key(&mut self, key: KeyEvent) -> Action {
         let back = matches!(
             key.code,
             KeyCode::Char('n' | 'q' | 'h') | KeyCode::Esc | KeyCode::Left
@@ -271,7 +276,7 @@ impl ModuleScreen for Screen {
             && key.code == KeyCode::Esc
         {
             stop.store(true, Ordering::Relaxed);
-            return true;
+            return Action::Used;
         }
         let state = std::mem::replace(&mut self.state, State::NotStarted);
         let (state, used) = match state {
@@ -352,7 +357,7 @@ impl ModuleScreen for Screen {
             state => (state, false),
         };
         self.state = state;
-        used
+        if used { Action::Used } else { Action::Unused }
     }
 
     fn hint(&self) -> &'static str {
@@ -386,15 +391,6 @@ impl ModuleScreen for Screen {
             | State::RemovingHome { .. }
             | State::RootPending { .. } => false,
         }
-    }
-
-    fn take_open(&mut self) -> Option<Module> {
-        None
-    }
-
-    /// Whether `sudo pacman -Rns` is waiting for [`ModuleScreen::run_root`].
-    fn needs_terminal(&self) -> bool {
-        matches!(self.state, State::RootPending { .. })
     }
 
     /// Removes the confirmed packages; `run_root` runs `sudo pacman -Rns` with the TUI paused.
@@ -917,7 +913,7 @@ mod tests {
     }
 
     fn press(screen: &mut Screen, code: KeyCode) -> bool {
-        screen.on_key(KeyEvent::from(code))
+        screen.on_key(KeyEvent::from(code)) == Action::Used
     }
 
     #[test]
@@ -1332,22 +1328,22 @@ mod tests {
     fn packages_wait_for_the_terminal_after_the_rest() {
         let (mut screen, sender) = finishing(true, false);
         sender.send(Progress::Finished(Vec::new(), log())).unwrap();
-        screen.tick();
-        assert!(screen.needs_terminal());
+        assert_eq!(screen.tick(), Tick::RunRoot);
+        // Until it has the terminal, it keeps asking.
+        assert_eq!(screen.tick(), Tick::RunRoot);
 
         // Without packages, it is done.
         let (mut screen, sender) = finishing(false, false);
         sender.send(Progress::Finished(Vec::new(), log())).unwrap();
-        screen.tick();
-        assert!(!screen.needs_terminal() && screen.can_leave());
+        assert_eq!(screen.tick(), Tick::Nothing);
+        assert!(screen.can_leave());
     }
 
     #[test]
     fn stopping_leaves_the_packages_alone() {
         let (mut screen, sender) = finishing(true, true);
         sender.send(Progress::Finished(Vec::new(), log())).unwrap();
-        screen.tick();
-        assert!(!screen.needs_terminal());
+        assert_eq!(screen.tick(), Tick::Nothing);
         let State::Done { outcomes, .. } = &screen.state else {
             panic!("not done");
         };
